@@ -282,7 +282,37 @@ def secondary_entries(mod):
                     orphans.add(t)
                 else:
                     sec[o].add(t)
+    # code whose address is taken (relocation targets, exports, init_array, ADR / ADRP+ADD) and that IDA put
+    # inside another function: it is entered through call_ind, so it needs an entry too
+    for t in set(mod.m.code_seeds()) | code_address_refs(mod):
+        if t in mod.funcs or not (mod.text[0] <= t < mod.text[1]):
+            continue
+        o = mod.owner.get(t)
+        if o is not None:
+            sec[o].add(t)
     return {o: sorted(v) for o, v in sec.items()}, orphans
+
+
+def code_address_refs(mod):
+    """Text addresses computed by ADR, or by ADRP followed by ADD to the same register."""
+    def sx(v, b):
+        return v - (1 << b) if v >> (b - 1) & 1 else v
+    out = set()
+    t0, t1 = mod.text
+    for a in range(t0, t1 - 4, 4):
+        w = mod.word(a)
+        if w & 0x9f000000 == 0x10000000:                               # ADR
+            t = a + sx(((w >> 5) & 0x7ffff) << 2 | (w >> 29) & 3, 21)
+        elif w & 0x9f000000 == 0x90000000:                             # ADRP + ADD
+            w2 = mod.word(a + 4)
+            if w2 & 0xffc00000 != 0x91000000 or (w2 >> 5) & 31 != w & 31:
+                continue
+            t = (a & ~0xfff) + (sx(((w >> 5) & 0x7ffff) << 2 | (w >> 29) & 3, 21) << 12) + ((w2 >> 10) & 0xfff)
+        else:
+            continue
+        if t0 <= t < t1 and not t & 3:
+            out.add(t)
+    return out
 
 
 def sext26(w):

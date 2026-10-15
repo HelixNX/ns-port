@@ -1,0 +1,197 @@
+/* What the lifted code calls into: indirect calls and branches (one table slot per text word, so a lookup is an
+ * index), host functions at guest addresses ("host calls"), traps, the counter and FPCR, and the crash report. */
+#include "hos.h"
+#include <stdlib.h>
+#include <windows.h>
+#include <dbghelp.h>
+#include <intrin.h>
+
+extern const ModInfo lifted_modules[];
+
+typedef struct { u64 base, span; GuestFn *tab; const char *name; } FnTable;
+static FnTable tables[4];
+static int ntables;
+
+static struct { const char *name; GuestFn fn; } hostcalls[HOSTCALL_MAX];
+static int nhostcalls;
+
+void dispatch_init(void) {
+    for (const ModInfo *m = lifted_modules; m->name; m++) {
+        FnTable *t = &tables[ntables++];
+        t->base = m->base;
+        t->span = m->text_end - m->base;
+        t->name = m->name;
+        t->tab = calloc(t->span / 4, sizeof(GuestFn));
+        for (const FnEntry *e = m->entries; e->fn; e++)
+            t->tab[(e->addr - m->base) / 4] = e->fn;
+    }
+}
+
+u64 hostcall_register(const char *name, GuestFn fn) {
+    if (nhostcalls == HOSTCALL_MAX) fatal("too many host calls");
+    hostcalls[nhostcalls].name = name;
+    hostcalls[nhostcalls].fn = fn;
+    return HOSTCALL_BASE + 4 * (u64)nhostcalls++;
+}
+
+GuestFn guest_fn(u64 addr) {
+    for (int i = 0; i < ntables; i++) {
+        u64 off = addr - tables[i].base;
+        if (off < tables[i].span) return off & 3 ? NULL : tables[i].tab[off / 4];
+    }
+    u64 off = addr - HOSTCALL_BASE;
+    if (off < 4 * (u64)nhostcalls && !(off & 3)) return hostcalls[off / 4].fn;
+    return NULL;
+}
+
+void call_ind(Ctx *c, u64 addr) {
+    GuestFn f = guest_fn(addr);
+    if (!f) guest_trap(c, "call to an address with no lifted function", addr);
+    f(c);
+}
+
+void jump_ind(Ctx *c) {
+    GuestFn f = guest_fn(c->pc);
+    if (!f) guest_trap(c, "branch to an address with no lifted function", c->pc);
+    MUSTTAIL return f(c);
+}
+
+void guest_call(Ctx *c, u64 addr) {
+    c->x[30] = HOSTCALL_BASE;          /* a return address that is not guest code */
+    call_ind(c, addr);
+}
+
+void guest_svc(Ctx *c, u32 imm) { svc_dispatch(c, imm); }
+
+void host_yield(void) { YieldProcessor(); }
+
+/* CNTPCT_EL0: 19.2 MHz since start-up */
+static LARGE_INTEGER qpc_freq, qpc_start;
+u64 host_cntpct(void) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    u64 d = (u64)(now.QuadPart - qpc_start.QuadPart);
+    u64 f = (u64)qpc_freq.QuadPart;
+    return d / f * 19200000u + d % f * 19200000u / f;
+}
+
+/* FPCR.FZ (bit 24) -> MXCSR flush-to-zero and denormals-are-zero; rounding modes other than nearest are not
+ * modelled (see CLAUDE.md) */
+void host_set_fpcr(Ctx *c) {
+    unsigned m = _mm_getcsr() & ~0x8040u;
+    if (c->fpcr & (1u << 24)) m |= 0x8040u;
+    _mm_setcsr(m);
+}
+
+void host_thread_init(Ctx *c) { host_set_fpcr(c); }
+
+/* ---------------------------------------------------------------------------------------------- diagnostics */
+int log_level = 1;
+static SRWLOCK loglock = SRWLOCK_INIT;
+
+static void vlog(const char *prefix, const char *fmt, va_list ap) {
+    AcquireSRWLockExclusive(&loglock);
+    fprintf(stderr, "[%s] %s", cur_thread ? cur_thread->name : "host", prefix);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+    ReleaseSRWLockExclusive(&loglock);
+}
+
+void hlog(int level, const char *fmt, ...) {
+    if (level > log_level) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vlog("", fmt, ap);
+    va_end(ap);
+}
+
+void fatal(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog("fatal: ", fmt, ap);
+    va_end(ap);
+    if (IsDebuggerPresent()) __debugbreak();
+    TerminateProcess(GetCurrentProcess(), 3);
+    for (;;) {}
+}
+
+const char *describe_addr(u64 addr, char *buf, size_t n) {
+    u64 off;
+    const char *s = sym_name(addr, &off);
+    for (int i = 0; i < num_loaded_mods; i++) {
+        LoadedMod *m = &loaded_mods[i];
+        if (addr >= m->base && addr < m->bss_end) {
+            if (s && off < 0x100000) snprintf(buf, n, "%s+%llx (%s+%llx)", m->name, addr - m->base, s, off);
+            else snprintf(buf, n, "%s+%llx", m->name, addr - m->base);
+            return buf;
+        }
+    }
+    snprintf(buf, n, "%llx", addr);
+    return buf;
+}
+
+void dump_ctx(Ctx *c) {
+    char b[256];
+    AcquireSRWLockExclusive(&loglock);
+    for (int i = 0; i < 32; i += 4)
+        fprintf(stderr, "  %s%-2d %016llx  x%-2d %016llx  x%-2d %016llx  %s%-2d %016llx\n", "x", i, c->x[i], i + 1,
+                c->x[i + 1], i + 2, c->x[i + 2], i == 28 ? "sp" : "x", i == 28 ? 0 : i + 3, c->x[i + 3]);
+    fprintf(stderr, "  lr = %s\n", describe_addr(c->x[30], b, sizeof b));
+    fprintf(stderr, "  tpidrro %llx tpidr %llx\n", c->tpidrro, c->tpidr);
+    fflush(stderr);
+    ReleaseSRWLockExclusive(&loglock);
+}
+
+void guest_trap(Ctx *c, const char *what, u64 pc) {
+    char b[256];
+    hlog(0, "guest trap: %s at %s", what, describe_addr(pc, b, sizeof b));
+    dump_ctx(c);
+    fatal("stopped");
+}
+
+void guest_unimpl(Ctx *c, u64 pc, u32 insn, const char *what) {
+    char b[256];
+    hlog(0, "untranslated instruction %08x (%s) at %s", insn, what, describe_addr(pc, b, sizeof b));
+    dump_ctx(c);
+    fatal("stopped");
+}
+
+static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    char b[256], sb[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+    memset(sb, 0, sizeof sb);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    DWORD64 disp = 0, rip = ep->ContextRecord->Rip;
+    const char *fn = SymFromAddr(GetCurrentProcess(), rip, &disp, si) ? si->Name : "?";
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        u64 a = ep->ExceptionRecord->ExceptionInformation[1];
+        hlog(0, "access violation (%s %s) in %s+%llx", ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "writing" :
+             "reading", describe_addr(a, b, sizeof b), fn, (unsigned long long)disp);
+    } else {
+        hlog(0, "exception %08lx in %s+%llx", code, fn, (unsigned long long)disp);
+    }
+    /* a lifted function f_<addr> names the guest function */
+    if (!strncmp(fn, "f_", 2) || !strncmp(fn, "b_", 2)) {
+        u64 g = strtoull(fn + 2, NULL, 16);
+        hlog(0, "  guest function %s", describe_addr(g, b, sizeof b));
+    }
+    if (cur_thread) {
+        hlog(0, "  registers as of the last call:");
+        dump_ctx(cur_thread->ctx);
+    }
+    fatal("crashed");
+}
+
+void diag_init(void) {
+    QueryPerformanceFrequency(&qpc_freq);
+    QueryPerformanceCounter(&qpc_start);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    AddVectoredExceptionHandler(1, crash_handler);
+}
