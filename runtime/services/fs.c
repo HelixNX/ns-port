@@ -5,9 +5,10 @@
 #include <stdlib.h>
 #include <windows.h>
 
-bool romfs_init(const char *dir);
-u64 romfs_size(void);
-bool romfs_read(u64 off, void *dst, u64 size);
+typedef struct RomFs RomFs;
+RomFs *romfs_open(const char *dir);
+u64 romfs_size(RomFs *fs);
+bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size);
 
 #define FS_RES(d)              (0x02u | (u32)(d) << 9)
 #define R_FS_PATH_NOT_FOUND    FS_RES(1)
@@ -17,16 +18,17 @@ bool romfs_read(u64 off, void *dst, u64 size);
 #define R_FS_TARGET_NOT_FOUND  FS_RES(1002)
 #define R_FS_INVALID_ARGUMENT  FS_RES(6001)
 
-static char romfs_dir[1024], save_root[1024];
-static bool romfs_ok;
+static char save_root[1024], sysdata_root[1024];
+static RomFs *game_romfs;
 
 /* ---------------------------------------------------------------------------------------------- IStorage (RomFS) */
 static void st_read(SvcObj *o, IpcReq *r) {
     u64 off = in_u64(r, 0), size = in_u64(r, 8);
-    if (!r->nb || r->b[0].size < size) { r->result = R_FS_INVALID_ARGUMENT; return; }
-    if (!romfs_read(off, (void *)(uintptr_t)r->b[0].addr, size)) r->result = R_FS_OUT_OF_RANGE;
+    const IpcBuf *b = buf_out(r, 0);
+    if (!b || b->size < size) { r->result = R_FS_INVALID_ARGUMENT; return; }
+    if (!romfs_read(o->data, off, (void *)(uintptr_t)b->addr, size)) r->result = R_FS_OUT_OF_RANGE;
 }
-static void st_size(SvcObj *o, IpcReq *r) { out_u64(r, romfs_size()); }
+static void st_size(SvcObj *o, IpcReq *r) { out_u64(r, romfs_size(o->data)); }
 
 static const Iface iface_storage = {"IStorage", (const IpcCmd[]){
     {0, st_read, "Read"},
@@ -274,13 +276,62 @@ static void fsp_open_save(SvcObj *o, IpcReq *r) {
 }
 
 static void fsp_open_romfs(SvcObj *o, IpcReq *r) {
-    if (!romfs_ok) { r->result = R_FS_TARGET_NOT_FOUND; return; }
-    out_object(r, svcobj_new(&iface_storage, NULL, "romfs"));
+    if (!game_romfs) { r->result = R_FS_TARGET_NOT_FOUND; return; }
+    out_object(r, svcobj_new(&iface_storage, game_romfs, "romfs"));
+}
+
+/* system data archives: build/sysdata/<data id>/ holds the extracted archive (a firmware dump's, if the user puts
+ * one there); missing ones get the minimal placeholder files below */
+static const u8 nftr[16] = {'N', 'F', 'T', 'R', 1}, nfsr[16] = {'N', 'F', 'S', 'R', 1};
+static const struct { u64 id; const char *name; const u8 *data; u32 size; } placeholders[] = {
+    {0x0100000000000802ull, "NXTextureLowLinear.dat", nftr, 16},      /* MiiModel */
+    {0x0100000000000802ull, "NXTextureLowSRGB.dat", nftr, 16},
+    {0x0100000000000802ull, "NXTextureMidLinear.dat", nftr, 16},
+    {0x0100000000000802ull, "NXTextureMidSRGB.dat", nftr, 16},
+    {0x0100000000000802ull, "ShapeHigh.dat", nfsr, 16},
+    {0x0100000000000802ull, "ShapeMid.dat", nfsr, 16},
+};
+
+static RomFs *sysdata[64];
+static u64 sysdata_ids[64];
+static int nsysdata;
+
+static RomFs *open_sysdata(u64 id) {
+    for (int i = 0; i < nsysdata; i++)
+        if (sysdata_ids[i] == id) return sysdata[i];
+    char dir[1100];
+    snprintf(dir, sizeof dir, "%s/%016llx", sysdata_root, id);
+    RomFs *fs = romfs_open(dir);
+    if (!fs) {
+        bool made = false;
+        for (size_t i = 0; i < sizeof placeholders / sizeof *placeholders; i++) {
+            if (placeholders[i].id != id) continue;
+            CreateDirectoryA(sysdata_root, NULL);
+            CreateDirectoryA(dir, NULL);
+            char path[1200];
+            snprintf(path, sizeof path, "%s/%s", dir, placeholders[i].name);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(placeholders[i].data, 1, placeholders[i].size, f); fclose(f); }
+            made = true;
+        }
+        if (made) {
+            hlog(0, "fs: system data %016llx: wrote placeholder files to %s", id, dir);
+            fs = romfs_open(dir);
+        }
+    }
+    if (fs && nsysdata < 64) { sysdata_ids[nsysdata] = id; sysdata[nsysdata++] = fs; }
+    return fs;
 }
 
 static void fsp_open_data_by_id(SvcObj *o, IpcReq *r) {
-    hlog(0, "fs: OpenDataStorageByDataId(storage %u, data %llx): not available", in_u8(r, 0), in_u64(r, 8));
-    r->result = R_FS_TARGET_NOT_FOUND;
+    u64 id = in_u64(r, 8);
+    RomFs *fs = open_sysdata(id);
+    if (!fs) {
+        hlog(0, "fs: OpenDataStorageByDataId(storage %u, data %016llx): not available", in_u8(r, 0), id);
+        r->result = R_FS_TARGET_NOT_FOUND;
+        return;
+    }
+    out_object(r, svcobj_new(&iface_storage, fs, "sysdata"));
 }
 
 static void fsp_open_patch(SvcObj *o, IpcReq *r) { r->result = R_FS_TARGET_NOT_FOUND; }
@@ -308,9 +359,11 @@ static const Iface iface_fsp = {"fsp-srv", (const IpcCmd[]){
 static SvcObj *open_fsp(const char *name) { return svcobj_new(&iface_fsp, NULL, name); }
 
 void fs_register(const char *game_dir, const char *save_dir) {
+    char romfs_dir[1100];
     snprintf(romfs_dir, sizeof romfs_dir, "%s/romfs", game_dir);
     snprintf(save_root, sizeof save_root, "%s", save_dir);
-    romfs_ok = romfs_init(romfs_dir);
-    if (!romfs_ok) hlog(0, "fs: no RomFS at %s", romfs_dir);
+    snprintf(sysdata_root, sizeof sysdata_root, "%s/../sysdata", save_dir);
+    game_romfs = romfs_open(romfs_dir);
+    if (!game_romfs) hlog(0, "fs: no RomFS at %s", romfs_dir);
     service_register("fsp-srv", open_fsp);
 }

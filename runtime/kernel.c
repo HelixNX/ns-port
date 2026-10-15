@@ -477,4 +477,28 @@ void event_clear(KEvent *e) {
     kunlock();
 }
 
+/* every guest thread: what it waits for, and its backtrace as of its last call or SVC */
+void kernel_dump_threads(void) {
+    static const char *const kinds[] = {"running", "WaitSynchronization", "mutex", "condition variable",
+                                        "address arbiter", "sleep"};
+    AcquireSRWLockShared(&klk);
+    for (KThread *t = threads; t; t = t->next) {
+        if (t->exited) continue;
+        char b[200];
+        hlog(0, "%s (id %llx, prio %d): %s%s addr %llx key %llx; lr %s", t->name, t->id, t->prio,
+             t->started ? "" : "not started, ", kinds[t->wait < 6 ? t->wait : 0], t->wait_addr, t->cv_key,
+             describe_addr(t->ctx->x[30], b, sizeof b));
+        if (t->host && t->wait == W_NONE) {                  /* running: where it is now, five samples */
+            char where[5][128];
+            for (int k = 0; k < 5; k++) {
+                host_where(t->host, where[k], sizeof where[k]);
+                Sleep(20);
+            }
+            hlog(0, "  now in %s | %s | %s | %s | %s", where[0], where[1], where[2], where[3], where[4]);
+        }
+        dump_ctx(t->ctx);
+    }
+    ReleaseSRWLockShared(&klk);
+}
+
 void kernel_init(void) {}

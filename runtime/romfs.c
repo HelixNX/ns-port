@@ -2,6 +2,8 @@
  * the dump holds the extracted files (11 GB). So the metadata (header, hash tables, directory and file entries)
  * is built here in memory from a scan of the directory, and reads of the data area go to the host files.
  *
+ * The same serves system data archives (fsp-srv OpenDataStorageByDataId) from build/sysdata/<data id>/.
+ *
  * Layout: header (0x50) | directory hash table | directory entries | file hash table | file entries |
  *         (aligned to 0x200) file data, each file aligned to 0x10. */
 #include "hos.h"
@@ -10,10 +12,13 @@
 
 typedef struct RomFile { wchar_t *path; u64 offset, size; HANDLE h; } RomFile;
 
-static u8 *meta;
-static u64 meta_size, data_offset, total_size;
-static RomFile *files;
-static int nfiles, capfiles;
+typedef struct RomFs {
+    u8 *meta;
+    u64 meta_size, data_offset, total_size;
+    RomFile *files;
+    int nfiles, capfiles;
+} RomFs;
+static RomFs *B;                                /* the image being built (start-up, one at a time) */
 static SRWLOCK open_lock = SRWLOCK_INIT;
 
 typedef struct Node {
@@ -26,7 +31,7 @@ typedef struct Node {
     u32 file_index;
 } Node;
 
-static int count_dirs, count_files;
+static int count_dirs, count_files;                  /* of the image being built */
 static u32 dir_table_size, file_table_size;
 
 static u32 align4(u32 v) { return (v + 3) & ~3u; }
@@ -120,12 +125,12 @@ static void assign(Node *root, u64 *data_pos) {
                 k->off = foff;
                 foff += 0x20 + align4((u32)strlen(k->name));
                 *data_pos = (*data_pos + 15) & ~15ull;
-                if (nfiles == capfiles) {
-                    capfiles = capfiles ? capfiles * 2 : 1024;
-                    files = realloc(files, capfiles * sizeof *files);
+                if (B->nfiles == B->capfiles) {
+                    B->capfiles = B->capfiles ? B->capfiles * 2 : 1024;
+                    B->files = realloc(B->files, B->capfiles * sizeof *B->files);
                 }
-                k->file_index = (u32)nfiles;
-                files[nfiles++] = (RomFile){k->path, *data_pos, k->size, NULL};
+                k->file_index = (u32)B->nfiles;
+                B->files[B->nfiles++] = (RomFile){k->path, *data_pos, k->size, NULL};
                 *data_pos += k->size;
             }
         }
@@ -150,67 +155,77 @@ static u32 next_sibling(Node *n) {
 static void write_tables(Node *root) {
     u32 dbuckets = bucket_count((u32)count_dirs), fbuckets = bucket_count((u32)count_files);
     u64 dht = 0x50, dmt = dht + 4ull * dbuckets, fht = dmt + dir_table_size, fmt = fht + 4ull * fbuckets;
-    meta_size = fmt + file_table_size;
-    data_offset = (meta_size + 0x1ff) & ~0x1ffull;
-    meta = calloc(1, meta_size);
-    u8 *h = meta;
+    B->meta_size = fmt + file_table_size;
+    B->data_offset = (B->meta_size + 0x1ff) & ~0x1ffull;
+    B->meta = calloc(1, B->meta_size);
+    u8 *h = B->meta;
     put64(h + 0x00, 0x50);
     put64(h + 0x08, dht); put64(h + 0x10, 4ull * dbuckets);
     put64(h + 0x18, dmt); put64(h + 0x20, dir_table_size);
     put64(h + 0x28, fht); put64(h + 0x30, 4ull * fbuckets);
     put64(h + 0x38, fmt); put64(h + 0x40, file_table_size);
-    put64(h + 0x48, data_offset);
-    memset(meta + dht, 0xff, 4ull * dbuckets);
-    memset(meta + fht, 0xff, 4ull * fbuckets);
+    put64(h + 0x48, B->data_offset);
+    memset(B->meta + dht, 0xff, 4ull * dbuckets);
+    memset(B->meta + fht, 0xff, 4ull * fbuckets);
     /* walk all nodes in directory order again */
     int head = 0, tail = 0;
     queue[tail++] = root;
     while (head < tail) {
         Node *d = queue[head++];
         u32 parent = d->parent ? d->parent->off : 0;
-        u8 *e = meta + dmt + d->off;
+        u8 *e = B->meta + dmt + d->off;
         u32 hash = path_hash(parent, d->name) % dbuckets;
         u32 nl = (u32)strlen(d->name);
         put32(e + 0x00, parent);
         put32(e + 0x04, d->parent ? next_sibling(d) : 0xffffffffu);
         put32(e + 0x08, first_child(d, true));
         put32(e + 0x0c, first_child(d, false));
-        memcpy(e + 0x10, meta + dht + 4 * hash, 4);
-        put32(meta + dht + 4 * hash, d->off);
+        memcpy(e + 0x10, B->meta + dht + 4 * hash, 4);
+        put32(B->meta + dht + 4 * hash, d->off);
         put32(e + 0x14, nl);
         memcpy(e + 0x18, d->name, nl);
         for (Node *k = d->child; k; k = k->sibling) {
             if (k->dir) { queue[tail++] = k; continue; }
-            u8 *f = meta + fmt + k->off;
+            u8 *f = B->meta + fmt + k->off;
             u32 fh = path_hash(d->off, k->name) % fbuckets;
             u32 kl = (u32)strlen(k->name);
             put32(f + 0x00, d->off);
             put32(f + 0x04, next_sibling(k));
-            put64(f + 0x08, files[k->file_index].offset);
+            put64(f + 0x08, B->files[k->file_index].offset);
             put64(f + 0x10, k->size);
-            memcpy(f + 0x18, meta + fht + 4 * fh, 4);
-            put32(meta + fht + 4 * fh, k->off);
+            memcpy(f + 0x18, B->meta + fht + 4 * fh, 4);
+            put32(B->meta + fht + 4 * fh, k->off);
             put32(f + 0x1c, kl);
             memcpy(f + 0x20, k->name, kl);
         }
     }
 }
 
-bool romfs_init(const char *dir) {
+/* a virtual RomFS image of a host directory, or NULL if there is no such directory */
+RomFs *romfs_open(const char *dir) {
     wchar_t wdir[1024];
     MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1024);
-    if (GetFileAttributesW(wdir) == INVALID_FILE_ATTRIBUTES) return false;
+    DWORD a = GetFileAttributesW(wdir);
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return NULL;
+    static SRWLOCK build_lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&build_lock);
+    B = calloc(1, sizeof *B);
+    count_dirs = count_files = 0;
+    dir_table_size = file_table_size = 0;
     Node *root = scan(wdir, "", NULL);
     u64 pos = 0;
     assign(root, &pos);
     write_tables(root);
-    total_size = data_offset + pos;
-    hlog(1, "romfs: %d directories, %d files, image of %llu MB (tables %llu KB)", count_dirs, count_files,
-         total_size >> 20, meta_size >> 10);
-    return true;
+    B->total_size = B->data_offset + pos;
+    RomFs *fs = B;
+    B = NULL;
+    hlog(1, "romfs %s: %d directories, %d files, image of %llu MB (tables %llu KB)", dir, count_dirs, count_files,
+         fs->total_size >> 20, fs->meta_size >> 10);
+    ReleaseSRWLockExclusive(&build_lock);
+    return fs;
 }
 
-u64 romfs_size(void) { return total_size; }
+u64 romfs_size(RomFs *fs) { return fs->total_size; }
 
 static HANDLE file_handle(RomFile *f) {
     HANDLE h = __atomic_load_n(&f->h, __ATOMIC_ACQUIRE);
@@ -226,26 +241,27 @@ static HANDLE file_handle(RomFile *f) {
 }
 
 /* reads [off, off+size) of the virtual image; returns false past the end */
-bool romfs_read(u64 off, void *dst, u64 size) {
+bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size) {
     u8 *out = dst;
-    if (off + size > total_size || off + size < off) return false;
+    if (off + size > fs->total_size || off + size < off) return false;
     while (size) {
-        if (off < data_offset) {                         /* tables, and the padding after them */
-            u64 n = data_offset - off < size ? data_offset - off : size;
-            for (u64 i = 0; i < n; i++) out[i] = off + i < meta_size ? meta[off + i] : 0;
+        if (off < fs->data_offset) {                     /* tables, and the padding after them */
+            u64 n = fs->data_offset - off < size ? fs->data_offset - off : size;
+            for (u64 i = 0; i < n; i++) out[i] = off + i < fs->meta_size ? fs->meta[off + i] : 0;
             off += n; out += n; size -= n;
             continue;
         }
-        u64 d = off - data_offset;
-        int lo = 0, hi = nfiles - 1;                      /* last file starting at or before d */
+        u64 d = off - fs->data_offset;
+        int lo = 0, hi = fs->nfiles - 1;                  /* last file starting at or before d */
         while (lo < hi) {
             int mid = (lo + hi + 1) / 2;
-            if (files[mid].offset <= d) lo = mid; else hi = mid - 1;
+            if (fs->files[mid].offset <= d) lo = mid; else hi = mid - 1;
         }
-        RomFile *f = &files[lo];
-        if (nfiles == 0 || d >= f->offset + f->size) {   /* alignment padding between files */
-            u64 next = lo + 1 < nfiles ? files[lo + 1].offset : total_size - data_offset;
-            if (nfiles && d < f->offset) next = f->offset;
+        RomFile *f = fs->nfiles ? &fs->files[lo] : NULL;
+        if (!f || d < f->offset || d >= f->offset + f->size) {   /* padding between files */
+            u64 next = fs->total_size - fs->data_offset;
+            if (f && d < f->offset) next = f->offset;
+            else if (f && lo + 1 < fs->nfiles) next = fs->files[lo + 1].offset;
             u64 n = next - d < size ? next - d : size;
             memset(out, 0, n);
             off += n; out += n; size -= n;

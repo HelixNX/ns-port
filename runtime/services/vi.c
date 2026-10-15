@@ -55,8 +55,8 @@ enum { GBP_QUERY = 9, GBP_CONNECT = 10 };
 static void binder_transact(SvcObj *o, IpcReq *r) {
     u32 code = in_u32(r, 4);
     /* TransactParcelAuto sends A+X and B+C pairs, one of each empty */
-    const IpcBuf *in = r->na && r->a[0].size ? &r->a[0] : r->nx ? &r->x[0] : NULL;
-    const IpcBuf *outb = r->nb && r->b[0].size ? &r->b[0] : r->nc ? &r->c[0] : NULL;
+    const IpcBuf *in = buf_in(r, 0);
+    const IpcBuf *outb = buf_out(r, 0);
     hlog(2, "vi: binder %u, in %llx+%llx out %llx+%llx", in_u32(r, 4), in ? in->addr : 0, in ? in->size : 0,
          outb ? outb->addr : 0, outb ? outb->size : 0);
     const u8 *ip = in ? (const u8 *)(uintptr_t)in->addr : NULL;

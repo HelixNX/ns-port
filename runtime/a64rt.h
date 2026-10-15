@@ -55,9 +55,16 @@ u64 host_cntpct(void);
 void host_set_fpcr(Ctx *c);
 
 /* ---------------------------------------------------------------------------------------------- memory */
+/* Guest loads and stores are volatile: another guest thread may change memory at any time, and a guest loop that
+ * polls memory (a spinlock, a flag) must read it on every iteration, where a plain C load could be hoisted out of
+ * the loop. The u<b>u types allow unaligned addresses, as the console does. */
+typedef u8 u8u;
+typedef u16 __attribute__((aligned(1))) u16u;
+typedef u32 __attribute__((aligned(1))) u32u;
+typedef u64 __attribute__((aligned(1))) u64u;
 #define DEF_MEM(b) \
-    static inline u##b LD##b(u64 a) { u##b v; memcpy(&v, (const void *)(uintptr_t)a, sizeof v); return v; } \
-    static inline void ST##b(u64 a, u##b v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); } \
+    static inline u##b LD##b(u64 a) { return *(volatile u##b##u *)(uintptr_t)a; } \
+    static inline void ST##b(u64 a, u##b v) { *(volatile u##b##u *)(uintptr_t)a = v; } \
     static inline u##b LDA##b(u64 a) { return __atomic_load_n((u##b *)(uintptr_t)a, __ATOMIC_ACQUIRE); } \
     static inline void STL##b(u64 a, u##b v) { __atomic_store_n((u##b *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)

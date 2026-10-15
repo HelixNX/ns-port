@@ -136,9 +136,72 @@ static const Iface iface_pwc = {"IProcessWindingController", (const IpcCmd[]){IP
 static const Iface iface_lac = {"ILibraryAppletCreator", (const IpcCmd[]){IPC_END}, NULL};
 static const Iface iface_df = {"IDebugFunctions", (const IpcCmd[]){IPC_END}, NULL};
 
+/* ---------------------------------------------------------------------------------------------- IStorage */
+typedef struct Storage { u8 *data; u64 size; } Storage;
+
+static void storage_destroy(SvcObj *o) { Storage *s = o->data; free(s->data); free(s); }
+static void sa_size(SvcObj *o, IpcReq *r) { out_u64(r, ((Storage *)o->data)->size); }
+static void sa_read(SvcObj *o, IpcReq *r) {
+    Storage *s = o->data;
+    u64 off = in_u64(r, 0);
+    const IpcBuf *b = buf_out(r, 0);
+    if (!b || off > s->size) { r->result = 0x1f680; return; }     /* am: out of bounds */
+    u64 n = b->size < s->size - off ? b->size : s->size - off;
+    memcpy((void *)(uintptr_t)b->addr, s->data + off, n);
+}
+static void sa_write(SvcObj *o, IpcReq *r) {
+    Storage *s = o->data;
+    u64 off = in_u64(r, 0);
+    const IpcBuf *b = buf_in(r, 0);
+    if (!b || off > s->size) { r->result = 0x1f680; return; }
+    u64 n = b->size < s->size - off ? b->size : s->size - off;
+    memcpy(s->data + off, (const void *)(uintptr_t)b->addr, n);
+}
+static const Iface iface_storage_accessor = {"IStorageAccessor", (const IpcCmd[]){
+    {0, sa_size, "GetSize"},
+    {10, sa_write, "Write"},
+    {11, sa_read, "Read"},
+    IPC_END}, storage_destroy};
+
+static void st_open(SvcObj *o, IpcReq *r) {
+    Storage *s = o->data;                               /* the accessor works on its own copy */
+    Storage *view = calloc(1, sizeof *view);
+    view->size = s->size;
+    view->data = malloc(s->size);
+    memcpy(view->data, s->data, s->size);
+    out_object(r, svcobj_new(&iface_storage_accessor, view, NULL));
+}
+static const Iface iface_storage = {"IStorage", (const IpcCmd[]){
+    {0, st_open, "Open"},
+    IPC_END}, storage_destroy};
+
+static SvcObj *storage_new(const void *data, u64 size) {
+    Storage *s = calloc(1, sizeof *s);
+    s->data = malloc(size);
+    memcpy(s->data, data, size);
+    s->size = size;
+    return svcobj_new(&iface_storage, s, NULL);
+}
+
 /* ---------------------------------------------------------------------------------------------- IApplicationFunctions */
+extern const u64 acc_user_id[2];
+static bool preselected_popped;
+
+/* kind 1: user channel (nothing); kind 2: the preselected user {magic, selected, pad, uid, pad} */
 static void af_pop_launch_parameter(SvcObj *o, IpcReq *r) {
-    hlog(1, "am: PopLaunchParameter(%u): none", in_u32(r, 0));
+    u32 kind = in_u32(r, 0);
+    if (kind == 2 && !preselected_popped) {
+        u8 p[0x88] = {0};
+        u32 magic = 0xc79497ca;
+        memcpy(p, &magic, 4);
+        p[4] = 1;
+        memcpy(p + 8, acc_user_id, 16);
+        preselected_popped = true;
+        hlog(1, "am: PopLaunchParameter(PreselectedUser)");
+        out_object(r, storage_new(p, sizeof p));
+        return;
+    }
+    hlog(1, "am: PopLaunchParameter(%u): none", kind);
     r->result = R_AM_NO_DATA;
 }
 static void af_ensure_save_data(SvcObj *o, IpcReq *r) { out_u64(r, 0); }
@@ -197,7 +260,6 @@ static const Iface iface_proxy = {"IApplicationProxy", (const IpcCmd[]){
     IPC_END}, NULL};
 
 static void oe_open_proxy(SvcObj *o, IpcReq *r) {
-    for (int i = 0; i < r->ncopy; i++) handle_close(r->copy[i]);        /* the process handle */
     out_object(r, svcobj_new(&iface_proxy, NULL, NULL));
 }
 

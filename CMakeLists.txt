@@ -14,7 +14,8 @@ get_filename_component(LIFTED_DIR "${LIFTED_DIR}" ABSOLUTE)
 # lifted code: no FP contraction (the guest fuses only where it says so), no strict aliasing (guest memory is
 # untyped); -O1 keeps compile time reasonable for the very large generated functions
 set(LIFT_FLAGS /clang:-O1 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-march=haswell
-               /clang:-fbracket-depth=1024 /clang:-Wno-everything)
+               /clang:-fbracket-depth=1024 /clang:-Wno-everything
+               /clang:-gline-tables-only /clang:-gcodeview)   # lines = guest offsets (a64lift #line)
 
 file(GLOB LIFTED_SOURCES CONFIGURE_DEPENDS "${LIFTED_DIR}/*.c")
 add_library(lifted STATIC ${LIFTED_SOURCES})
@@ -32,7 +33,7 @@ target_compile_options(a64rt PRIVATE ${LIFT_FLAGS})
 # the game: the runtime (kernel, SVCs, services) around the lifted code
 set(RUNTIME_SOURCES runtime/main.c runtime/loader.c runtime/dispatch.c runtime/mem.c runtime/kernel.c runtime/kmem.c
                     runtime/svc.c runtime/ipc.c runtime/services/am.c runtime/services/lm.c runtime/services/apm.c
-                    runtime/services/pctl.c runtime/services/vi.c
+                    runtime/services/pctl.c runtime/services/vi.c runtime/services/hid.c runtime/services/time.c runtime/services/acc.c runtime/services/mii.c runtime/services/audio.c runtime/services/pl.c runtime/services/set.c
                     runtime/services/fs.c runtime/romfs.c runtime/nvn.c)
 add_executable(mk8recomp ${RUNTIME_SOURCES})
 target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter /clang:-Wno-bitwise-op-parentheses

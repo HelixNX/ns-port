@@ -14,7 +14,7 @@ typedef struct IpcReq {
     u32 type, cmd, token;
     bool has_pid;
     u64 pid;
-    u32 copy[8], move[8];
+    u32 copy[8], move[8];           /* copied handles stay the client's (never close them); moved ones are the server's */
     int ncopy, nmove;
     IpcBuf x[16], a[16], b[16], w[16], c[16];
     int nx, na, nb, nw, nc;
@@ -60,6 +60,17 @@ SvcObj *service_open(const char *name);
 static inline u64 in_u64(IpcReq *r, u32 off) { u64 v = 0; if (off + 8 <= r->in_size) memcpy(&v, r->in + off, 8); return v; }
 static inline u32 in_u32(IpcReq *r, u32 off) { u32 v = 0; if (off + 4 <= r->in_size) memcpy(&v, r->in + off, 4); return v; }
 static inline u8 in_u8(IpcReq *r, u32 off) { return off < r->in_size ? r->in[off] : 0; }
+/* the i-th output (B, or its C partner when an auto-select B is empty) and input (A, or X) buffers */
+static inline const IpcBuf *buf_out(IpcReq *r, int i) {
+    if (i < r->nb && r->b[i].size) return &r->b[i];
+    if (i < r->nc && r->c[i].size) return &r->c[i];
+    return i < r->nb ? &r->b[i] : NULL;
+}
+static inline const IpcBuf *buf_in(IpcReq *r, int i) {
+    if (i < r->na && r->a[i].size) return &r->a[i];
+    if (i < r->nx && r->x[i].size) return &r->x[i];
+    return i < r->na ? &r->a[i] : NULL;
+}
 void out_data(IpcReq *r, const void *p, u32 size);          /* appends, aligned to min(size, 8) */
 static inline void out_u64(IpcReq *r, u64 v) { out_data(r, &v, 8); }
 static inline void out_u32(IpcReq *r, u32 v) { out_data(r, &v, 4); }
@@ -86,6 +97,13 @@ void lm_register(void);
 void apm_register(void);
 void pctl_register(void);
 void vi_register(void);
+void hid_register(void);
+void time_register(void);
+void acc_register(void);
+void mii_register(void);
+void audio_register(void);
+void pl_register(const char *save_dir);
+void set_register(void);
 void fs_register(const char *game_dir, const char *save_dir);
 
 #endif

@@ -5,12 +5,22 @@
  * Usage: mk8recomp [--game <dump dir>] [--image <image dir>] [--save <dir>] [--log <0-2>]
  *   --game   the dumped game: exefs/main.npdm, romfs/ (default: ../../dump_v21 from the executable)
  *   --image  module images from tools/lifter/a64image.py (default: ../image from the executable)
- *   --save   save data folders (default: ../save from the executable, i.e. build/save) */
+ *   --save   save data folders (default: ../save from the executable, i.e. build/save)
+ *   --dump-after N   after N seconds, print every guest thread's state and backtrace, then exit */
 #include "ipc.h"
 #include <stdlib.h>
 #include <windows.h>
+#include <process.h>
 
 static char game_dir[1024], image_dir[1024], save_dir[1024];
+static int dump_after;                                  /* seconds; then print every thread's state and exit */
+
+static unsigned __stdcall dump_thread(void *p) {
+    Sleep((DWORD)dump_after * 1000);
+    hlog(0, "--dump-after %d: thread states", dump_after);
+    kernel_dump_threads();
+    fatal("stopped after %d seconds", dump_after);
+}
 
 void u_nnosGetDefaultUserExceptionStackForApplication(Ctx *c) {
     guest_trap(c, "call to the unresolved nnosGetDefaultUserExceptionStackForApplication", c->x[30]);
@@ -60,7 +70,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) snprintf(image_dir, sizeof image_dir, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--save") && i + 1 < argc) snprintf(save_dir, sizeof save_dir, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_level = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: mk8recomp [--game DIR] [--image DIR] [--save DIR] [--log 0-2]\n"); return 2; }
+        else if (!strcmp(argv[i], "--dump-after") && i + 1 < argc) dump_after = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: mk8recomp [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
     mem_init();
@@ -87,6 +98,7 @@ int main(int argc, char **argv) {
     c->x[3] = hostcall_register("rtld DT_INIT", h_rtld_run_dt_init);
     hlog(1, "main thread: stack %llx bytes, priority %u, core %u", stack_size, npdm.prio, npdm.core);
     thread_start(t);
+    if (dump_after) _beginthreadex(NULL, 0, dump_thread, NULL, 0, NULL);
     WaitForSingleObject((HANDLE)t->host, INFINITE);
     hlog(1, "the main thread exited");
     return 0;

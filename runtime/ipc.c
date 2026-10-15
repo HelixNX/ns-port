@@ -1,6 +1,7 @@
 /* HIPC framing, CMIF requests, sessions and domains, and the service manager (sm:). */
 #include "ipc.h"
 #include <stdlib.h>
+#include <windows.h>
 
 /* ---------------------------------------------------------------------------------------------- service objects */
 SvcObj *svcobj_new(const Iface *iface, void *data, const char *name) {
@@ -39,47 +40,102 @@ SvcObj *service_open(const char *name) {
 }
 
 /* ---------------------------------------------------------------------------------------------- sessions */
+/* A domain: the objects behind one or more sessions (a domain session's clones share it), by id - 1. */
+typedef struct Domain {
+    SRWLOCK lock;
+    volatile long refs;
+    SvcObj **objs;
+    int cap;
+} Domain;
+
 typedef struct KSession {
     KObj obj;
-    SvcObj *root;
-    bool domain;
-    SvcObj *objs[64];               /* domain objects by id - 1 */
+    SRWLOCK lock;                   /* a non-domain session serves one request at a time, as on the console */
+    SvcObj *root;                   /* the object, until the session becomes a domain */
+    Domain *domain;
 } KSession;
 
 static bool session_signaled(KObj *o) { (void)o; return false; }
 
+static void domain_unref(Domain *d) {
+    if (InterlockedDecrement(&d->refs)) return;
+    for (int i = 0; i < d->cap; i++)
+        if (d->objs[i]) svcobj_unref(d->objs[i]);
+    free(d->objs);
+    free(d);
+}
+
 static void session_destroy(KObj *o) {
     KSession *s = (KSession *)o;
     if (s->root) svcobj_unref(s->root);
-    for (int i = 0; i < 64; i++)
-        if (s->objs[i]) svcobj_unref(s->objs[i]);
+    if (s->domain) domain_unref(s->domain);
     free(s);
+}
+
+static KSession *session_alloc(void) {
+    KSession *s = calloc(1, sizeof *s);
+    kobj_init(&s->obj, KO_SESSION, session_destroy, session_signaled);
+    InitializeSRWLock(&s->lock);
+    return s;
 }
 
 /* a new client session handle for o (takes the caller's reference) */
 static u32 session_new(SvcObj *o, u32 *h) {
-    KSession *s = calloc(1, sizeof *s);
-    kobj_init(&s->obj, KO_SESSION, session_destroy, session_signaled);
+    KSession *s = session_alloc();
     s->root = o;
     u32 r = handle_new(&s->obj, h);
     kobj_unref(&s->obj);
     return r;
 }
 
-static u32 domain_add(KSession *s, SvcObj *o) {
-    for (int i = 0; i < 64; i++)
-        if (!s->objs[i]) {
-            s->objs[i] = o;
-            return (u32)i + 1;
-        }
-    fatal("domain of %s is full", s->root ? s->root->name : "?");
+/* adds o (taking the reference) and returns its id */
+static u32 domain_add(Domain *d, SvcObj *o) {
+    AcquireSRWLockExclusive(&d->lock);
+    int i = 0;
+    while (i < d->cap && d->objs[i]) i++;
+    if (i == d->cap) {
+        int n = d->cap ? d->cap * 2 : 16;
+        d->objs = realloc(d->objs, n * sizeof *d->objs);
+        memset(d->objs + d->cap, 0, (n - d->cap) * sizeof *d->objs);
+        d->cap = n;
+    }
+    d->objs[i] = o;
+    ReleaseSRWLockExclusive(&d->lock);
+    hlog(2, "ipc: domain %p object %d = %s", (void *)d, i + 1, o->name);
+    return (u32)i + 1;
+}
+
+/* the object with this id, with a reference, or NULL */
+static SvcObj *domain_get(Domain *d, u32 id) {
+    SvcObj *o = NULL;
+    AcquireSRWLockShared(&d->lock);
+    if (id && (int)id <= d->cap && d->objs[id - 1]) {
+        o = d->objs[id - 1];
+        svcobj_ref(o);
+    }
+    ReleaseSRWLockShared(&d->lock);
+    return o;
+}
+
+static void domain_close(Domain *d, u32 id) {
+    SvcObj *o = NULL;
+    AcquireSRWLockExclusive(&d->lock);
+    if (id && (int)id <= d->cap) {
+        o = d->objs[id - 1];
+        d->objs[id - 1] = NULL;
+    }
+    ReleaseSRWLockExclusive(&d->lock);
+    if (o) {
+        hlog(2, "ipc: domain %p object %u closed (%s)", (void *)d, id, o->name);
+        svcobj_unref(o);
+    }
 }
 
 /* ---------------------------------------------------------------------------------------------- replies */
 void out_data(IpcReq *r, const void *p, u32 size) {
     u32 align = size >= 8 ? 8 : size >= 4 ? 4 : size >= 2 ? 2 : 1;
     r->out_size = (r->out_size + align - 1) & ~(align - 1);
-    if (r->out_size + size > sizeof r->out) fatal("reply of %s too large", r->session->root->name);
+    if (r->out_size + size > sizeof r->out) fatal("ipc: reply too large");
     memcpy(r->out + r->out_size, p, size);
     r->out_size += size;
 }
@@ -111,6 +167,13 @@ void services_init(const char *game_dir, const char *save_dir) {
     apm_register();
     pctl_register();
     vi_register();
+    hid_register();
+    time_register();
+    acc_register();
+    mii_register();
+    audio_register();
+    pl_register(save_dir);
+    set_register();
     fs_register(game_dir, save_dir);
 }
 
@@ -136,29 +199,28 @@ static void control(KSession *s, IpcReq *r) {
     switch (r->cmd) {
     case 0:                                              /* ConvertCurrentObjectToDomain */
         if (!s->domain) {
-            s->domain = true;
-            s->objs[0] = s->root;
+            Domain *d = calloc(1, sizeof *d);
+            InitializeSRWLock(&d->lock);
+            d->refs = 1;
+            s->domain = d;
+            domain_add(d, s->root);
             s->root = NULL;
         }
         out_u32(r, 1);
         break;
     case 1: {                                            /* CopyFromCurrentDomain */
-        u32 id = in_u32(r, 0);
-        if (!s->domain || id == 0 || id > 64 || !s->objs[id - 1]) { r->result = 0x3d80b; break; }  /* sf: invalid object */
-        svcobj_ref(s->objs[id - 1]);
+        SvcObj *o = s->domain ? domain_get(s->domain, in_u32(r, 0)) : NULL;
+        if (!o) { r->result = 0x3d80b; break; }          /* sf: invalid object */
         u32 h;
-        session_new(s->objs[id - 1], &h);
+        session_new(o, &h);
         out_move_handle(r, h);
         break;
     }
-    case 2: case 4: {                                    /* CloneCurrentObject(Ex) */
-        u32 h;
-        KSession *n = calloc(1, sizeof *n);
-        kobj_init(&n->obj, KO_SESSION, session_destroy, session_signaled);
-        n->domain = s->domain;
+    case 2: case 4: {                                    /* CloneCurrentObject(Ex): the same object or domain */
+        KSession *n = session_alloc();
         if (s->root) { svcobj_ref(s->root); n->root = s->root; }
-        for (int i = 0; i < 64; i++)
-            if (s->objs[i]) { svcobj_ref(s->objs[i]); n->objs[i] = s->objs[i]; }
+        if (s->domain) { InterlockedIncrement(&s->domain->refs); n->domain = s->domain; }
+        u32 h;
         handle_new(&n->obj, &h);
         kobj_unref(&n->obj);
         out_move_handle(r, h);
@@ -176,6 +238,8 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
     (void)size;
     KSession *s = (KSession *)handle_get(handle, KO_SESSION);
     if (!s) return R_INVALID_HANDLE;
+    bool serial = !s->domain;
+    if (serial) AcquireSRWLockExclusive(&s->lock);
     u32 *m = (u32 *)(uintptr_t)msg;
     IpcReq *r = calloc(1, sizeof *r);
     r->session = s;
@@ -214,8 +278,9 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
     /* the CMIF payload starts at the next 16-byte boundary */
     const u8 *data = (const u8 *)(((uintptr_t)raw + 15) & ~(uintptr_t)15);
     const u8 *raw_end = (const u8 *)(raw + raw_words);
-    SvcObj *target = s->root;
-    bool domain_msg = s->domain && (r->type == 4 || r->type == 6);
+    SvcObj *target = NULL;
+    Domain *dom = s->domain;
+    bool domain_msg = dom && (r->type == 4 || r->type == 6);
     u32 domain_cmd = 0, domain_obj = 0;
     if (domain_msg) {
         domain_cmd = data[0];
@@ -225,7 +290,10 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         for (int i = 0; i < r->nin_objs && i < 8; i++) memcpy(&r->in_objs[i], data + 16 + payload + 4 * i, 4);
         data += 16;
         raw_end = data + payload;
-        target = domain_obj && domain_obj <= 64 ? s->objs[domain_obj - 1] : NULL;
+        if (domain_cmd != 2) target = domain_get(dom, domain_obj);
+    } else if (s->root) {
+        target = s->root;
+        svcobj_ref(target);
     }
     u32 magic;
     memcpy(&magic, data, 4);
@@ -241,12 +309,9 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         break;
     case 4: case 6:
         if (domain_msg && domain_cmd == 2) {             /* close a domain object */
-            if (domain_obj && domain_obj <= 64 && s->objs[domain_obj - 1]) {
-                svcobj_unref(s->objs[domain_obj - 1]);
-                s->objs[domain_obj - 1] = NULL;
-            }
+            domain_close(dom, domain_obj);
         } else if (!target) {
-            hlog(0, "ipc: request to missing domain object %u", domain_obj);
+            hlog(0, "ipc: request to missing domain object %u in domain %p (command %u)", domain_obj, (void *)dom, r->cmd);
             r->result = 0x3d80b;
         } else {
             dispatch(target, r);
@@ -261,8 +326,9 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         break;
     }
     /* reply: header, handles, then padding to 16 bytes, [domain header], SFCO header, data, [domain object ids] */
+    if (target) svcobj_unref(target);
     u32 nobjs_handles = 0;
-    if (!s->domain)
+    if (!domain_msg)
         for (int i = 0; i < r->nout_objs; i++) {
             u32 h;
             session_new(r->out_objs[i], &h);
@@ -294,7 +360,7 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         u8 *end = d + 16 + r->out_size;
         if (domain_msg)
             for (int i = 0; i < r->nout_objs; i++) {
-                u32 id = domain_add(s, r->out_objs[i]);
+                u32 id = domain_add(dom, r->out_objs[i]);
                 memcpy(end, &id, 4);
                 end += 4;
             }
@@ -304,6 +370,7 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         m[1] = words | (special ? 1u << 31 : 0);
     }
     (void)nobjs_handles;
+    if (serial) ReleaseSRWLockExclusive(&s->lock);
     kobj_unref(&s->obj);
     free(r);
     return R_OK;

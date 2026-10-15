@@ -3,7 +3,7 @@
 
 /* a packet: u64 pid, u64 thread id, u8 flags, u8 pad, u8 severity, u8 verbosity, u32 payload size, payload */
 static void logger_log(SvcObj *o, IpcReq *r) {
-    const IpcBuf *b = r->nx && r->x[0].size ? &r->x[0] : r->na ? &r->a[0] : NULL;
+    const IpcBuf *b = buf_in(r, 0);
     if (!b || b->size < 0x18) return;
     const u8 *p = (const u8 *)(uintptr_t)b->addr;
     u32 len;

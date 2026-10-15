@@ -48,7 +48,9 @@ u32 shmem_map(u32 handle, u64 addr, u64 size, u32 perm) {
     else if (s->addr) r = R_INVALID_STATE;
     else if (!mem_is_free(addr, size)) r = R_INVALID_MEMSTATE;
     else {
-        mem_map(addr, size, MS_SHARED, perm & MP_RW);
+        /* host-writable whatever the guest asked for: the service keeps writing to it */
+        mem_map(addr, size, MS_SHARED, MP_RW);
+        mem_set_block(addr, size, MS_SHARED, perm & MP_RW);
         memcpy((void *)(uintptr_t)addr, s->staging, size);
         __atomic_store_n(&s->addr, addr, __ATOMIC_RELEASE);
         hlog(1, "shared memory %s mapped at %llx (%llx bytes)", s->name, addr, size);

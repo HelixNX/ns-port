@@ -176,6 +176,20 @@ void guest_unimpl(Ctx *c, u64 pc, u32 insn, const char *what) {
     fatal("stopped");
 }
 
+/* the guest instruction behind a host address in lifted code (its line number is the guest offset), or 0 */
+static u64 guest_pc_of(DWORD64 rip) {
+    IMAGEHLP_LINE64 line;
+    memset(&line, 0, sizeof line);
+    line.SizeOfStruct = sizeof line;
+    DWORD disp = 0;
+    if (!SymGetLineFromAddr64(GetCurrentProcess(), rip, &disp, &line) || !line.FileName) return 0;
+    const char *f = strrchr(line.FileName, '\\');
+    f = f ? f + 1 : line.FileName;
+    for (int i = 0; i < num_loaded_mods; i++)
+        if (!strcmp(f, loaded_mods[i].name)) return loaded_mods[i].base + line.LineNumber;
+    return 0;
+}
+
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
@@ -195,6 +209,8 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     } else {
         hlog(0, "exception %08lx in %s+%llx", code, fn, (unsigned long long)disp);
     }
+    u64 gpc = guest_pc_of(rip);
+    if (gpc) hlog(0, "  at guest instruction %s", describe_addr(gpc, b, sizeof b));
     /* a lifted function f_<addr> names the guest function */
     if (!strncmp(fn, "f_", 2) || !strncmp(fn, "b_", 2)) {
         u64 g = strtoull(fn + 2, NULL, 16);
@@ -207,10 +223,38 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     fatal("crashed");
 }
 
+/* the lifted function a host thread is executing (suspends it briefly) */
+void host_where(void *thread, char *buf, size_t n) {
+    HANDLE h = (HANDLE)thread;
+    CONTEXT ctx = {0};
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    snprintf(buf, n, "?");
+    if (SuspendThread(h) == (DWORD)-1) return;
+    if (GetThreadContext(h, &ctx)) {
+        char sb[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+        memset(sb, 0, sizeof sb);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        u64 gpc = guest_pc_of(ctx.Rip);
+        char b[160];
+        if (gpc) {
+            snprintf(buf, n, "%s", describe_addr(gpc, b, sizeof b));
+        } else if (SymFromAddr(GetCurrentProcess(), ctx.Rip, &disp, si)) {
+            if (!strncmp(si->Name, "f_", 2) || !strncmp(si->Name, "b_", 2))
+                snprintf(buf, n, "%s", describe_addr(strtoull(si->Name + 2, NULL, 16), b, sizeof b));
+            else
+                snprintf(buf, n, "%s+%llx", si->Name, (unsigned long long)disp);
+        }
+    }
+    ResumeThread(h);
+}
+
 void diag_init(void) {
     QueryPerformanceFrequency(&qpc_freq);
     QueryPerformanceCounter(&qpc_start);
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, crash_handler);
 }

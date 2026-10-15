@@ -37,6 +37,7 @@ MODULES = ['main', 'subsdk0', 'sdk']
 BASES = {'main': 0x7100000000, 'subsdk0': 0x7101400000, 'sdk': 0x7101c00000}
 
 NREG = 32          # X0..X30 and SP (31)
+LINE_INFO = os.environ.get('LIFT_LINES', '1') != '0'   # #line <guest offset> before every instruction
 
 
 def regname(n):
@@ -303,11 +304,19 @@ def code_address_refs(mod):
         w = mod.word(a)
         if w & 0x9f000000 == 0x10000000:                               # ADR
             t = a + sx(((w >> 5) & 0x7ffff) << 2 | (w >> 29) & 3, 21)
-        elif w & 0x9f000000 == 0x90000000:                             # ADRP + ADD
-            w2 = mod.word(a + 4)
-            if w2 & 0xffc00000 != 0x91000000 or (w2 >> 5) & 31 != w & 31:
-                continue
-            t = (a & ~0xfff) + (sx(((w >> 5) & 0x7ffff) << 2 | (w >> 29) & 3, 21) << 12) + ((w2 >> 10) & 0xfff)
+        elif w & 0x9f000000 == 0x90000000:                             # ADRP, then ADD from that register
+            rd = w & 31
+            page = (a & ~0xfff) + (sx(((w >> 5) & 0x7ffff) << 2 | (w >> 29) & 3, 21) << 12)
+            for b in range(a + 4, min(a + 4 * 32, t1), 4):
+                w2 = mod.word(b)
+                if w2 & 0xffc00000 == 0x91000000 and (w2 >> 5) & 31 == rd:
+                    t = page + ((w2 >> 10) & 0xfff)
+                    if t0 <= t < t1 and not t & 3:
+                        out.add(t)
+                if w2 & 0xfc000000 in (0x14000000, 0x94000000) or w2 & 0xfffffc1f == 0xd65f0000 or \
+                        (w2 & 0x9f000000 == 0x90000000 and w2 & 31 == rd):
+                    break             # B, BL, RET or a new ADRP to rd end the search (extra hits only add entries)
+            continue
         else:
             continue
         if t0 <= t < t1 and not t & 3:
@@ -415,7 +424,11 @@ def emit(fn, lines, entries=None):
                                                           if i or fn.order[0] != e))
     elif fn.order[0] != fn.entry:
         out.append('  goto L_%x;' % fn.entry)
+    base = fn.mod.base
+    out.append('#line %d "%s"' % (fn.order[0] - base, fn.mod.name))
     for pc, stmt in lines:
+        if pc is not None and LINE_INFO:
+            out.append('#line %d' % (pc - base))       # guest offset as the line number: crash reports name it
         if pc is not None and pc in fn.labels:
             out.append('L_%x: %s' % (pc, stmt))
         else:

@@ -134,6 +134,7 @@ typedef struct KThread {
 
 extern __declspec(thread) KThread *cur_thread;
 void kernel_init(void);
+void kernel_dump_threads(void);
 void klock(void);
 void kunlock(void);
 KThread *thread_create(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 core);
@@ -189,6 +190,7 @@ const char *sym_name(u64 addr, u64 *offset);        /* nearest symbol at or belo
 /* ---------------------------------------------------------------------------------------------- dispatch */
 void dispatch_init(void);
 void diag_init(void);
+void host_where(void *thread, char *buf, size_t n);
 u64 hostcall_register(const char *name, GuestFn fn);  /* returns the guest address that calls fn */
 GuestFn guest_fn(u64 addr);                            /* lifted function or host call at addr, or NULL */
 void dispatch_override(u64 addr, GuestFn fn);          /* calls through pointers to addr go to fn */
