@@ -1,8 +1,8 @@
 # mk8recomp — plan
 
-> **Update 2026-10-15:** the target is now update **3.0.5** (`dump_v21/`), which is **64-bit AArch64**, so
-> ssbu-recomp's lifter and runtime are reused and the A32 lifter below is shelved. (3.0.1 was still 32-bit.) From 3.x
-> the NVN driver lives in `sdk`, and `subsdk0` is the movie player. The tables below describe 1.0.0.
+> **Superseded (2026-10-15).** The target is now 3.0.5 (64-bit AArch64), with our own design: AArch64 lifter, the
+> SDK run as-is over emulated SVCs and services, and NVN on Vulkan. See `../CLAUDE.md`. This file records the
+> original 1.0.0 (32-bit) plan.
 > Current status and next steps: `../CLAUDE.md`.
 
 Static recompilation of Mario Kart 8 Deluxe 1.0.0 (title 0100152000022000, your own dump) to a native
