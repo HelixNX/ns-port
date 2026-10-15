@@ -104,9 +104,23 @@ def export(elf, out, t0):
         else:
             nxt = ida_bytes.next_head(ea, text.end_ea)
             ea = nxt if nxt != ida_idaapi.BADADDR and nxt > ea else text.end_ea
+    # targets of indirect jumps that IDA resolved (switch tables): BR address -> sorted case targets
+    import ida_nalt
+    import ida_xref
+    switches = {}
+    for f in funcs:
+        for s, e in f['chunks']:
+            for ea in idautils.Heads(s, e):
+                if ida_nalt.get_switch_info(ea) is None:
+                    continue
+                targets = sorted({x for x in idautils.CodeRefsFrom(ea, False)})
+                if targets:
+                    switches[ea] = targets
     code_bytes = sum(sum(e - s for s, e in f['chunks']) for f in funcs)
     json.dump({'module': os.path.basename(elf), 'text': [text.start_ea, text.end_ea],
-               'functions': funcs, 'text_data': data}, open(out, 'w'))
+               'functions': funcs, 'text_data': data,
+               'switches': {'%x' % k: v for k, v in sorted(switches.items())}}, open(out, 'w'))
+    print('switch tables %d' % len(switches))
     print('functions %d  code bytes in functions %x of %x  data ranges in .text %d (%x bytes)  total %.0fs' % (
         len(funcs), code_bytes, text.end_ea - text.start_ea, len(data), sum(e - s for s, e in data), time.time() - t0))
 
