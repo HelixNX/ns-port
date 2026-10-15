@@ -29,7 +29,7 @@
 #define MODULES_END     0x7103000000ull
 #define MISC_BASE       0x7103000000ull     /* one page of loader data (rtld's lists) */
 #define HOSTCALL_BASE   0x7104000000ull     /* guest addresses of host functions (never mapped) */
-#define HOSTCALL_MAX    256
+#define HOSTCALL_MAX    4096
 
 #define TOTAL_MEMORY    0xcd500000ull       /* the application pool reported to the game */
 
@@ -156,6 +156,15 @@ KEvent *event_create(void);
 void event_signal(KEvent *e);
 void event_clear(KEvent *e);
 
+/* memory objects (kmem.c) */
+typedef struct KTmem { KObj obj; u64 addr, size; u32 perm; } KTmem;
+typedef struct KShmem { KObj obj; u64 size, addr; u8 *staging; char name[32]; } KShmem;
+u32 tmem_create(u64 addr, u64 size, u32 perm, u32 *handle);
+KShmem *shmem_create(u64 size, const char *name);
+void *shmem_ptr(KShmem *s);                         /* where the contents are now (guest mapping or staging) */
+u32 shmem_map(u32 handle, u64 addr, u64 size, u32 perm);
+u32 shmem_unmap(u32 handle, u64 addr, u64 size);
+
 /* ---------------------------------------------------------------------------------------------- SVCs, IPC */
 void svc_dispatch(Ctx *c, u32 imm);
 u32 ipc_connect_named_port(const char *name, u32 *out);
@@ -182,6 +191,8 @@ void dispatch_init(void);
 void diag_init(void);
 u64 hostcall_register(const char *name, GuestFn fn);  /* returns the guest address that calls fn */
 GuestFn guest_fn(u64 addr);                            /* lifted function or host call at addr, or NULL */
+void dispatch_override(u64 addr, GuestFn fn);          /* calls through pointers to addr go to fn */
+void nvn_init(void);
 void guest_call(Ctx *c, u64 addr);                      /* call_ind without the guest's LR */
 void host_thread_init(Ctx *c);                         /* per host thread: FP state */
 

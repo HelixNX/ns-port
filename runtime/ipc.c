@@ -110,6 +110,7 @@ void services_init(const char *game_dir, const char *save_dir) {
     lm_register();
     apm_register();
     pctl_register();
+    vi_register();
     fs_register(game_dir, save_dir);
 }
 

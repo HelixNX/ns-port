@@ -1,0 +1,6 @@
+# Symbols whose calls (through PLT stubs) become calls of host functions h_<symbol>(c), one per line.
+# runtime/nvn.c: graphics are intercepted at NVN, so the sdk's nv:: setup never runs
+nvnBootstrapLoader
+_ZN2nv18InitializeGraphicsEPvm
+_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_
+_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_

@@ -44,8 +44,16 @@ GuestFn guest_fn(u64 addr) {
     return NULL;
 }
 
+void dispatch_override(u64 addr, GuestFn fn) {
+    for (int i = 0; i < ntables; i++) {
+        u64 off = addr - tables[i].base;
+        if (off < tables[i].span) tables[i].tab[off / 4] = fn;
+    }
+}
+
 void call_ind(Ctx *c, u64 addr) {
     GuestFn f = guest_fn(addr);
+    c->pc = addr;                      /* host calls shared by several addresses tell them apart by it */
     if (!f) guest_trap(c, "call to an address with no lifted function", addr);
     f(c);
 }
@@ -139,6 +147,17 @@ void dump_ctx(Ctx *c) {
                 c->x[i + 1], i + 2, c->x[i + 2], i == 28 ? "sp" : "x", i == 28 ? 0 : i + 3, c->x[i + 3]);
     fprintf(stderr, "  lr = %s\n", describe_addr(c->x[30], b, sizeof b));
     fprintf(stderr, "  tpidrro %llx tpidr %llx\n", c->tpidrro, c->tpidr);
+    /* the guest's frame records: x29 -> {previous x29, return address} */
+    u64 fp = c->x[29];
+    for (int depth = 0; depth < 24 && fp && !(fp & 7); depth++) {
+        MemInfo mi;
+        mem_query(fp, &mi);
+        if (mi.state == MS_FREE || mi.state == MS_INACCESSIBLE || !(mi.perm & MP_R)) break;
+        u64 next = LD64(fp), ret = LD64(fp + 8);
+        fprintf(stderr, "  #%-2d %s\n", depth, describe_addr(ret, b, sizeof b));
+        if (next <= fp) break;
+        fp = next;
+    }
     fflush(stderr);
     ReleaseSRWLockExclusive(&loglock);
 }

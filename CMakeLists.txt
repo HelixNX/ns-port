@@ -30,17 +30,18 @@ target_include_directories(a64rt PUBLIC runtime)
 target_compile_options(a64rt PRIVATE ${LIFT_FLAGS})
 
 # the game: the runtime (kernel, SVCs, services) around the lifted code
-set(RUNTIME_SOURCES runtime/main.c runtime/loader.c runtime/dispatch.c runtime/mem.c runtime/kernel.c
+set(RUNTIME_SOURCES runtime/main.c runtime/loader.c runtime/dispatch.c runtime/mem.c runtime/kernel.c runtime/kmem.c
                     runtime/svc.c runtime/ipc.c runtime/services/am.c runtime/services/lm.c runtime/services/apm.c
-                    runtime/services/pctl.c
-                    runtime/services/fs.c runtime/romfs.c)
+                    runtime/services/pctl.c runtime/services/vi.c
+                    runtime/services/fs.c runtime/romfs.c runtime/nvn.c)
 add_executable(mk8recomp ${RUNTIME_SOURCES})
 target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter /clang:-Wno-bitwise-op-parentheses
                                          /clang:-fno-strict-aliasing)
 target_compile_definitions(mk8recomp PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
-target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt)
+target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi)
 # /DEBUG: a PDB whose public symbols name the lifted functions (f_<guest address>) in crash reports
-target_link_options(mk8recomp PRIVATE /DEBUG /INCREMENTAL:NO)
+# /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range
+target_link_options(mk8recomp PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO)
 
 # links every lifted function with stub runtime entry points (M2 check)
 add_executable(linkcheck runtime/linkcheck.c)

@@ -68,6 +68,7 @@ int main(int argc, char **argv) {
     dispatch_init();
     services_init(game_dir, save_dir);
     loader_load(image_dir);
+    nvn_init();
     Npdm npdm = read_npdm();
     u64 stack_size = (npdm.stack_size + 0xfffull) & ~0xfffull;
     if (stack_size > MAINSTACK_MAX) fatal("main thread stack of %llx bytes is too large", stack_size);

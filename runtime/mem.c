@@ -7,6 +7,7 @@
 #include "hos.h"
 #include <stdlib.h>
 #include <windows.h>
+#include <psapi.h>
 
 typedef struct Block { u64 addr, size; u32 state, perm, attr; } Block;
 static Block *blocks;
@@ -92,8 +93,20 @@ void mem_init(void) {
     insert_at(1, (Block){AS_BASE, AS_END - AS_BASE, MS_FREE, MP_NONE, 0});
     insert_at(2, (Block){AS_END, 0 - AS_END, MS_INACCESSIBLE, MP_NONE, 0});
     void *p = VirtualAlloc((void *)(uintptr_t)AS_BASE, AS_END - AS_BASE, MEM_RESERVE, PAGE_NOACCESS);
-    if (p != (void *)(uintptr_t)AS_BASE)
+    if (p != (void *)(uintptr_t)AS_BASE) {
+        for (u64 a = AS_BASE; a < AS_END;) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
+            if (mbi.State != MEM_FREE) {
+                char name[MAX_PATH] = "";
+                GetMappedFileNameA(GetCurrentProcess(), mbi.AllocationBase, name, sizeof name);
+                hlog(0, "in the way: %p+%llx state %lx type %lx %s", mbi.BaseAddress, (u64)mbi.RegionSize, mbi.State,
+                     mbi.Type, name);
+            }
+            a = (u64)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        }
         fatal("cannot reserve the guest address space %llx-%llx (error %lu)", AS_BASE, AS_END, GetLastError());
+    }
     /* never handed out: the loader's page and the host-call addresses */
     mem_set_block(HOSTCALL_BASE, 0x10000, MS_INACCESSIBLE, MP_NONE);
 }

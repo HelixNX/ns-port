@@ -85,6 +85,7 @@ void am_register(void);
 void lm_register(void);
 void apm_register(void);
 void pctl_register(void);
+void vi_register(void);
 void fs_register(const char *game_dir, const char *save_dir);
 
 #endif

@@ -152,6 +152,9 @@ void svc_dispatch(Ctx *c, u32 n) {
         kobj_unref(&e->obj);
         break;
     }
+    case 0x13: r = shmem_map((u32)x[0], x[1], x[2], (u32)x[3]); break;
+    case 0x14: r = shmem_unmap((u32)x[0], x[1], x[2]); break;
+    case 0x15: { u32 h = 0; r = tmem_create(x[1], x[2], (u32)x[3], &h); x[1] = h; break; }
     case 0x16: r = handle_close((u32)x[0]); break;
     case 0x18: {
         u32 cnt = (u32)x[2];
