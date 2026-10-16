@@ -356,6 +356,18 @@ static void texinfo_from_builder(const TexBuilder *b, TexInfo *t) {
     t->stride = (s32)b->stride;
     /* NVNpackagedTextureLayout: byte 0 is the block height (log2 GOBs) chosen by the packaging tool */
     t->block_height = b->has_layout ? b->layout[0] : 0xff;
+    if (b->has_layout) {
+        static u64 seen[64];
+        static int nseen;
+        u64 key = 0;
+        memcpy(&key, b->layout, 8);
+        bool found = false;
+        for (int i = 0; i < nseen; i++) found |= seen[i] == key;
+        if (!found && nseen < 64) {
+            seen[nseen++] = key;
+            hlog(1, "nvn: packaged layout %016llx for %ux%u fmt %u levels %u", key, t->width, t->height, t->format, t->levels);
+        }
+    }
     if (t->target == TEX_1D || t->target == TEX_BUFFER) t->height = 1;
     if (t->target != TEX_3D && t->target != TEX_2D_ARRAY && t->target != TEX_2D_MS_ARRAY && t->target != TEX_CUBE &&
         t->target != TEX_CUBE_ARRAY) t->depth = 1;

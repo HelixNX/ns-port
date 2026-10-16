@@ -17,6 +17,7 @@
 #include <windows.h>
 
 static CRITICAL_SECTION gpu_cs;
+static u64 frame_no;                    /* frames presented so far */
 static bool gpu_ready;
 
 /* ---------------------------------------------------------------------------------------------- submissions */
@@ -270,8 +271,38 @@ static u32 info_hash(const TexInfo *t0) {
 }
 
 static u64 image_epoch;                 /* bumped whenever images are destroyed */
+
+/* every image by storage address (sub-resource lookups) */
+static Image **byaddr;
+static int nbyaddr, capbyaddr;
+
+static int byaddr_lower(u64 a) {          /* first index with addr >= a */
+    int lo = 0, hi = nbyaddr;
+    while (lo < hi) {
+        int m = (lo + hi) / 2;
+        if (byaddr[m]->info.addr < a) lo = m + 1; else hi = m;
+    }
+    return lo;
+}
+static void byaddr_add(Image *im) {
+    if (nbyaddr == capbyaddr) byaddr = realloc(byaddr, (capbyaddr = capbyaddr * 2 + 1024) * sizeof *byaddr);
+    int i = byaddr_lower(im->info.addr);
+    memmove(&byaddr[i + 1], &byaddr[i], (nbyaddr - i) * sizeof *byaddr);
+    byaddr[i] = im;
+    nbyaddr++;
+}
+static void byaddr_remove(Image *im) {
+    for (int i = byaddr_lower(im->info.addr); i < nbyaddr && byaddr[i]->info.addr == im->info.addr; i++)
+        if (byaddr[i] == im) {
+            memmove(&byaddr[i], &byaddr[i + 1], (nbyaddr - i - 1) * sizeof *byaddr);
+            nbyaddr--;
+            return;
+        }
+}
+
 static void image_destroy(Image *im) {
     image_epoch++;
+    byaddr_remove(im);
     for (int i = 0; i < im->nviews; i++) bury(DEAD_VIEW, im->views[i].view, NULL);
     free(im->views);
     bury(DEAD_IMAGE, im->image, &im->alloc);
@@ -285,6 +316,12 @@ static void images_drop_range(u64 lo, u64 hi) {
         while (*pp) {
             Image *im = *pp;
             if (im->info.addr >= lo && im->info.addr < hi) {
+                static int logged;
+                if (im->gpu_written && logged < 20) {
+                    logged++;
+                    hlog(1, "gpu: frame %llu: rendered image %ux%ux%u f%u at %llx dropped (pool %llx-%llx changed)", frame_no + 1,
+                         im->info.width, im->info.height, im->info.depth, im->info.format, im->info.addr, lo, hi);
+                }
                 *pp = im->next;
                 image_destroy(im);
             } else {
@@ -317,6 +354,98 @@ static VkFormat usable_format(u32 nvn) {
 }
 
 static Image *image_create(const TexInfo *t, u32 h);
+
+/* is texture t a part of image I: its storage starts at one of I's (layer, level) and the shapes agree?
+ * (cube faces rendered as 2D textures, then sampled as the cube; mip levels as textures of their own) */
+static bool sub_of(const Image *I, const TexInfo *t, u32 *layer, u32 *level) {
+    if (t->addr < I->info.addr || t->addr >= I->info.addr + I->size || I->info.target == TEX_3D || t->target == TEX_3D)
+        return false;
+    if ((t->flags ^ I->info.flags) & TEX_FLAG_LINEAR || t->flags & TEX_FLAG_LINEAR) return false;
+    if ((t->samples > 1 ? t->samples : 1) != (I->info.samples > 1 ? I->info.samples : 1)) return false;
+    u32 b1, w1, h1, b2, w2, h2;
+    format_info(t->format, &b1, &w1, &h1);
+    format_info(I->info.format, &b2, &w2, &h2);
+    if (b1 != b2 || w1 != w2 || h1 != h2 || !b1) return false;
+    if (format_aspects(usable_format(t->format)) != I->aspects) return false;
+    TexLayout L, M;
+    tex_layout(&I->info, &L);
+    tex_layout(t, &M);
+    u64 off = t->addr - I->info.addr;
+    u32 ly = (u32)(off / L.layer_size);
+    u64 rem = off % L.layer_size;
+    for (u32 l = 0; l < L.levels; l++) {
+        if (L.level[l].offset != rem) continue;
+        u32 iw = I->info.width >> l ? I->info.width >> l : 1, ih = tex_height(&I->info) >> l ? tex_height(&I->info) >> l : 1;
+        if (iw != t->width || ih != tex_height(t)) return false;
+        if (M.level[0].bh != L.level[l].bh) return false;
+        if (ly + M.layers > I->layers || l + M.levels > I->levels) return false;
+        *layer = ly;
+        *level = l;
+        return true;
+    }
+    return false;
+}
+
+static void bucket_unlink(Image *im) {
+    for (Image **pp = &buckets[info_hash(&im->info)]; *pp; pp = &(*pp)->next)
+        if (*pp == im) { *pp = im->next; return; }
+}
+
+static Image *image_get(const TexInfo *t);
+
+/* the image holding texture t, and where in it t starts */
+static Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
+    *layer = *level = 0;
+    u32 h = info_hash(t);
+    TexInfo k, ki;
+    image_key(t, &k);
+    for (Image *im = buckets[h]; im; im = im->next) {
+        image_key(&im->info, &ki);
+        if (!memcmp(&ki, &k, sizeof k)) return image_get(t);
+    }
+    /* inside a bigger image? (scan back over images that start at or below t) */
+    int i = byaddr_lower(t->addr + 1);
+    for (int n = 0; i > 0 && n < 64; n++) {
+        Image *I = byaddr[--i];
+        if (sub_of(I, t, layer, level)) return I;
+    }
+    Image *im = image_get(t);
+    if (!im) return NULL;
+    /* a new container takes over the parts of it that exist as images of their own */
+    bool took = false;
+    for (int j = byaddr_lower(im->info.addr); j < nbyaddr && byaddr[j]->info.addr < im->info.addr + im->size;) {
+        Image *o = byaddr[j];
+        u32 ly, lv;
+        if (o == im || !sub_of(im, &o->info, &ly, &lv)) { j++; continue; }
+        if (o->valid) {
+            end_rendering();
+            if (!took) barrier();
+            for (u32 l = 0; l < o->levels && lv + l < im->levels; l++) {
+                u32 w = o->info.width >> l ? o->info.width >> l : 1, hh = tex_height(&o->info) >> l ? tex_height(&o->info) >> l : 1;
+                VkImageCopy c = {{o->aspects, l, 0, o->layers}, {0, 0, 0}, {im->aspects, lv + l, ly, o->layers}, {0, 0, 0},
+                                 {w, hh, 1}};
+                vkCmdCopyImage(cmd(), o->image, VK_IMAGE_LAYOUT_GENERAL, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            }
+            if (o->gpu_written) im->gpu_written = true;
+            im->valid = true;
+            took = true;
+        }
+        bucket_unlink(o);
+        image_destroy(o);               /* removes it from byaddr: j now names the next one */
+    }
+    if (took) barrier();
+    return im;
+}
+
+/* a texture reference resolved to its image: the view moved to t's place in the image */
+static Image *image_ref(const TexRef *r, ViewInfo *v) {
+    u32 layer, level;
+    Image *im = image_find(&r->t, &layer, &level);
+    *v = r->v;
+    v->base_level = (u16)(v->base_level + level);
+    v->min_layer = (u16)(v->min_layer + layer);
+    return im;
+}
 
 static Image *image_get(const TexInfo *t) {
     u32 h = info_hash(t);
@@ -419,6 +548,7 @@ static Image *image_create(const TexInfo *t, u32 h) {
     barrier();
     im->next = buckets[h];
     buckets[h] = im;
+    byaddr_add(im);
     if (++nimages % 500 == 0) hlog(1, "gpu: %d images", nimages);
     hlog(2, "gpu: image %ux%ux%u fmt %u target %u levels %u at %llx", t->width, t->height, t->depth, t->format,
          t->target, t->levels, t->addr);
@@ -611,7 +741,6 @@ typedef struct State {
     u32 samples;
 } State;
 
-static u64 frame_no;                    /* frames presented so far */
 static State st;                        /* the GPU's state carries over between command buffers, as on NVN */
 static u64 draws, draws_skipped, dispatches;
 
@@ -648,12 +777,14 @@ static void watch(const char *what, const TexRef *r) {
          r->t.height, r->t.depth, r->v.format, r->t.target, r->v.base_level, r->v.min_layer, r->v.num_layers);
 }
 
-static VkImageView rt_view(const TexRef *r, Image **out) {
+static VkImageView rt_view(const TexRef *r, Image **out, u32 *level) {
     watch("render target", r);
-    Image *im = image_get(&r->t);
+    ViewInfo v;
+    Image *im = image_ref(r, &v);
     if (out) *out = im;
+    if (level) *level = v.base_level;
     if (!im) return NULL;
-    return image_view(im, &r->v, VIEW_ATTACHMENT);
+    return image_view(im, &v, VIEW_ATTACHMENT);
 }
 
 static bool begin_rendering(void) {
@@ -667,7 +798,8 @@ static bool begin_rendering(void) {
     for (u32 i = 0; i < st.nrt; i++) {
         color[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         Image *im;
-        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im) : NULL;
+        u32 l;
+        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l) : NULL;
         if (!v) continue;
         color[i].imageView = v;
         st.rt_format[i] = usable_format(st.rt[i].v.format) != VK_FORMAT_UNDEFINED ? usable_format(st.rt[i].v.format) : im->format;
@@ -675,7 +807,6 @@ static bool begin_rendering(void) {
         color[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        u32 l = st.rt[i].v.base_level;
         u32 iw = im->info.width >> l, ih = tex_height(&im->info) >> l;
         if (iw < w) w = iw ? iw : 1;
         if (ih < h) h = ih ? ih : 1;
@@ -689,7 +820,8 @@ static bool begin_rendering(void) {
     bool has_d = false, has_s = false;
     if (st.has_depth) {
         Image *im;
-        VkImageView v = rt_view(&st.depth, &im);
+        u32 l;
+        VkImageView v = rt_view(&st.depth, &im, &l);
         if (v) {
             depth.imageView = v;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -700,7 +832,6 @@ static bool begin_rendering(void) {
             if (has_d) st.depth_format = im->format;
             if (has_s) st.stencil_format = im->format;
             st.samples = im->info.samples > 1 ? im->info.samples : 1;
-            u32 l = st.depth.v.base_level;
             u32 iw = im->info.width >> l, ih = tex_height(&im->info) >> l;
             if (iw < w) w = iw ? iw : 1;
             if (ih < h) h = ih ? ih : 1;
@@ -765,7 +896,8 @@ static void do_clear_color(const CmdClearColor *p) {
 
 static void do_clear_depth_stencil(const CmdClearDS *p) {
     if (!st.has_depth || !begin_rendering()) return;
-    Image *im = image_get(&st.depth.t);
+    u32 ly, lv;
+    Image *im = image_find(&st.depth.t, &ly, &lv);
     if (!im) return;
     VkImageAspectFlags asp = 0;
     if (p->depth_mask && im->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -780,11 +912,12 @@ static void do_clear_depth_stencil(const CmdClearDS *p) {
 /* ClearTexture: a region of a level/layers, outside the render targets */
 static void do_clear_texture(const CmdClearTexture *p) {
     watch("ClearTexture", &p->tex);
-    Image *im = image_get(&p->tex.t);
+    ViewInfo v;
+    Image *im = image_ref(&p->tex, &v);
     if (!im) return;
     end_rendering();
-    u32 level = p->tex.v.base_level;
-    u32 layer = p->tex.v.min_layer + (p->tex.t.target == TEX_3D ? 0 : (u32)p->r.z);
+    u32 level = v.base_level;
+    u32 layer = v.min_layer + (p->tex.t.target == TEX_3D ? 0 : (u32)p->r.z);
     u32 nlayers = p->tex.t.target == TEX_3D ? 1 : (p->r.d > 0 ? (u32)p->r.d : 1);
     VkImageSubresourceRange range = {im->aspects, level, 1, layer, nlayers};
     if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -822,7 +955,9 @@ static VkBufferImageCopy bt_region(const CmdCopyBT *p, const Image *im, u64 off)
 
 static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
     watch("CopyBufferToTexture", &p->tex);
-    Image *im = image_get(&p->tex.t);
+    CmdCopyBT q = *p;
+    Image *im = image_ref(&p->tex, &q.tex.v);
+    p = &q;
     VkBuffer buf;
     u64 off;
     if (!im || !gpu_buffer(p->buffer, &buf, &off) || p->r.w <= 0) return;
@@ -836,7 +971,9 @@ static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
 }
 
 static void do_copy_texture_to_buffer(const CmdCopyBT *p) {
-    Image *im = image_get(&p->tex.t);
+    CmdCopyBT q = *p;
+    Image *im = image_ref(&p->tex, &q.tex.v);
+    p = &q;
     VkBuffer buf;
     u64 off;
     if (!im || !gpu_buffer(p->buffer, &buf, &off) || p->r.w <= 0) return;
@@ -849,7 +986,9 @@ static void do_copy_texture_to_buffer(const CmdCopyBT *p) {
 
 static void do_copy_texture_to_texture(const CmdCopyTT *p) {
     watch("CopyTextureToTexture (dst)", &p->dst);
-    Image *s = image_get(&p->src.t), *d = image_get(&p->dst.t);
+    CmdCopyTT q = *p;
+    Image *s = image_ref(&p->src, &q.src.v), *d = image_ref(&p->dst, &q.dst.v);
+    p = &q;
     if (!s || !d || p->sr.w <= 0 || p->dr.w <= 0) return;
     image_upload(s);
     end_rendering();
@@ -882,17 +1021,19 @@ static void do_copy_texture_to_texture(const CmdCopyTT *p) {
 
 static void do_downsample(const CmdDownsample *p) {
     watch("Downsample (dst)", &p->dst);
-    Image *s = image_get(&p->src.t), *d = image_get(&p->dst.t);
+    CmdDownsample q = *p;
+    Image *s = image_ref(&p->src, &q.src.v), *d = image_ref(&p->dst, &q.dst.v);
+    p = &q;
     if (!s || !d) return;
     end_rendering();
-    u32 w = d->info.width, h = tex_height(&d->info);
+    u32 w = p->dst.t.width, h = tex_height(&p->dst.t);
     VkImageSubresourceLayers sl = {copy_aspect(s), p->src.v.base_level, p->src.v.min_layer, 1};
     VkImageSubresourceLayers dl = {copy_aspect(d), p->dst.v.base_level, p->dst.v.min_layer, 1};
     if (s->info.samples > 1 && d->info.samples <= 1 && s->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
         VkImageResolve r = {sl, {0, 0, 0}, dl, {0, 0, 0}, {w, h, 1}};
         vkCmdResolveImage(cmd(), s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {
-        VkImageBlit b = {sl, {{0, 0, 0}, {(s32)s->info.width, (s32)tex_height(&s->info), 1}},
+        VkImageBlit b = {sl, {{0, 0, 0}, {(s32)p->src.t.width, (s32)tex_height(&p->src.t), 1}},
                          dl, {{0, 0, 0}, {(s32)w, (s32)h, 1}}};
         vkCmdBlitImage(cmd(), s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                        VK_FILTER_LINEAR);
@@ -1132,10 +1273,12 @@ static void descset_sync(DescSet *d) {
         } else {
             const TexDesc *td = tdesc_get(want);
             if (!td || !pool_find(td->t.addr)) continue;      /* storage gone: leave the entry alone */
-            Image *im = image_get(&td->t);
+            TexRef tr = {td->t, td->v};
+            ViewInfo v;
+            Image *im = image_ref(&tr, &v);
             if (!im) continue;
             image_upload(im);
-            infos[n].imageView = image_view(im, &td->v, VIEW_SAMPLED);
+            infos[n].imageView = image_view(im, &v, VIEW_SAMPLED);
             infos[n].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             if (!infos[n].imageView) continue;
         }
@@ -1925,7 +2068,10 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
 void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, const void *data,
                          s64 row_stride, s64 image_stride) {
     EnterCriticalSection(&gpu_cs);
-    Image *im = image_get(t);
+    TexRef tr = {*t, *v};
+    ViewInfo vv;
+    Image *im = image_ref(&tr, &vv);
+    v = &vv;
     if (im && r->w > 0 && !format_is_astc(t->format)) {
         u32 bpb, bw, bh;
         format_info(t->format, &bpb, &bw, &bh);
