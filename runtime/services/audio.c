@@ -258,18 +258,20 @@ static u32 request_update(ArRenderer *r, const u8 *in, u64 in_size, u8 *out, u64
 }
 
 /* ---------------------------------------------------------------------------------------------- the clock */
-/* a frame whenever the host device has fewer than three queued (one per tick without a device) */
+/* a frame whenever the host device has fewer than four queued (one per tick without a device); a frame takes well
+ * under a millisecond, so the thread runs above the guest's threads to keep the device fed */
 static unsigned __stdcall renderer_thread(void *p) {
     ArRenderer *r = p;
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER due;
     due.QuadPart = -50000;                          /* 5 ms */
     SetWaitableTimer(timer, &due, 5, NULL, NULL, FALSE);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     while (!r->closing) {
         WaitForSingleObject(timer, INFINITE);
         if (!r->started) continue;
         u32 queued = r->sample_rate == 48000 ? audio_queued_frames(r->sample_count) : ~0u;
-        u32 frames = queued == ~0u ? 1 : queued >= 3 ? 0 : 3 - queued;
+        u32 frames = queued == ~0u ? 1 : queued >= 4 ? 0 : 4 - queued;
         for (u32 i = 0; i < frames && r->started; i++) {
             AcquireSRWLockExclusive(&r->lock);
             ar_render_frame(r);
