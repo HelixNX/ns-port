@@ -1386,6 +1386,7 @@ class Translator:
                 out.append('layout(location = %d) out vec4 out_a%d;' % (k, k))
             if 'clip' in self.uses:
                 out.append('out float gl_ClipDistance[8];')
+            out.append('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; } pc;')
         if self.stage == 'fragment':
             for k in sorted(self.in_attrs):
                 q = self.in_attrs[k]
@@ -1394,7 +1395,7 @@ class Translator:
                 if self.omap_target >> (4 * rt) & 0xf:
                     out.append('layout(location = %d) out vec4 out_c%d;' % (rt, rt))
         if self.stage == 'fragment':
-            out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; } pc;',
+            out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; } pc;',
                     'bool alpha_ok(float a) {',
                     '    switch (pc.alpha_func) {',
                     '    case 1u: return false;',
@@ -1425,6 +1426,7 @@ class Translator:
             out.append('    bool ' + ', '.join('b%d = false' % f for f in flags[i:i + 16]) + ';')
         if self.stage == 'vertex':
             out.append('    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);')
+            out.append('    gl_PointSize = pc.point_size;')     # NVN's point size, unless the shader writes one
         out += body
         out.append('}')
         return '\n'.join(out) + '\n'

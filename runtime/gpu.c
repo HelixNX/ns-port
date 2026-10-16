@@ -244,6 +244,7 @@ typedef struct Image {
     u64 rt_frame;                       /* the frame (frame_no + 1) it was last a render target in */
     bool gpu_written;                   /* rendered, cleared or copied into: guest memory is not its source */
     u64 size;                           /* bytes of guest memory it covers */
+    u64 used;                           /* the frame (frame_no + 1) it was last looked up in */
     View *views;
     int nviews, capviews;
     struct Image *next;
@@ -251,6 +252,7 @@ typedef struct Image {
 #define IMAGE_BUCKETS 4096
 static Image *buckets[IMAGE_BUCKETS];
 static int nimages;
+static u64 image_bytes;                 /* device memory the images hold */
 
 /* what identifies an image: its storage and shape. Textures over the same memory that differ only in how many
  * mip levels they declare (a render target view and the mipmapped texture it fills) share one image. */
@@ -305,6 +307,7 @@ static void image_destroy(Image *im) {
     byaddr_remove(im);
     for (int i = 0; i < im->nviews; i++) bury(DEAD_VIEW, im->views[i].view, NULL);
     free(im->views);
+    image_bytes -= im->alloc.size;
     bury(DEAD_IMAGE, im->image, &im->alloc);
     free(im);
     nimages--;
@@ -354,6 +357,7 @@ static VkFormat usable_format(u32 nvn) {
 }
 
 static Image *image_create(const TexInfo *t, u32 h);
+static void images_evict(u64 target, bool wait);
 
 /* is texture t a part of image I: its storage starts at one of I's (layer, level) and the shapes agree?
  * (cube faces rendered as 2D textures, then sampled as the cube; mip levels as textures of their own) */
@@ -407,7 +411,7 @@ static Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
     int i = byaddr_lower(t->addr + 1);
     for (int n = 0; i > 0 && n < 64; n++) {
         Image *I = byaddr[--i];
-        if (sub_of(I, t, layer, level)) return I;
+        if (sub_of(I, t, layer, level)) { I->used = frame_no + 1; return I; }
     }
     Image *im = image_get(t);
     if (!im) return NULL;
@@ -457,6 +461,7 @@ static Image *image_get(const TexInfo *t) {
         if (!memcmp(&ki, &k, sizeof k)) break;
     }
     Image *old = *pp;
+    if (old) old->used = frame_no + 1;
     if (old && (t->levels ? t->levels : 1) <= old->levels) return old;
     if (!old) return image_create(t, h);
     /* more mip levels than the image has: a bigger image, with the levels so far copied over */
@@ -525,7 +530,13 @@ static Image *image_create(const TexInfo *t, u32 h) {
     }
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.dev, im->image, &req);
-    if (!vk_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->alloc)) fatal("gpu: out of video memory");
+    if (!vk_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->alloc)) {
+        images_evict(image_bytes / 2, true);
+        if (!vk_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->alloc))
+            fatal("gpu: out of video memory (%d images, %llu MB)", nimages, image_bytes >> 20);
+    }
+    image_bytes += im->alloc.size;
+    im->used = frame_no + 1;
     VKCHECK(vkBindImageMemory(vk.dev, im->image, im->alloc.mem, im->alloc.offset));
     end_rendering();
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -1108,7 +1119,7 @@ static void layouts_init(void) {
     tci.pBindings = &sb;
     VKCHECK(vkCreateDescriptorSetLayout(vk.dev, &tci, NULL, &set_smp));
     VkDescriptorSetLayout sets[3] = {set_ubo, set_tex, set_smp};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 3,
                                       .pSetLayouts = sets, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VKCHECK(vkCreatePipelineLayout(vk.dev, &lci, NULL, &layout_gfx));
@@ -1194,7 +1205,9 @@ typedef struct DescSet {
     u32 count;
     bool smp;
     VkDescriptorSet set;
-    u32 *idx;                           /* interned descriptor written into each entry, ~0 none */
+    u32 *idx;                           /* interned descriptor in each entry (as last seen), ~0 none */
+    u8 *res;                            /* texture entries: written into the set since idx or the images changed */
+    Image **img;                        /* ... and the image written (NULL: the dummy) */
     u64 epoch, synced;
     struct DescSet *next;
 } DescSet;
@@ -1247,6 +1260,8 @@ static DescSet *descset_get(const CmdPool *p, bool smp) {
     descset_fill(d->set, smp, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
     d->idx = malloc(d->count * sizeof *d->idx);
     memset(d->idx, 0xff, d->count * sizeof *d->idx);
+    d->res = calloc(d->count, 1);
+    d->img = calloc(d->count, sizeof *d->img);
     d->epoch = ~0ull;
     d->next = descsets;
     descsets = d;
@@ -1254,11 +1269,84 @@ static DescSet *descset_get(const CmdPool *p, bool smp) {
     return d;
 }
 
+/* Video memory: images are made on first use and nothing tells us when the game is done with one (it reuses pool
+ * memory for the next course's textures, leaves old entries in its texture pools, and changes the size of its
+ * render targets with dynamic resolution). Over budget, or when an allocation fails, the least recently used
+ * images go, except those used in the last EVICT_KEEP frames (bound by a draw, rendered to, copied; their work
+ * has been submitted, so they die once the GPU is past it). One that is needed again is made again and
+ * uploaded from guest memory (what the GPU had written into it is lost). */
+#define EVICT_KEEP 60
+static int used_order(const void *a, const void *b) {
+    u64 x = (*(Image *const *)a)->used, y = (*(Image *const *)b)->used;
+    return x < y ? -1 : x > y;
+}
+static void images_evict(u64 target, bool wait) {
+    Image **c = malloc(nimages * sizeof *c);
+    int n = 0;
+    for (int b = 0; b < IMAGE_BUCKETS; b++)
+        for (Image *im = buckets[b]; im; im = im->next)
+            if (n < nimages && im->used + EVICT_KEEP <= frame_no + 1 && im->info.addr != 1) c[n++] = im;
+    qsort(c, n, sizeof *c, used_order);
+    u64 before = image_bytes;
+    int first = ndead, gone = 0;
+    for (int i = 0; i < n && image_bytes > target; i++, gone++) {
+        bucket_unlink(c[i]);
+        image_destroy(c[i]);
+    }
+    for (int i = first; i < ndead; i++) dead[i].value = submitted;     /* not in the work being recorded */
+    free(c);
+    hlog(1, "gpu: frame %llu: %d of %d images unused for %d frames evicted, %llu -> %llu MB", frame_no + 1, gone, n,
+         EVICT_KEEP, before >> 20, image_bytes >> 20);
+    if (wait && submitted) {
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
+                                  .pValues = &submitted};
+        VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+    }
+    reap();
+}
+
+/* Texture pools: an entry is resolved to an image (made and uploaded if need be) when a draw or dispatch binds its
+ * handle: shaders read handles only from c[2], i.e. from the bound textures, so an entry nothing binds is never
+ * sampled and may hold anything (the sets are PARTIALLY_BOUND). Binding also marks the image used (eviction). */
+static void descset_resolve(DescSet *d, u32 i) {
+    const TexDesc *td = d->idx[i] != ~0u ? tdesc_get(d->idx[i]) : NULL;
+    Image *im = NULL;
+    ViewInfo v;
+    if (td && pool_find(td->t.addr)) {
+        TexRef tr = {td->t, td->v};
+        im = image_ref(&tr, &v);
+    }
+    if (im) image_upload(im);
+    VkDescriptorImageInfo info = {NULL, im ? image_view(im, &v, VIEW_SAMPLED) : NULL, VK_IMAGE_LAYOUT_GENERAL};
+    if (!info.imageView) { info.imageView = dummy_view; im = NULL; }
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set, .dstBinding = 0,
+        .dstArrayElement = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &info};
+    vkUpdateDescriptorSets(vk.dev, 1, &w, 0, NULL);
+    d->res[i] = 1;
+    d->img[i] = im;
+}
+
+static void descset_use(DescSet *d, const u64 *tex, u32 n) {
+    if (!d) return;
+    for (int pass = 0; pass < 4; pass++) {
+        if (d->epoch != image_epoch) {          /* images were destroyed: the pointers may be stale */
+            memset(d->res, 0, d->count);
+            d->epoch = image_epoch;
+        }
+        for (u32 k = 0; k < n; k++) {
+            u32 h = (u32)tex[k], id = h & 0xfffff;
+            if (!h || id >= d->count) continue;
+            if (!d->res[id]) descset_resolve(d, id);
+            if (d->img[id]) d->img[id]->used = frame_no + 1;
+        }
+        if (d->epoch == image_epoch) return;   /* else resolving destroyed an image (a container took it over) */
+    }
+}
+
+/* once per submission: which entries the guest changed */
 static void descset_sync(DescSet *d) {
     if (!d || d->synced == submit_serial) return;
     d->synced = submit_serial;
-    bool full = d->epoch != image_epoch;
-    d->epoch = image_epoch;
     VkDescriptorImageInfo infos[256];
     VkWriteDescriptorSet writes[256];
     int n = 0;
@@ -1266,28 +1354,15 @@ static void descset_sync(DescSet *d) {
         u64 a = d->addr + 32ull * i;
         u32 magic = LD32(a), x = LD32(a + 4);
         u32 want = magic == (d->smp ? SDESC_MAGIC : TDESC_MAGIC) ? x : ~0u;
-        if (want == d->idx[i] && !full) continue;
+        if (want == d->idx[i]) continue;
         d->idx[i] = want;
+        if (!d->smp) { d->res[i] = 0; continue; }
         if (want == ~0u) continue;
         memset(&infos[n], 0, sizeof infos[n]);
-        if (d->smp) {
-            infos[n].sampler = sampler_get(want);
-            if (!infos[n].sampler) continue;
-        } else {
-            const TexDesc *td = tdesc_get(want);
-            if (!td || !pool_find(td->t.addr)) continue;      /* storage gone: leave the entry alone */
-            TexRef tr = {td->t, td->v};
-            ViewInfo v;
-            Image *im = image_ref(&tr, &v);
-            if (!im) continue;
-            image_upload(im);
-            infos[n].imageView = image_view(im, &v, VIEW_SAMPLED);
-            infos[n].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            if (!infos[n].imageView) continue;
-        }
+        infos[n].sampler = sampler_get(want);
+        if (!infos[n].sampler) continue;
         writes[n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set, .dstBinding = 0,
-            .dstArrayElement = i, .descriptorCount = 1,
-            .descriptorType = d->smp ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &infos[n]};
+            .dstArrayElement = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &infos[n]};
         if (++n == 256) { vkUpdateDescriptorSets(vk.dev, n, writes, 0, NULL); n = 0; }
     }
     if (n) vkUpdateDescriptorSets(vk.dev, n, writes, 0, NULL);
@@ -1658,6 +1733,8 @@ static void draw(u32 op, const void *payload) {
     DescSet *ts = descset_get(&st.texpool, false), *ss = descset_get(&st.smppool, true);
     descset_sync(ts);
     descset_sync(ss);
+    descset_use(ts, st.tex[ST_VERTEX], 32);
+    descset_use(ts, st.tex[ST_FRAGMENT], 32);
     if (!begin_rendering()) { skip_draw("no render targets"); return; }
     VkCommandBuffer c = cmd();
     PipeKey k;
@@ -1716,8 +1793,8 @@ static void draw(u32 op, const void *payload) {
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_gfx, 0, nw, w);
     VkDescriptorSet sets[2] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_gfx, 1, 2, sets, 0, NULL);
-    struct { u32 func; float ref; u32 pad[2]; } pc = {st.color.alpha_test, st.alpha_ref, {0, 0}};
-    vkCmdPushConstants(c, layout_gfx, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
+    struct { u32 func; float ref, point_size; u32 pad; } pc = {st.color.alpha_test, st.alpha_ref, st.point_size, 0};
+    vkCmdPushConstants(c, layout_gfx, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
     set_vertex_input(c);
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
         const CmdDraw *d = payload;
@@ -1797,6 +1874,7 @@ static void dispatch(u32 op, const u8 *pay) {
     DescSet *ts = descset_get(&st.texpool, false), *ss = descset_get(&st.smppool, true);
     descset_sync(ts);
     descset_sync(ss);
+    descset_use(ts, st.tex[ST_COMPUTE], 32);
     end_rendering();
     VkCommandBuffer c = cmd();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
@@ -2269,10 +2347,19 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     Image *im = image_get(&w->info[index]);
     if (im) image_upload(im);
     flush();
+    static u64 budget;
+    if (!budget) {
+        for (u32 i = 0; i < vk.mem.memoryHeapCount; i++)
+            if (vk.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && vk.mem.memoryHeaps[i].size > budget)
+                budget = vk.mem.memoryHeaps[i].size;
+        budget = budget / 100 * 55;
+        hlog(1, "gpu: images may use %llu MB of video memory", budget >> 20);
+    }
+    if (image_bytes > budget) images_evict(budget / 4 * 3, false);
     dump_frame(im, frame_no + 1);
     u64 frames = ++frame_no;
-    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images, %u pipelines",
-                                  draws, draws_skipped, dispatches, nimages, npipes);
+    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
+                                  draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */
