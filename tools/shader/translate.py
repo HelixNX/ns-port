@@ -1167,7 +1167,26 @@ class Translator:
         self.emit('}')
 
     def op_TXQ(self, w, form, pc):
-        raise Unsupported('TXQ')
+        """texture size; the instruction has no texture type, so the texture is taken as 2D"""
+        d, sr, mode, mask = bits(w, 0, 8), bits(w, 8, 8), bits(w, 22, 3), bits(w, 31, 4)
+        if mode != 1:
+            raise Unsupported('TXQ mode %d' % mode)
+        if form == 'B':
+            h, lod = self.R(sr), self.R(sr + 1 if sr != RZ else RZ)
+        else:
+            h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
+        self.uses.add('tex_t2d')
+        t = 't2d[nonuniformEXT(min(h_ & 0xfffffu, 65535u))]'
+        self.emit('{ uint h_ = %s; ivec2 s_ = textureSize(%s, int(%s)); uvec4 v_ = uvec4(uvec2(s_), 1u, uint(textureQueryLevels(sampler2D(%s, smp[nonuniformEXT(min(h_ >> 20, 4095u))]))));'
+                  % (h, t, lod, t))
+        self.indent += 1
+        r = d
+        for c in range(4):
+            if mask >> c & 1:
+                self.set_r(r, 'v_[%d]' % c)
+                r += 1
+        self.indent -= 1
+        self.emit('}')
 
     def op_KIL(self, w, form, pc):
         t = self.flow(bits(w, 0, 5))
@@ -1340,8 +1359,8 @@ class Translator:
                     '#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require']
         out.append('// translated from Maxwell shader %s (%s)' % (os.path.basename(self.sh.path), self.stage))
         if self.stage == 'compute':
-            out += ['#ifndef LOCAL_X', '#define LOCAL_X 1', '#define LOCAL_Y 1', '#define LOCAL_Z 1', '#endif',
-                    'layout(local_size_x = LOCAL_X, local_size_y = LOCAL_Y, local_size_z = LOCAL_Z) in;']
+            lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
+            out.append('layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;' % (lx, ly, lz))
         out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }']
         if 'fmz' in self.uses:
             out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',

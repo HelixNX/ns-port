@@ -92,7 +92,8 @@ void mem_init(void) {
     insert_at(0, (Block){0, AS_BASE, MS_INACCESSIBLE, MP_NONE, 0});
     insert_at(1, (Block){AS_BASE, AS_END - AS_BASE, MS_FREE, MP_NONE, 0});
     insert_at(2, (Block){AS_END, 0 - AS_END, MS_INACCESSIBLE, MP_NONE, 0});
-    void *p = VirtualAlloc((void *)(uintptr_t)AS_BASE, AS_END - AS_BASE, MEM_RESERVE, PAGE_NOACCESS);
+    /* MEM_WRITE_WATCH: the GPU side (gpu.c) asks which pages the CPU wrote, to refresh textures */
+    void *p = VirtualAlloc((void *)(uintptr_t)AS_BASE, AS_END - AS_BASE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
     if (p != (void *)(uintptr_t)AS_BASE) {
         for (u64 a = AS_BASE; a < AS_END;) {
             MEMORY_BASIC_INFORMATION mbi;

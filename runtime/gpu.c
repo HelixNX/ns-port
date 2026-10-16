@@ -12,6 +12,7 @@
  * One lock (gpu_cs) covers everything here; work is submitted at each nvnQueueSubmitCommands, on a timeline
  * semaphore whose values are the NVN syncs. */
 #include "tex.h"
+#include "astc.h"
 #include <stdlib.h>
 #include <windows.h>
 
@@ -240,6 +241,8 @@ typedef struct Image {
     u32 levels, layers;
     bool valid;                         /* contents defined (rendered, copied, cleared or uploaded) */
     u64 rt_frame;                       /* the frame (frame_no + 1) it was last a render target in */
+    bool gpu_written;                   /* rendered, cleared or copied into: guest memory is not its source */
+    u64 size;                           /* bytes of guest memory it covers */
     View *views;
     int nviews, capviews;
     struct Image *next;
@@ -248,7 +251,18 @@ typedef struct Image {
 static Image *buckets[IMAGE_BUCKETS];
 static int nimages;
 
-static u32 info_hash(const TexInfo *t) {
+/* what identifies an image: its storage and shape. Textures over the same memory that differ only in how many
+ * mip levels they declare (a render target view and the mipmapped texture it fills) share one image. */
+static void image_key(const TexInfo *t, TexInfo *k) {
+    *k = *t;
+    k->levels = 0;
+    k->flags &= TEX_FLAG_LINEAR;
+}
+
+static u32 info_hash(const TexInfo *t0) {
+    TexInfo kk;
+    image_key(t0, &kk);
+    const TexInfo *t = &kk;
     const u8 *b = (const u8 *)t;
     u32 h = 2166136261u;
     for (size_t i = 0; i < sizeof *t; i++) h = (h ^ b[i]) * 16777619u;
@@ -302,10 +316,41 @@ static VkFormat usable_format(u32 nvn) {
     }
 }
 
+static Image *image_create(const TexInfo *t, u32 h);
+
 static Image *image_get(const TexInfo *t) {
     u32 h = info_hash(t);
-    for (Image *im = buckets[h]; im; im = im->next)
-        if (!memcmp(&im->info, t, sizeof *t)) return im;
+    TexInfo k, ki;
+    image_key(t, &k);
+    Image **pp;
+    for (pp = &buckets[h]; *pp; pp = &(*pp)->next) {
+        image_key(&(*pp)->info, &ki);
+        if (!memcmp(&ki, &k, sizeof k)) break;
+    }
+    Image *old = *pp;
+    if (old && (t->levels ? t->levels : 1) <= old->levels) return old;
+    if (!old) return image_create(t, h);
+    /* more mip levels than the image has: a bigger image, with the levels so far copied over */
+    TexInfo big = old->info;
+    big.levels = t->levels;
+    *pp = old->next;                    /* out of the bucket: image_create inserts the new one */
+    Image *im = image_create(&big, h);
+    if (!im) { old->next = buckets[h]; buckets[h] = old; return old; }
+    end_rendering();
+    for (u32 l = 0; l < old->levels; l++) {
+        u32 w = old->info.width >> l ? old->info.width >> l : 1, hh = tex_height(&old->info) >> l ? tex_height(&old->info) >> l : 1;
+        u32 d = tex_depth(&old->info) >> l ? tex_depth(&old->info) >> l : 1;
+        VkImageCopy c = {{old->aspects, l, 0, old->layers}, {0, 0, 0}, {im->aspects, l, 0, im->layers}, {0, 0, 0}, {w, hh, d}};
+        vkCmdCopyImage(cmd(), old->image, VK_IMAGE_LAYOUT_GENERAL, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    barrier();
+    im->valid = old->valid;
+    im->rt_frame = old->rt_frame;
+    image_destroy(old);
+    return im;
+}
+
+static Image *image_create(const TexInfo *t, u32 h) {
     VkFormat fmt = usable_format(t->format);
     if (fmt == VK_FORMAT_UNDEFINED) {
         static u32 warned[8];
@@ -319,6 +364,7 @@ static Image *image_get(const TexInfo *t) {
     Image *im = calloc(1, sizeof *im);
     im->info = *t;
     im->format = fmt;
+    im->size = texture_storage_size(t);
     im->aspects = format_aspects(fmt);
     im->levels = t->levels ? t->levels : 1;
     im->layers = tex_layers(t);
@@ -361,6 +407,16 @@ static Image *image_get(const TexInfo *t) {
         .image = im->image, .subresourceRange = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
     vkCmdPipelineBarrier2(cmd(), &d);
+    /* defined contents (zeros) until something writes it: undefined memory can hold NaNs that spread */
+    VkImageSubresourceRange all = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkClearColorValue z = {{0, 0, 0, 0}};
+        vkCmdClearColorImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    } else {
+        VkClearDepthStencilValue z = {1, 0};
+        vkCmdClearDepthStencilImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    }
+    barrier();
     im->next = buckets[h];
     buckets[h] = im;
     if (++nimages % 500 == 0) hlog(1, "gpu: %d images", nimages);
@@ -389,8 +445,11 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .format = fmt};
     u32 base_level = v->base_level < im->levels ? v->base_level : im->levels - 1;
     u32 nlevels = v->num_levels && base_level + v->num_levels <= im->levels ? v->num_levels : im->levels - base_level;
-    u32 base_layer = v->min_layer < im->layers ? v->min_layer : 0;
-    u32 nlayers = v->num_layers && base_layer + v->num_layers <= im->layers ? v->num_layers : im->layers - base_layer;
+    /* a 3D image drawn into is seen as a 2D array of its depth slices (the view's layers pick slices) */
+    u32 nl_img = kind == VIEW_ATTACHMENT && im->info.target == TEX_3D ? tex_depth(&im->info) >> v->base_level : im->layers;
+    if (!nl_img) nl_img = 1;
+    u32 base_layer = v->min_layer < nl_img ? v->min_layer : 0;
+    u32 nlayers = v->num_layers && base_layer + v->num_layers <= nl_img ? v->num_layers : nl_img - base_layer;
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     if (kind == VIEW_ATTACHMENT) {
         bool is3d = im->info.target == TEX_3D;
@@ -428,6 +487,48 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
 }
 
 /* fill an image from the guest memory under it (block-linear or pitch layout) */
+/* ASTC: deswizzle the blocks, decode them to RGBA8 (the image's format), copy level by level */
+static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
+    bool srgb = im->info.format >= 135;
+    VkBufferImageCopy regions[16];
+    u32 nr = 0;
+    for (u32 l = 0; l < L->levels; l++) {
+        const TexLevel *lv = &L->level[l];
+        u32 w = im->info.width >> l ? im->info.width >> l : 1, h = tex_height(&im->info) >> l ? tex_height(&im->info) >> l : 1;
+        u64 bpitch = (u64)lv->w * 16, lsize = (u64)w * h * 4;
+        u8 *blocks = malloc(bpitch * lv->h);
+        VkBuffer buf;
+        u64 off;
+        u8 *dst = staging(lsize * L->layers, &buf, &off);
+        for (u32 layer = 0; layer < L->layers; layer++) {
+            u64 at = (u64)layer * L->layer_size + lv->offset;
+            if (L->linear) {
+                for (u32 y = 0; y < lv->h; y++) memcpy(blocks + y * bpitch, src + at + y * lv->row_pitch, bpitch);
+            } else {
+                deswizzle_level(lv, 16, src + at, L->size - at, blocks, bpitch);
+            }
+            astc_decode(blocks, lv->w, lv->h, L->bw, L->bh, srgb, dst + layer * lsize, w, h);
+            static int dumped;
+            if (l == 0 && layer == 0 && getenv("MK8_DUMP_ASTC") && dumped < 40) {
+                char path[MAX_PATH];
+                snprintf(path, sizeof path, "E:/projects/ns-port/build/frames/astc_%02d_%ux%u_f%u.pam", dumped++, w, h,
+                         im->info.format);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", w, h);
+                    fwrite(dst, 1, lsize, f);
+                    fclose(f);
+                }
+            }
+        }
+        free(blocks);
+        regions[nr++] = (VkBufferImageCopy){off, w, h, {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, L->layers}, {0, 0, 0}, {w, h, 1}};
+        end_rendering();
+        vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &regions[nr - 1]);
+    }
+    barrier();
+}
+
 static void image_upload(Image *im) {
     if (im->valid) return;
     im->valid = true;
@@ -436,8 +537,7 @@ static void image_upload(Image *im) {
     const u8 *src = gpu_cpu(im->info.addr, L.size);
     if (!src) return;                   /* GPU-only memory: nothing to read */
     if (format_is_astc(im->info.format)) {
-        static bool logged;
-        if (!logged) { logged = true; hlog(0, "gpu: ASTC textures are not decoded yet"); }
+        upload_astc(im, &L, src);
         return;
     }
     if (L.bpb != 1 && L.bpb != 2 && L.bpb != 4 && L.bpb != 8 && L.bpb != 16) return;
@@ -536,7 +636,20 @@ static void end_rendering(void) {
     barrier();
 }
 
+/* MK8_WATCH=<hex address>: log every GPU write to that texture storage */
+static u64 watch_addr = ~0ull;
+static void watch(const char *what, const TexRef *r) {
+    if (watch_addr == ~0ull) {
+        const char *e = getenv("MK8_WATCH");
+        watch_addr = e ? strtoull(e, NULL, 16) : 0;
+    }
+    if (!watch_addr || r->t.addr != watch_addr) return;
+    hlog(0, "watch: frame %llu %s %ux%ux%u f%u target %u view level %u layers %u+%u", frame_no + 1, what, r->t.width,
+         r->t.height, r->t.depth, r->v.format, r->t.target, r->v.base_level, r->v.min_layer, r->v.num_layers);
+}
+
 static VkImageView rt_view(const TexRef *r, Image **out) {
+    watch("render target", r);
     Image *im = image_get(&r->t);
     if (out) *out = im;
     if (!im) return NULL;
@@ -570,6 +683,7 @@ static bool begin_rendering(void) {
         if (nl < layers) layers = nl;
         im->valid = true;
         im->rt_frame = frame_no + 1;
+        im->gpu_written = true;
         any = true;
     }
     bool has_d = false, has_s = false;
@@ -594,6 +708,7 @@ static bool begin_rendering(void) {
             if (nl < layers) layers = nl;
             im->valid = true;
             im->rt_frame = frame_no + 1;
+            im->gpu_written = true;
             any = true;
         }
     }
@@ -664,6 +779,7 @@ static void do_clear_depth_stencil(const CmdClearDS *p) {
 
 /* ClearTexture: a region of a level/layers, outside the render targets */
 static void do_clear_texture(const CmdClearTexture *p) {
+    watch("ClearTexture", &p->tex);
     Image *im = image_get(&p->tex.t);
     if (!im) return;
     end_rendering();
@@ -681,6 +797,7 @@ static void do_clear_texture(const CmdClearTexture *p) {
         vkCmdClearDepthStencilImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
     }
     im->valid = true;
+    im->gpu_written = true;
     barrier();
 }
 
@@ -704,6 +821,7 @@ static VkBufferImageCopy bt_region(const CmdCopyBT *p, const Image *im, u64 off)
 }
 
 static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
+    watch("CopyBufferToTexture", &p->tex);
     Image *im = image_get(&p->tex.t);
     VkBuffer buf;
     u64 off;
@@ -713,6 +831,7 @@ static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
     VkBufferImageCopy r = bt_region(p, im, off);
     vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     im->valid = true;
+    im->gpu_written = true;
     barrier();
 }
 
@@ -729,6 +848,7 @@ static void do_copy_texture_to_buffer(const CmdCopyBT *p) {
 }
 
 static void do_copy_texture_to_texture(const CmdCopyTT *p) {
+    watch("CopyTextureToTexture (dst)", &p->dst);
     Image *s = image_get(&p->src.t), *d = image_get(&p->dst.t);
     if (!s || !d || p->sr.w <= 0 || p->dr.w <= 0) return;
     image_upload(s);
@@ -756,10 +876,12 @@ static void do_copy_texture_to_texture(const CmdCopyTT *p) {
                        p->flags & 1 && !depth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     d->valid = true;
+    d->gpu_written = true;
     barrier();
 }
 
 static void do_downsample(const CmdDownsample *p) {
+    watch("Downsample (dst)", &p->dst);
     Image *s = image_get(&p->src.t), *d = image_get(&p->dst.t);
     if (!s || !d) return;
     end_rendering();
@@ -776,6 +898,7 @@ static void do_downsample(const CmdDownsample *p) {
                        VK_FILTER_LINEAR);
     }
     d->valid = true;
+    d->gpu_written = true;
     barrier();
 }
 
@@ -1197,25 +1320,29 @@ static void skip_draw(const char *why) {
 static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescriptorSet *w, VkDescriptorBufferInfo *bi) {
     VkBuffer sbuf;
     u64 soff;
-    u8 *drv = staging(0x600, &sbuf, &soff);    /* c[0] at 0, c[2] at 0x400 */
-    memset(drv, 0, 0x600);
-    for (u32 k = 0; k < 16; k++) {
-        const BufferRange *r = &st.ssbo[stage][k];
+    u8 *drv = staging(0x800, &sbuf, &soff);    /* c[0] at 0, c[2] at 0x600 */
+    memset(drv, 0, 0x800);
+    /* c[0]: buffer tables with device addresses {lo, hi, size}. Graphics: storage buffers at 0x110.
+     * Compute (no cbuf slots for the game's uniform buffers there): uniform buffers at 0x220, storage at 0x310 */
+    u32 ssbo_at = stage == ST_COMPUTE ? 0x310 : 0x110;
+    for (u32 k = 0; k < 16 + 14; k++) {
+        const BufferRange *r = k < 16 ? &st.ssbo[stage][k] : &st.ubo[stage][k - 16];
+        if (k >= 16 && stage != ST_COMPUTE) break;
         PoolEnt *p = r->addr ? pool_find(r->addr) : NULL;
         if (!p || !p->hb) continue;
         u64 dev = p->hb->addr + (r->addr - p->gpu);
         u32 v[4] = {(u32)dev, (u32)(dev >> 32), (u32)r->size, 0};
-        memcpy(drv + 0x110 + 16 * k, v, 16);
+        memcpy(drv + (k < 16 ? ssbo_at + 16 * k : 0x220 + 16 * (k - 16)), v, 16);
     }
     for (u32 k = 0; k < 32; k++) {
         u32 h = (u32)st.tex[stage][k];
-        memcpy(drv + 0x400 + 0x20 + 8 * k, &h, 4);
+        memcpy(drv + 0x600 + 0x20 + 8 * k, &h, 4);
     }
     for (u32 i = 0; i < 16; i++) {
         VkDescriptorBufferInfo *b = &bi[i];
         *b = (VkDescriptorBufferInfo){NULL, 0, VK_WHOLE_SIZE};
-        if (i == 0) *b = (VkDescriptorBufferInfo){sbuf, soff, 0x400};
-        else if (i == 2) *b = (VkDescriptorBufferInfo){sbuf, soff + 0x400, 0x200};
+        if (i == 0) *b = (VkDescriptorBufferInfo){sbuf, soff, 0x600};
+        else if (i == 2) *b = (VkDescriptorBufferInfo){sbuf, soff + 0x600, 0x200};
         else {
             u64 addr = 0, size = 0;
             if (i == 1 && sc && sc->const_size) { addr = sc->const_addr; size = (sc->const_size + 15) & ~15u; }
@@ -1241,6 +1368,12 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
         vp.width = (float)st.area.extent.width;
         vp.height = (float)st.area.extent.height;
     }
+    if (window_origin == 1) {
+        /* NVN's upper-left origin puts NDC y = +1 at row 0, Vulkan puts -1 there: flip, so that every render
+         * target holds rows exactly as on the console (scissors and gl_FragCoord already count from row 0) */
+        vp.y += vp.height;
+        vp.height = -vp.height;
+    }
     vkCmdSetViewportWithCount(c, 1, &vp);
     VkRect2D sc = clear_rect();
     if (!sc.extent.width || !sc.extent.height) sc = (VkRect2D){{0, 0}, {1, 1}};
@@ -1256,7 +1389,9 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, st.stencil_ref[0]);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, st.stencil_ref[1]);
     vkCmdSetCullMode(c, st.poly.cull & 3);
-    vkCmdSetFrontFace(c, st.poly.front_face ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    /* the viewport flip for the upper-left origin mirrors the winding too */
+    vkCmdSetFrontFace(c, (st.poly.front_face != 0) != (window_origin == 1) ? VK_FRONT_FACE_CLOCKWISE
+                                                                            : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(c, topology(mode));
     vkCmdSetDepthTestEnable(c, st.ds.flags & 1);
     vkCmdSetDepthWriteEnable(c, (st.ds.flags & 2) != 0);
@@ -1415,6 +1550,16 @@ static void draw(u32 op, const void *payload) {
         for (u32 i = 0; i < 6; i++)
             o += snprintf(b + o, sizeof b - o, " u%u:%llx+%llx", i, st.ubo[ST_VERTEX][i].addr, st.ubo[ST_VERTEX][i].size);
         hlog(0, "  %s", b);
+        o = 0;
+        for (u32 k = 0; k < 8 && st.texpool.addr; k++) {
+            u32 h = (u32)st.tex[ST_FRAGMENT][k], id = h & 0xfffff;
+            if (!h || id >= st.texpool.count) continue;
+            u64 a = st.texpool.addr + 32ull * id;
+            const TexDesc *td = LD32(a) == TDESC_MAGIC ? tdesc_get(LD32(a + 4)) : NULL;
+            if (td) o += snprintf(b + o, sizeof b - o, " t%u:%ux%ux%u f%u L%u/%u+%u tg%u @%llx", k, td->t.width, td->t.height,
+                                  td->t.depth, td->v.format, td->v.base_level, td->t.levels, td->v.num_levels, td->v.target, td->t.addr);
+        }
+        if (o) hlog(0, "   tex%s", b);
     }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     set_dynamic_state(c, ((const CmdDraw *)payload)->mode);
@@ -1465,6 +1610,68 @@ static void draw(u32 op, const void *payload) {
     VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     vkCmdBindIndexBuffer(c, ib, io, it);
     vkCmdDrawIndexedIndirect(c, buf, off, 1, 20);
+}
+
+/* ---- compute */
+static u64 pr_hash(void) { return st.program && st.program->stage[ST_COMPUTE] ? st.program->stage[ST_COMPUTE]->hash : 0; }
+typedef struct CPipe { VkShaderModule m; VkPipeline pipe; struct CPipe *next; } CPipe;
+static CPipe *cpipes;
+
+static void dispatch(u32 op, const u8 *pay) {
+    dispatches++;
+    static long trace = -2;
+    if (trace == -2) trace = getenv("MK8_TRACE") ? atol(getenv("MK8_TRACE")) : -1;
+    if ((long)frame_no + 1 == trace) {
+        char b[700];
+        int o = 0;
+        for (u32 i = 0; i < 14; i++)
+            if (st.ubo[ST_COMPUTE][i].addr) o += snprintf(b + o, sizeof b - o, " u%u:%llx+%llx", i, st.ubo[ST_COMPUTE][i].addr, st.ubo[ST_COMPUTE][i].size);
+        for (u32 i = 0; i < 16; i++)
+            if (st.ssbo[ST_COMPUTE][i].addr) o += snprintf(b + o, sizeof b - o, " s%u:%llx+%llx", i, st.ssbo[ST_COMPUTE][i].addr, st.ssbo[ST_COMPUTE][i].size);
+        hlog(0, "dispatch %llu: cs %016llx%s", dispatches, pr_hash(), b);
+    }
+    Shaders *pr = st.program;
+    if (!pr || !pr->stage[ST_COMPUTE]) { skip_draw("dispatch without a compute shader"); return; }
+    VkShaderModule m = shader_module(pr->stage[ST_COMPUTE]);
+    if (!m) { skip_draw("shader not translated"); return; }
+    CPipe *cp;
+    for (cp = cpipes; cp && cp->m != m; cp = cp->next) {}
+    if (!cp) {
+        cp = calloc(1, sizeof *cp);
+        cp->m = m;
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                      .module = m, .pName = "main"}, .layout = layout_gfx};
+        if (vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, &cp->pipe) != VK_SUCCESS)
+            hlog(0, "gpu: compute pipeline for %016llx failed", pr->stage[ST_COMPUTE]->hash);
+        cp->next = cpipes;
+        cpipes = cp;
+    }
+    if (!cp->pipe) return;
+    DescSet *ts = descset_get(&st.texpool, false), *ss = descset_get(&st.smppool, true);
+    descset_sync(ts);
+    descset_sync(ss);
+    end_rendering();
+    VkCommandBuffer c = cmd();
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
+    VkWriteDescriptorSet w[16];
+    VkDescriptorBufferInfo bi[16];
+    int nw = stage_ubos(ST_COMPUTE, 0, pr->stage[ST_COMPUTE], w, bi);
+    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 0, nw, w);
+    VkDescriptorSet sets[2] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp};
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 1, 2, sets, 0, NULL);
+    if (op == OP_DISPATCH) {
+        u32 g[3];
+        memcpy(g, pay, 12);
+        if (g[0] && g[1] && g[2]) vkCmdDispatch(c, g[0], g[1], g[2]);
+    } else {
+        u64 a;
+        memcpy(&a, pay, 8);
+        VkBuffer buf;
+        u64 off;
+        if (gpu_buffer(a, &buf, &off)) vkCmdDispatchIndirect(c, buf, off);
+    }
+    barrier();
 }
 
 /* ---------------------------------------------------------------------------------------------- replay */
@@ -1546,7 +1753,7 @@ static void run(u64 at, int depth) {
             draw(op, pay);
             break;
         case OP_DISPATCH: case OP_DISPATCH_INDIRECT:
-            dispatches++;               /* compute comes later */
+            dispatch(op, pay);
             break;
         case OP_VIEWPORTS: case OP_SCISSORS: case OP_DEPTH_RANGES: {
             CmdRange r;
@@ -1740,7 +1947,15 @@ void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *
         end_rendering();
         vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &reg);
         im->valid = true;
+        im->gpu_written = true;         /* guest memory does not hold these texels */
         barrier();
+        static int logged;
+        if (logged++ < 8) {
+            const u32 *px = data;
+            hlog(1, "gpu: WriteTexels %ux%ux%u f%u target %u region %d,%d,%d %dx%dx%d row %llu: %08x %08x %08x %08x",
+                 t->width, t->height, t->depth, t->format, t->target, r->x, r->y, r->z, r->w, r->h, r->d, row, px[0],
+                 px[1], px[2], px[3]);
+        }
     }
     LeaveCriticalSection(&gpu_cs);
 }
@@ -1862,15 +2077,52 @@ static void dump_frame(Image *win, u64 frame) {
     hlog(1, "gpu: frame %llu and %d render targets written to build/frames", frame, n);
 }
 
+/* textures the CPU rewrote since the last frame (write watch over the GPU-visible pools): upload them again */
+static void refresh_cpu_textures(void) {
+    static u64 *pages;
+    static size_t cap;
+    size_t n = 0;
+    for (int i = 0; i < npools; i++) {
+        if (!pools[i].cpu || !pools[i].hb) continue;
+        for (;;) {
+            if (cap - n < 4096) pages = realloc(pages, (cap = cap * 2 + 65536) * sizeof *pages);
+            ULONG_PTR count = cap - n;
+            ULONG gran;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)pools[i].cpu, pools[i].end - pools[i].gpu,
+                              (void **)(pages + n), &count, &gran) != 0) break;
+            n += count;
+            if (count < cap - n + count) break;     /* all of them */
+        }
+    }
+    if (!n) return;
+    /* pages come sorted per pool and pools are sorted: one sorted list */
+    int refreshed = 0;
+    for (int b = 0; b < IMAGE_BUCKETS; b++)
+        for (Image *im = buckets[b]; im; im = im->next) {
+            if (!im->valid || im->gpu_written || !im->size) continue;
+            u64 lo = im->info.addr, hi = lo + im->size;
+            size_t a = 0, z = n;
+            while (a < z) { size_t m = (a + z) / 2; if (pages[m] + 4096 <= lo) a = m + 1; else z = m; }
+            if (a < n && pages[a] < hi) {
+                im->valid = false;
+                image_upload(im);
+                refreshed++;
+            }
+        }
+    static int logged;
+    if (refreshed && logged < 5) { logged++; hlog(1, "gpu: %d textures written by the CPU uploaded again", refreshed); }
+}
+
 void gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
     EnterCriticalSection(&gpu_cs);
+    refresh_cpu_textures();
     Image *im = image_get(&w->info[index]);
     if (im) image_upload(im);
     flush();
     dump_frame(im, frame_no + 1);
     u64 frames = ++frame_no;
-    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches skipped, %d images, %u pipelines",
+    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images, %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, npipes);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
