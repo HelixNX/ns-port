@@ -67,6 +67,8 @@ class Mod:
             for a in addrs:
                 self.owner.setdefault(a, f['ea'])
         self.switches = {int(k, 16): v for k, v in ida.get('switches', {}).items()}
+        self.addr_refs = code_address_refs(self)
+        self.recover_functions(data)
         got = {r[0]: r[2] for r in self.m.rels if r[1] in (1025, 1026)}      # GLOB_DAT / JUMP_SLOT slot -> symbol
         self.plt = {}                        # PLT stub offset -> symbol name
         for ea in self.funcs:
@@ -77,6 +79,35 @@ class Mod:
 
     def word(self, off):
         return self.m.u32(off)
+
+    def recover_functions(self, data):
+        """Code whose address is taken but that IDA left out of every function (e.g. a virtual method next to
+        bytes IDA called data: main+1f4): follow its control flow from there, through IDA's "data" if the flow
+        leads into it, up to returns, indirect branches and other functions' code."""
+        t0, t1 = self.text
+        for seed in sorted(set(self.m.code_seeds()) | self.addr_refs):
+            if not (t0 <= seed < t1) or seed & 3 or seed in self.owner or self.word(seed) == 0:
+                continue
+            addrs, work = set(), [seed]
+            while work:
+                a = work.pop()
+                if a in addrs or not (t0 <= a < t1) or (a in self.owner and a != seed):
+                    continue
+                w = self.word(a)
+                if w == 0 or w & 0xffe0001f == 0xd4200000:            # UDF / BRK: not code, or a trap
+                    addrs.add(a)
+                    continue
+                addrs.add(a)
+                work.extend(t - self.base for t in branch_targets(w, self.base + a) if w & 0xfc000000 != 0x94000000)
+                if w & 0xfffffc1f in (0xd65f0000, 0xd61f0000) or w & 0xfc000000 == 0x14000000:
+                    continue                                         # RET, BR, B: no fall-through
+                work.append(a + 4)
+            order = sorted(addrs)
+            self.funcs[seed] = order
+            for a in order:
+                self.owner.setdefault(a, seed)
+            print('%s: recovered function %x (%d instructions%s)' % (
+                self.name, seed, len(order), ', through IDA data' if data & addrs else ''))
 
     def plt_slot(self, ea):
         """GOT slot of `adrp x16, p; ldr x17, [x16, #o]; add x16, x16, #o; br x17`, or None."""
@@ -285,7 +316,7 @@ def secondary_entries(mod):
                     sec[o].add(t)
     # code whose address is taken (relocation targets, exports, init_array, ADR / ADRP+ADD) and that IDA put
     # inside another function: it is entered through call_ind, so it needs an entry too
-    for t in set(mod.m.code_seeds()) | code_address_refs(mod):
+    for t in set(mod.m.code_seeds()) | mod.addr_refs:
         if t in mod.funcs or not (mod.text[0] <= t < mod.text[1]):
             continue
         o = mod.owner.get(t)
