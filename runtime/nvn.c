@@ -1412,7 +1412,9 @@ static void queue_present(Ctx *c) {
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&now);
     s64 period = f.QuadPart / 60 * (w->interval ? w->interval : 1);
-    if (w->last) {
+    static int nopace = -1;                     /* MK8_NOPACE=1: as fast as it goes (unattended runs) */
+    if (nopace < 0) nopace = getenv("MK8_NOPACE") && atoi(getenv("MK8_NOPACE"));
+    if (w->last && !nopace) {
         s64 due = w->last + period - now.QuadPart;
         if (due > 0) thread_sleep(due * 1000000000 / f.QuadPart);
         if (due > -period) now.QuadPart = w->last + period;

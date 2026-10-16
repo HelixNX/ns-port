@@ -2,7 +2,8 @@
  *
  * Keyboard: arrows = left stick and D-pad, Z = A, X = B, C = X, V = Y, Q = L, E = R, 1 = ZL, 3 = ZR,
  * Enter = +, Backspace = -, IJKL = right stick. Gamepads map by label (an Xbox pad's bottom button is A).
- * MK8_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs). Names: A B X Y
+ * MK8_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
+ * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
  * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN. */
 #include "hos.h"
 #include <SDL3/SDL.h>
@@ -50,14 +51,16 @@ static u64 scripted(u64 frame) {
     u64 b = 0;
     const char *p = script;
     while (*p) {
-        unsigned long long lo = strtoull(p, (char **)&p, 10), hi = lo;
+        unsigned long long lo = strtoull(p, (char **)&p, 10), hi = lo, period = 0;
         if (*p == '-') hi = strtoull(p + 1, (char **)&p, 10);
+        if (*p == '/') period = strtoull(p + 1, (char **)&p, 10);     /* "lo-hi/n:A": A for 3 frames every n */
         if (*p == ':') p++;
+        bool on = frame >= lo && frame <= hi && (!period || (frame - lo) % period < 3);
         while (*p && *p != ';') {
             const char *q = p;
             while (*q && *q != '+' && *q != ';') q++;
             for (size_t i = 0; i < sizeof names / sizeof *names; i++)
-                if (strlen(names[i].n) == (size_t)(q - p) && !strncmp(names[i].n, p, q - p) && frame >= lo && frame <= hi)
+                if (strlen(names[i].n) == (size_t)(q - p) && !strncmp(names[i].n, p, q - p) && on)
                     b |= names[i].bit;
             p = *q == '+' ? q + 1 : q;
         }

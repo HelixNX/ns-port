@@ -972,7 +972,11 @@ class Translator:
         if bits(w, 38, 1):
             raise Unsupported('IPA indexed')
         e, generic = self.attr_in(attr)
-        # GLSL inputs are already perspective-correct: IPA.MUL's multiplier (1/w from IPA a[0x7c]) is not needed
+        # GLSL inputs are already perspective-correct, so IPA.MULTIPLY's multiplier (w, from RCP of IPA a[0x7c]) is
+        # not needed. IPA.PASS of a perspective attribute is the raw interpolant, attribute / w: shaders that read it
+        # multiply by w themselves (perspective-projected UI does)
+        if generic and mode == 0 and self.in_attrs.get((attr - 0x80) >> 4) == 'smooth':
+            e = 'U(F(%s) * gl_FragCoord.w)' % e
         if sat:
             e = 'U(clamp(F(%s), 0.0, 1.0))' % e
         self.set_r(d, e)

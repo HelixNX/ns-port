@@ -1528,6 +1528,19 @@ static VkPrimitiveTopology topology(u32 mode) {
     }
 }
 
+/* MK8_TRACE=n or n-m: the frames whose draws and dispatches are logged (MK8_TRACE_FILTER: only draws whose
+ * trace contains that text, e.g. a texture's "128x128x1 f56") */
+static bool trace_frame(void) {
+    static long lo = -2, hi = -1;
+    if (lo == -2) {
+        const char *e = getenv("MK8_TRACE");
+        lo = e ? atol(e) : -1;
+        hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : lo;
+    }
+    long f = (long)frame_no + 1;
+    return lo >= 0 && f >= lo && f <= hi;
+}
+
 static void skip_draw(const char *why) {
     draws_skipped++;
     static const char *seen[16];
@@ -1749,30 +1762,43 @@ static void draw(u32 op, const void *payload) {
     k.minus_one = depth_mode == 0;
     VkPipeline pipe = pipeline_get(&k);
     if (!pipe) { skip_draw("pipeline creation failed"); return; }
-    static long trace = -2;
-    if (trace == -2) trace = getenv("MK8_TRACE") ? atol(getenv("MK8_TRACE")) : -1;
-    if ((long)frame_no + 1 == trace) {
+    if (trace_frame()) {
         const CmdDraw *d = payload;
-        hlog(0, "draw %llu: op %u mode %u count %u inst %u idx %u@%llx | vs %016llx fs %016llx | rt0 %ux%u f%u @%llx n%u ds %s | vp %g %g %g %g dr %g %g sc %d %d %d %d | ds %x df %u cull %u ff %u",
+        static char tb[8192];
+        int tn = 0;
+#define TP(...) (tn += snprintf(tb + tn, tn < (int)sizeof tb ? sizeof tb - tn : 0, __VA_ARGS__))
+        TP("draw %llu: op %u mode %u count %u inst %u idx %u@%llx | vs %016llx fs %016llx | rt0 %ux%u f%u @%llx n%u ds %s | vp %g %g %g %g dr %g %g sc %d %d %d %d | ds %x df %u cull %u ff %u",
              draws, op, d->mode, d->count, d->instances, d->index_type, d->index_addr, pr->stage[ST_VERTEX]->hash,
              pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0, st.rt[0].t.width, st.rt[0].t.height,
              st.rt[0].t.format, st.rt[0].t.addr, st.nrt, st.has_depth ? "yes" : "no", st.viewport[0][0], st.viewport[0][1],
              st.viewport[0][2], st.viewport[0][3], st.depth_range[0][0], st.depth_range[0][1], st.scissor[0][0],
              st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], st.ds.flags, st.ds.depth_func, st.poly.cull, st.poly.front_face);
+        TP("\n");
         char b[512];
         int o = 0;
         for (u32 i = 0; i < st.nattribs && o < 400; i++)
             if (VA_FORMAT(st.attribs[i]))
                 o += snprintf(b + o, sizeof b - o, " a%u:f%u s%u+%u", i, VA_FORMAT(st.attribs[i]), VA_STREAM(st.attribs[i]),
                               VA_OFFSET(st.attribs[i]));
-        hlog(0, "   attribs%s", b);
+        TP("   attribs%s\n", b);
         o = 0;
         for (u32 i = 0; i < 4; i++)
             o += snprintf(b + o, sizeof b - o, " v%u:%llx+%llx/%u", i, st.vbuf[i].addr, st.vbuf[i].size,
                           i < st.nstreams ? st.streams[i].stride : 0);
         for (u32 i = 0; i < 6; i++)
             o += snprintf(b + o, sizeof b - o, " u%u:%llx+%llx", i, st.ubo[ST_VERTEX][i].addr, st.ubo[ST_VERTEX][i].size);
-        hlog(0, "  %s", b);
+        TP("  %s\n", b);
+        /* MK8_TRACE_UBO=<16-byte row>[,row...]: those rows of the vertex stage's uniform buffer 0 */
+        const char *rows = getenv("MK8_TRACE_UBO");
+        u8 *u0 = rows && st.ubo[ST_VERTEX][0].addr ? gpu_cpu(st.ubo[ST_VERTEX][0].addr, st.ubo[ST_VERTEX][0].size) : NULL;
+        for (const char *q = rows; u0 && q && *q;) {
+            u32 row = (u32)strtoul(q, (char **)&q, 10);
+            if (*q == ',') q++;
+            if (16ull * row + 16 > st.ubo[ST_VERTEX][0].size) continue;
+            float f[4];
+            memcpy(f, u0 + 16 * row, 16);
+            TP("   u0[%u] = %g %g %g %g\n", row, f[0], f[1], f[2], f[3]);
+        }
         o = 0;
         for (u32 k = 0; k < 8 && st.texpool.addr; k++) {
             u32 h = (u32)st.tex[ST_FRAGMENT][k], id = h & 0xfffff;
@@ -1782,7 +1808,12 @@ static void draw(u32 op, const void *payload) {
             if (td) o += snprintf(b + o, sizeof b - o, " t%u:%ux%ux%u f%u L%u/%u+%u tg%u @%llx", k, td->t.width, td->t.height,
                                   td->t.depth, td->v.format, td->v.base_level, td->t.levels, td->v.num_levels, td->v.target, td->t.addr);
         }
-        if (o) hlog(0, "   tex%s", b);
+        if (o) TP("   tex%s\n", b);
+#undef TP
+        static const char *filter;
+        if (!filter) filter = getenv("MK8_TRACE_FILTER") ? getenv("MK8_TRACE_FILTER") : "";
+        if (tn > 0 && tn < (int)sizeof tb && tb[tn - 1] == '\n') tb[--tn] = 0;
+        if (!filter[0] || strstr(tb, filter)) hlog(0, "%s", tb);
     }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     set_dynamic_state(c, ((const CmdDraw *)payload)->mode);
@@ -1842,9 +1873,7 @@ static CPipe *cpipes;
 
 static void dispatch(u32 op, const u8 *pay) {
     dispatches++;
-    static long trace = -2;
-    if (trace == -2) trace = getenv("MK8_TRACE") ? atol(getenv("MK8_TRACE")) : -1;
-    if ((long)frame_no + 1 == trace) {
+    if (trace_frame()) {
         char b[700];
         int o = 0;
         for (u32 i = 0; i < 14; i++)
@@ -2279,11 +2308,13 @@ static void dump_image(Image *im, const char *name) {
 
 static void dump_frame(Image *win, u64 frame) {
     static char list[256];
+    static u64 dump_tex;
     static int init;
     if (!init) {
         init = 1;
         const char *e = getenv("MK8_DUMP");
         if (e) snprintf(list, sizeof list, ",%s,", e);
+        if ((e = getenv("MK8_DUMP_TEX")) != NULL) dump_tex = strtoull(e, NULL, 16);   /* and every image at this address */
     }
     char key[32], name[128];
     snprintf(key, sizeof key, ",%llu,", frame);
@@ -2291,7 +2322,7 @@ static void dump_frame(Image *win, u64 frame) {
     int n = 0;
     for (int bkt = 0; bkt < IMAGE_BUCKETS; bkt++)
         for (Image *im = buckets[bkt]; im; im = im->next)
-            if (im->rt_frame == frame && im != win) {
+            if ((im->rt_frame == frame || (dump_tex && im->info.addr == dump_tex)) && im != win) {
                 snprintf(name, sizeof name, "frame_%llu_%ux%u_f%u_%llx", frame, im->info.width, im->info.height,
                          im->info.format, im->info.addr);
                 dump_image(im, name);
