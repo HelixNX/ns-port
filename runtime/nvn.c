@@ -158,8 +158,20 @@ static void device_texel_fetch_handle(Ctx *c) { RET((u64)(u32)A(1)); }
 static void device_image_handle(Ctx *c) { RET((u64)(u32)A(1)); }
 static void device_separate_texture_handle(Ctx *c) { RET((u64)(u32)A(1)); }
 static void device_separate_sampler_handle(Ctx *c) { RET((u64)(u32)A(1) << 20); }
-static void device_set_window_origin(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); if (d) d->window_origin = (u32)A(1); }
-static void device_set_depth_mode(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); if (d) d->depth_mode = (u32)A(1); }
+static void device_set_window_origin(Ctx *c) {
+    Device *d = obj_get(A(0), T_DEVICE);
+    if (!d) return;
+    d->window_origin = (u32)A(1);
+    hlog(1, "nvn: window origin mode %u", d->window_origin);
+    gpu_device_modes(d->window_origin, d->depth_mode);
+}
+static void device_set_depth_mode(Ctx *c) {
+    Device *d = obj_get(A(0), T_DEVICE);
+    if (!d) return;
+    d->depth_mode = (u32)A(1);
+    hlog(1, "nvn: depth mode %u", d->depth_mode);
+    gpu_device_modes(d->window_origin, d->depth_mode);
+}
 static void device_get_window_origin(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->window_origin : 0); }
 static void device_get_depth_mode(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->depth_mode : 0); }
 
@@ -676,8 +688,9 @@ static void shader_dump(const ShaderCode *s, const void *control) {
     fclose(f);
 }
 
-/* the stage from the SPH (word 0: bits 0-4 type, 1 VTG / 2 pixel; bits 10-13 VTG kind); no SPH: compute */
+/* the stage from the SPH (word 0: bits 0-4 type, 1 VTG / 2 pixel; bits 10-13 VTG kind); compute has none */
 static u32 shader_stage(u64 code) {
+    if (LD32(code) != 0x12345678u) return ST_COMPUTE;    /* compute code has no NVN header */
     u32 w0 = LD32(code + 0x30);
     if ((w0 & 0x1f) == 2) return ST_FRAGMENT;
     if ((w0 & 0x1f) == 1) {

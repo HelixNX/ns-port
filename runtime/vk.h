@@ -47,7 +47,7 @@
     X(vkCmdSetLogicOpEXT) X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) \
     X(vkCmdSetColorWriteMaskEXT) X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetDepthClipEnableEXT) \
     X(vkCmdSetPatchControlPointsEXT) X(vkCmdWriteTimestamp2) X(vkCmdBeginQuery) X(vkCmdEndQuery) \
-    X(vkCmdCopyQueryPoolResults) X(vkCmdResetQueryPool)
+    X(vkCmdCopyQueryPoolResults) X(vkCmdResetQueryPool) X(vkCmdPushDescriptorSetKHR)
 
 #define VK_DECLARE(f) extern PFN_##f f;
 VK_GLOBAL_FNS(VK_DECLARE)
@@ -93,6 +93,6 @@ void vk_init(void);
 
 /* swapchain: present `src` (in GENERAL layout, the region given) scaled into the window. Called by the
  * thread that owns the queue (gpu.c), after the work that rendered src has been submitted. */
-void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, VkSemaphore wait, u64 wait_value);
+void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
 
 #endif

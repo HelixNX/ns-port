@@ -75,6 +75,8 @@ static const char *const device_exts[] = {
     VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
     VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
+    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+    VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME,
 };
 
 static VkPhysicalDevice pick_device(void) {
@@ -129,8 +131,12 @@ void vk_init(void) {
     if (vk.family == ~0u) fatal("no graphics queue that can present");
 
     /* features: everything the NVN state maps to is dynamic state, so pipelines depend on shaders and formats */
+    VkPhysicalDeviceIndexTypeUint8FeaturesKHR u8i = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR,
+                                                     .indexTypeUint8 = 1};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT clipc = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &u8i, .depthClipControl = 1};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT clip = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
-                                                       .depthClipEnable = 1};
+                                                       &clipc, .depthClipEnable = 1};
     VkPhysicalDeviceRobustness2FeaturesEXT rob = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &clip,
                                                   .nullDescriptor = 1};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {
@@ -155,12 +161,14 @@ void vk_init(void) {
         .timelineSemaphore = 1, .bufferDeviceAddress = 1, .descriptorIndexing = 1, .runtimeDescriptorArray = 1,
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1,
         .descriptorBindingUpdateUnusedWhilePending = 1, .shaderSampledImageArrayNonUniformIndexing = 1,
-        .scalarBlockLayout = 1, .hostQueryReset = 1, .shaderFloat16 = 0, .samplerFilterMinmax = 1};
+        .scalarBlockLayout = 1, .hostQueryReset = 1, .shaderFloat16 = 0, .samplerFilterMinmax = 1,
+        .samplerMirrorClampToEdge = 1, .descriptorBindingVariableDescriptorCount = 1,
+        .descriptorBindingUniformBufferUpdateAfterBind = 0, .descriptorBindingStorageBufferUpdateAfterBind = 0};
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12,
         .shaderDrawParameters = 1};
     VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     f.features = (VkPhysicalDeviceFeatures){
-        .imageCubeArray = 1, .independentBlend = 1, .geometryShader = 1, .tessellationShader = 1,
+        .robustBufferAccess = 1, .imageCubeArray = 1, .independentBlend = 1, .geometryShader = 1, .tessellationShader = 1,
         .sampleRateShading = 1, .dualSrcBlend = 1, .logicOp = 1, .multiDrawIndirect = 1, .drawIndirectFirstInstance = 1,
         .depthClamp = 1, .depthBiasClamp = 1, .fillModeNonSolid = 1, .depthBounds = 1, .wideLines = 1,
         .largePoints = 1, .multiViewport = 1, .samplerAnisotropy = 1, .textureCompressionBC = 1,
@@ -464,7 +472,7 @@ static void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, 
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
-void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, VkSemaphore wait, u64 wait_value) {
+void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (!sw.fence[0]) present_init();
     if (InterlockedExchange(&resized, 0) || !sw.sc) {
         vkDeviceWaitIdle(vk.dev);
@@ -496,7 +504,8 @@ void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, VkSemaphore wait, u64 w
         if (dh > H) { dh = H; dw = (u32)((u64)H * w / h); }
         s32 dx = (s32)(W - dw) / 2, dy = (s32)(H - dh) / 2;
         VkImageBlit blit = {
-            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{x, y, 0}, {x + w, y + h, 1}},
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffsets = {{x, flip_y ? y + h : y, 0}, {x + w, flip_y ? y : y + h, 1}},
             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .dstOffsets = {{dx, dy, 0}, {dx + (s32)dw, dy + (s32)dh, 1}}};
         vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,

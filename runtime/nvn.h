@@ -135,9 +135,11 @@ typedef struct ShaderCode {
     u64 const_addr;                     /* embedded constants (GPU address) and their size */
     u32 const_size;
     void *module;                       /* gpu.c: the translated shader, or NULL */
+    u32 caps;                           /* gpu.c: SHC_* found in the translation */
     bool missing;
 } ShaderCode;
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
+enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2 };
 typedef struct Shaders { ShaderCode *stage[ST_COUNT]; u32 mask; u64 key; } Shaders;
 
 /* ---------------------------------------------------------------------------------------------- windows, syncs */
@@ -215,6 +217,7 @@ void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *
                          s64 row_stride, s64 image_stride);
 void gpu_shaders_set(ShaderCode *s);                    /* a new shader: load its translation */
 void gpu_window_created(Window *w);
+void gpu_device_modes(u32 window_origin, u32 depth_mode);
 
 /* formats (tex.c) */
 void format_info(u32 f, u32 *bpb, u32 *bw, u32 *bh);
