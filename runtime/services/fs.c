@@ -358,8 +358,10 @@ static const Iface iface_fsp = {"fsp-srv", (const IpcCmd[]){
 
 static SvcObj *open_fsp(const char *name) { return svcobj_new(&iface_fsp, NULL, name); }
 
+static char romfs_dir[1100];
+const char *fs_romfs_dir(void) { return romfs_dir; }      /* the host folder behind the game's RomFS (movie.c) */
+
 void fs_register(const char *game_dir, const char *save_dir) {
-    char romfs_dir[1100];
     snprintf(romfs_dir, sizeof romfs_dir, "%s/romfs", game_dir);
     snprintf(save_root, sizeof save_root, "%s", save_dir);
     snprintf(sysdata_root, sizeof sysdata_root, "%s/../sysdata", save_dir);

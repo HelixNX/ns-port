@@ -51,6 +51,25 @@ static bool has_ext(const VkExtensionProperties *e, u32 n, const char *name) {
     return false;
 }
 
+/* validation layer messages (MK8_VK_VALIDATION): each message id is logged its first few times */
+static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+                                               VkDebugUtilsMessageTypeFlagsEXT type,
+                                               const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
+    enum { SLOTS = 1024, TIMES = 3 };
+    static volatile LONG ids[SLOTS], counts[SLOTS];
+    u32 id = (u32)d->messageIdNumber, k = (id * 2654435761u) % SLOTS;
+    for (u32 i = 0; i < SLOTS; i++, k = (k + 1) % SLOTS) {
+        LONG cur = InterlockedCompareExchange(&ids[k], (LONG)id, 0);
+        if (cur == 0 || cur == (LONG)id) {
+            LONG n = InterlockedIncrement(&counts[k]);
+            if (n > TIMES) return VK_FALSE;
+            break;
+        }
+    }
+    hlog(1, "vk %s: %s", sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning", d->pMessage);
+    return VK_FALSE;
+}
+
 static void load_instance(void) {
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     if (!gipa) fatal("no vkGetInstanceProcAddr");
@@ -63,7 +82,11 @@ static void load_instance(void) {
     for (u32 i = 0; i < n && next < 15; i++) ext[next++] = sdl_ext[i];
     const char *layers[1];
     u32 nlayers = 0;
-    if (getenv("MK8_VK_VALIDATION")) layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
+    bool validate = getenv("MK8_VK_VALIDATION") != NULL;
+    if (validate) {
+        layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
+        ext[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    }
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "mk8recomp",
                              .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -72,6 +95,19 @@ static void load_instance(void) {
     VKCHECK(vkCreateInstance(&ci, NULL, &vk.instance));
 #define VK_LOAD_I(f) if (!(f = (PFN_##f)gipa(vk.instance, #f))) fatal("Vulkan: no %s", #f);
     VK_INSTANCE_FNS(VK_LOAD_I)
+    if (validate) {
+        PFN_vkCreateDebugUtilsMessengerEXT create =
+            (PFN_vkCreateDebugUtilsMessengerEXT)gipa(vk.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT mi = {
+            VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+            .pfnUserCallback = vk_debug};
+        VkDebugUtilsMessengerEXT m;
+        if (!create || create(vk.instance, &mi, NULL, &m) != VK_SUCCESS) hlog(1, "vk: no debug messenger");
+    }
 }
 
 static const char *const device_exts[] = {

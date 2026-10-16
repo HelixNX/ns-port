@@ -272,6 +272,13 @@ bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size) {
             const wchar_t *rel = wcsstr(f->path, L"romfs");
             hlog(2, "romfs: %ls (%llx of %llx bytes)", rel ? rel + 5 : f->path, n, f->size);
         }
+        static const char *trace;                        /* MK8_FS_TRACE=<part of a path>: every read of that file */
+        static wchar_t wtrace[260];
+        if (!trace && (trace = getenv("MK8_FS_TRACE")) != NULL) MultiByteToWideChar(CP_UTF8, 0, trace, -1, wtrace, 260);
+        else if (!trace) trace = "";
+        if (wtrace[0] && wcsstr(f->path, wtrace))
+            hlog(0, "romfs: read %ls +%llx size %llx", wcsrchr(f->path, L'/') ? wcsrchr(f->path, L'/') + 1 : f->path,
+                 d - f->offset, n);
         HANDLE h = file_handle(f);
         u64 done = 0;
         while (done < n) {

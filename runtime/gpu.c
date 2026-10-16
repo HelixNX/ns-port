@@ -538,7 +538,10 @@ static Image *image_create(const TexInfo *t, u32 h) {
     vkCmdPipelineBarrier2(cmd(), &d);
     /* defined contents (zeros) until something writes it: undefined memory can hold NaNs that spread */
     VkImageSubresourceRange all = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+    bool compressed = fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+    if (compressed) {
+        /* not clearable: the CPU's data is uploaded before use */
+    } else if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
         VkClearColorValue z = {{0, 0, 0, 0}};
         vkCmdClearColorImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
     } else {
