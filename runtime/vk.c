@@ -13,11 +13,13 @@ VK_DEVICE_FNS(VK_DEFINE)
 
 Vk vk;
 static SDL_Window *window;
+void input_event(const SDL_Event *e);
+void input_poll(void);
 static volatile LONG resized;
 
 /* ---------------------------------------------------------------------------------------------- window */
 void window_init(void) {
-    if (!SDL_Init(SDL_INIT_VIDEO)) fatal("SDL_Init: %s", SDL_GetError());
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) fatal("SDL_Init: %s", SDL_GetError());
     if (!SDL_Vulkan_LoadLibrary(NULL)) fatal("no Vulkan: %s", SDL_GetError());
     window = SDL_CreateWindow("Mario Kart 8 Deluxe", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) fatal("SDL_CreateWindow: %s", SDL_GetError());
@@ -27,8 +29,9 @@ void window_init(void) {
 void window_loop(void *guest_main_thread) {
     for (;;) {
         SDL_Event e;
-        if (SDL_WaitEventTimeout(&e, 50)) {
+        if (SDL_WaitEventTimeout(&e, 8)) {
             do {
+                input_event(&e);
                 if (e.type == SDL_EVENT_QUIT) {
                     hlog(1, "window closed");
                     fflush(stderr);
@@ -37,6 +40,7 @@ void window_loop(void *guest_main_thread) {
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
             } while (SDL_PollEvent(&e));
         }
+        input_poll();
         if (WaitForSingleObject((HANDLE)guest_main_thread, 0) == WAIT_OBJECT_0) return;
     }
 }

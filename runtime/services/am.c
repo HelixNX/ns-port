@@ -133,13 +133,15 @@ static const Iface iface_ac = {"IAudioController", (const IpcCmd[]){
 
 static const Iface iface_dc = {"IDisplayController", (const IpcCmd[]){IPC_END}, NULL};
 static const Iface iface_pwc = {"IProcessWindingController", (const IpcCmd[]){IPC_END}, NULL};
-static const Iface iface_lac = {"ILibraryAppletCreator", (const IpcCmd[]){IPC_END}, NULL};
 static const Iface iface_df = {"IDebugFunctions", (const IpcCmd[]){IPC_END}, NULL};
 
 /* ---------------------------------------------------------------------------------------------- IStorage */
-typedef struct Storage { u8 *data; u64 size; } Storage;
+typedef struct Storage { u8 *data; u64 size; volatile long refs; } Storage;
 
-static void storage_destroy(SvcObj *o) { Storage *s = o->data; free(s->data); free(s); }
+static void storage_release(Storage *s) {
+    if (InterlockedDecrement(&s->refs) == 0) { free(s->data); free(s); }
+}
+static void storage_destroy(SvcObj *o) { storage_release(o->data); }
 static void sa_size(SvcObj *o, IpcReq *r) { out_u64(r, ((Storage *)o->data)->size); }
 static void sa_read(SvcObj *o, IpcReq *r) {
     Storage *s = o->data;
@@ -164,12 +166,9 @@ static const Iface iface_storage_accessor = {"IStorageAccessor", (const IpcCmd[]
     IPC_END}, storage_destroy};
 
 static void st_open(SvcObj *o, IpcReq *r) {
-    Storage *s = o->data;                               /* the accessor works on its own copy */
-    Storage *view = calloc(1, sizeof *view);
-    view->size = s->size;
-    view->data = malloc(s->size);
-    memcpy(view->data, s->data, s->size);
-    out_object(r, svcobj_new(&iface_storage_accessor, view, NULL));
+    Storage *s = o->data;                               /* the accessor works on the storage itself */
+    InterlockedIncrement(&s->refs);
+    out_object(r, svcobj_new(&iface_storage_accessor, s, NULL));
 }
 static const Iface iface_storage = {"IStorage", (const IpcCmd[]){
     {0, st_open, "Open"},
@@ -177,11 +176,83 @@ static const Iface iface_storage = {"IStorage", (const IpcCmd[]){
 
 static SvcObj *storage_new(const void *data, u64 size) {
     Storage *s = calloc(1, sizeof *s);
-    s->data = malloc(size);
-    memcpy(s->data, data, size);
+    s->data = calloc(1, size ? size : 1);
+    if (data) memcpy(s->data, data, size);
     s->size = size;
+    s->refs = 1;
     return svcobj_new(&iface_storage, s, NULL);
 }
+
+/* ---------------------------------------------------------------------------------------------- library applets
+ * No applet runs: each one finishes as soon as it is started, as if the user cancelled it, and hands back an
+ * output storage whose first word is 1 (the "cancelled" result of the Mii editor, keyboard and selectors). */
+typedef struct LibApplet { u32 id, mode; bool started, done; KEvent *state, *popout; bool popped; } LibApplet;
+
+static void la_destroy(SvcObj *o) { free(o->data); }
+static void la_state_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->state); }
+static void la_popout_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->popout); }
+static void la_is_completed(SvcObj *o, IpcReq *r) { out_u8(r, ((LibApplet *)o->data)->done); }
+static void la_start(SvcObj *o, IpcReq *r) {
+    LibApplet *a = o->data;
+    hlog(1, "am: library applet %#x (mode %u) started: finishes at once, cancelled", a->id, a->mode);
+    a->started = a->done = true;
+    event_signal(a->popout);
+    event_signal(a->state);
+}
+static void la_exit(SvcObj *o, IpcReq *r) { LibApplet *a = o->data; a->done = true; event_signal(a->state); }
+static void la_result(SvcObj *o, IpcReq *r) { (void)o; }
+static void la_push_in(SvcObj *o, IpcReq *r) { (void)o; }
+static void la_pop_out(SvcObj *o, IpcReq *r) {
+    LibApplet *a = o->data;
+    if (a->popped || !a->done) { r->result = 0x680; return; }          /* am: no data */
+    a->popped = true;
+    u8 out[0x100] = {0};
+    u32 cancelled = 1;
+    memcpy(out, &cancelled, 4);
+    out_object(r, storage_new(out, sizeof out));
+}
+static void la_false(SvcObj *o, IpcReq *r) { out_u8(r, 0); }
+static const Iface iface_la = {"ILibraryAppletAccessor", (const IpcCmd[]){
+    {0, la_state_event, "GetAppletStateChangedEvent"},
+    {1, la_is_completed, "IsCompleted"},
+    {10, la_start, "Start"},
+    {20, la_exit, "RequestExit"},
+    {25, la_exit, "Terminate"},
+    {30, la_result, "GetResult"},
+    {100, la_push_in, "PushInData"},
+    {101, la_pop_out, "PopOutData"},
+    {103, la_push_in, "PushInteractiveInData"},
+    {104, la_pop_out, "PopInteractiveOutData"},
+    {105, la_popout_event, "GetPopOutDataEvent"},
+    {106, la_popout_event, "GetPopInteractiveOutDataEvent"},
+    {110, la_false, "NeedsToExitProcess"},
+    {150, la_result, "RequestForAppletToGetForeground"},
+    IPC_END}, la_destroy};
+
+static void lac_create(SvcObj *o, IpcReq *r) {
+    LibApplet *a = calloc(1, sizeof *a);
+    a->id = in_u32(r, 0);
+    a->mode = in_u32(r, 4);
+    a->state = event_create();
+    a->popout = event_create();
+    out_object(r, svcobj_new(&iface_la, a, NULL));
+}
+static void lac_create_storage(SvcObj *o, IpcReq *r) {
+    u64 size = in_u64(r, 0);
+    if (size > 0x10000000) { r->result = 0x1f680; return; }
+    out_object(r, storage_new(NULL, size));
+}
+static void lac_create_tmem_storage(SvcObj *o, IpcReq *r) {
+    u64 size = in_u64(r, 8);
+    if (size > 0x10000000) { r->result = 0x1f680; return; }
+    out_object(r, storage_new(NULL, size));
+}
+static const Iface iface_lac = {"ILibraryAppletCreator", (const IpcCmd[]){
+    {0, lac_create, "CreateLibraryApplet"},
+    {10, lac_create_storage, "CreateStorage"},
+    {11, lac_create_tmem_storage, "CreateTransferMemoryStorage"},
+    {12, lac_create_tmem_storage, "CreateHandleStorage"},
+    IPC_END}, NULL};
 
 /* ---------------------------------------------------------------------------------------------- IApplicationFunctions */
 extern const u64 acc_user_id[2];

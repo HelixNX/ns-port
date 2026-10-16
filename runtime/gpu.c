@@ -2278,6 +2278,7 @@ void gpu_present(u64 queue, Window *w, u32 index) {
 }
 
 void gpu_window_created(Window *w) { (void)w; }
+u64 gpu_frames(void) { return frame_no; }
 void gpu_shaders_set(ShaderCode *s) { (void)s; }
 
 void gpu_init(void) {
