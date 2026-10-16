@@ -8,6 +8,7 @@
  *   --save   save data folders (default: ../save from the executable, i.e. build/save)
  *   --dump-after N   after N seconds, print every guest thread's state and backtrace, then exit */
 #include "ipc.h"
+#include "vk.h"
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
@@ -79,6 +80,8 @@ int main(int argc, char **argv) {
     dispatch_init();
     services_init(game_dir, save_dir);
     loader_load(image_dir);
+    window_init();
+    vk_init();
     nvn_init();
     Npdm npdm = read_npdm();
     u64 stack_size = (npdm.stack_size + 0xfffull) & ~0xfffull;
@@ -99,7 +102,7 @@ int main(int argc, char **argv) {
     hlog(1, "main thread: stack %llx bytes, priority %u, core %u", stack_size, npdm.prio, npdm.core);
     thread_start(t);
     if (dump_after) _beginthreadex(NULL, 0, dump_thread, NULL, 0, NULL);
-    WaitForSingleObject((HANDLE)t->host, INFINITE);
+    window_loop(t->host);
     hlog(1, "the main thread exited");
     return 0;
 }

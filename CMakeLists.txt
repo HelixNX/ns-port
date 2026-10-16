@@ -34,12 +34,16 @@ target_compile_options(a64rt PRIVATE ${LIFT_FLAGS})
 set(RUNTIME_SOURCES runtime/main.c runtime/loader.c runtime/dispatch.c runtime/mem.c runtime/kernel.c runtime/kmem.c
                     runtime/svc.c runtime/ipc.c runtime/services/am.c runtime/services/lm.c runtime/services/apm.c
                     runtime/services/pctl.c runtime/services/vi.c runtime/services/hid.c runtime/services/time.c runtime/services/acc.c runtime/services/mii.c runtime/services/audio.c runtime/services/pl.c runtime/services/set.c
-                    runtime/services/fs.c runtime/romfs.c runtime/nvn.c)
+                    runtime/services/fs.c runtime/romfs.c runtime/nvn.c runtime/gpu.c runtime/tex.c runtime/vk.c)
 add_executable(mk8recomp ${RUNTIME_SOURCES})
 target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter /clang:-Wno-bitwise-op-parentheses
                                          /clang:-fno-strict-aliasing)
 target_compile_definitions(mk8recomp PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
-target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi)
+set(DEPS "${CMAKE_SOURCE_DIR}/../deps")
+target_include_directories(mk8recomp PRIVATE "${DEPS}/Vulkan-Headers/include" "${DEPS}/SDL3/SDL3-3.4.18/include")
+target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi "${DEPS}/SDL3/SDL3-3.4.18/lib/x64/SDL3.lib")
+add_custom_command(TARGET mk8recomp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                   "${DEPS}/SDL3/SDL3-3.4.18/lib/x64/SDL3.dll" "$<TARGET_FILE_DIR:mk8recomp>")
 # /DEBUG: a PDB whose public symbols name the lifted functions (f_<guest address>) in crash reports
 # /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
 # /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)

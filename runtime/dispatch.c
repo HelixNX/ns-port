@@ -209,7 +209,7 @@ static u64 guest_pc_of(DWORD64 rip) {
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
-        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION && code != 0xc0000374u)
         return EXCEPTION_CONTINUE_SEARCH;
     char b[256], sb[sizeof(SYMBOL_INFO) + 256];
     SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
@@ -231,6 +231,16 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     if (!strncmp(fn, "f_", 2) || !strncmp(fn, "b_", 2)) {
         u64 g = strtoull(fn + 2, NULL, 16);
         hlog(0, "  guest function %s", describe_addr(g, b, sizeof b));
+    }
+    /* the host frames (the handler runs on the faulting thread's stack, above them) */
+    void *frames[48];
+    USHORT nf = RtlCaptureStackBackTrace(1, 48, frames, NULL);
+    for (USHORT i = 0; i < nf; i++) {
+        DWORD64 d = 0;
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)frames[i], &d, si))
+            hlog(0, "  host %2u: %s+%llx", i, si->Name, (unsigned long long)d);
+        else
+            hlog(0, "  host %2u: %p", i, frames[i]);
     }
     if (cur_thread) {
         hlog(0, "  registers as of the last call:");
