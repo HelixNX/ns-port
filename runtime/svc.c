@@ -237,7 +237,8 @@ void svc_dispatch(Ctx *c, u32 n) {
     }
     }
 done:
-    if (r && log_level >= 1 && n != 0x18 && n != 0x34 && n != 0x1c && !(n == 0x29))
+    /* routine failures: timeouts, GetInfo probes, resetting an event that isn't signalled */
+    if (r && log_level >= 1 && n != 0x18 && n != 0x34 && n != 0x1c && !(n == 0x29) && !(n == 0x17 && r == 0xfa01))
         hlog(1, "svc %s -> %x", svc_name(n), r);
     x[0] = r;
     kernel_svc_exit();

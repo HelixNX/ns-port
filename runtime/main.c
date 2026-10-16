@@ -9,6 +9,7 @@
  *   --dump-after N   after N seconds, print every guest thread's state and backtrace, then exit */
 #include "ipc.h"
 #include "vk.h"
+#include "audio_dsp.h"
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
@@ -81,6 +82,7 @@ int main(int argc, char **argv) {
     services_init(game_dir, save_dir);
     loader_load(image_dir);
     window_init();
+    audio_init();
     vk_init();
     nvn_init();
     Npdm npdm = read_npdm();
