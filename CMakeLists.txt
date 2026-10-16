@@ -33,7 +33,7 @@ target_compile_options(a64rt PRIVATE ${LIFT_FLAGS})
 # the game: the runtime (kernel, SVCs, services) around the lifted code
 set(RUNTIME_SOURCES runtime/main.c runtime/loader.c runtime/dispatch.c runtime/mem.c runtime/kernel.c runtime/kmem.c
                     runtime/svc.c runtime/ipc.c runtime/services/am.c runtime/services/lm.c runtime/services/apm.c
-                    runtime/services/pctl.c runtime/services/vi.c runtime/services/hid.c runtime/services/time.c runtime/services/acc.c runtime/services/mii.c runtime/services/audio.c runtime/audio_dsp.c runtime/audio_fx.c runtime/services/pl.c runtime/services/set.c
+                    runtime/services/pctl.c runtime/services/vi.c runtime/services/hid.c runtime/services/time.c runtime/services/acc.c runtime/services/mii.c runtime/services/audio.c runtime/audio_dsp.c runtime/audio_fx.c runtime/services/pl.c runtime/services/set.c runtime/services/nifm.c runtime/services/friends.c
                     runtime/services/fs.c runtime/romfs.c runtime/nvn.c runtime/gpu.c runtime/tex.c runtime/vk.c runtime/astc.c runtime/input.c runtime/movie.c)
 add_executable(mk8recomp ${RUNTIME_SOURCES})
 target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter /clang:-Wno-bitwise-op-parentheses
