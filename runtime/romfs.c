@@ -268,6 +268,10 @@ bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size) {
             continue;
         }
         u64 n = f->offset + f->size - d < size ? f->offset + f->size - d : size;
+        if (d == f->offset && log_level >= 2) {          /* what the game loads (reads from a file's start) */
+            const wchar_t *rel = wcsstr(f->path, L"romfs");
+            hlog(2, "romfs: %ls (%llx of %llx bytes)", rel ? rel + 5 : f->path, n, f->size);
+        }
         HANDLE h = file_handle(f);
         u64 done = 0;
         while (done < n) {
