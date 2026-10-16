@@ -81,11 +81,34 @@ class Mod:
         return self.m.u32(off)
 
     def recover_functions(self, data):
-        """Code whose address is taken but that IDA left out of every function (e.g. a virtual method next to
-        bytes IDA called data: main+1f4): follow its control flow from there, through IDA's "data" if the flow
-        leads into it, up to returns, indirect branches and other functions' code."""
+        """Code that IDA left out of every function (its analysis of main's first 0x500 bytes is broken: a
+        virtual method at main+1f4, instructions classed as data): address-taken code, direct branch and call
+        targets, and fall-through past a function's last instruction. Each becomes a function by following its
+        control flow, through IDA's "data" if the flow leads there, up to returns, indirect branches and other
+        functions' code; repeated until nothing new turns up."""
         t0, t1 = self.text
-        for seed in sorted(set(self.m.code_seeds()) | self.addr_refs):
+        seeds = set(self.m.code_seeds()) | self.addr_refs
+        todo = set(self.funcs)
+        while True:
+            # direct branch / call targets in no function, and fall-through past a function's last instruction
+            for f in todo:
+                offs = self.funcs[f]
+                for i, a in enumerate(offs):
+                    w = self.word(a)
+                    seeds.update(t - self.base for t in branch_targets(w, self.base + a))
+                    if (i + 1 == len(offs) or offs[i + 1] != a + 4) and w & 0xfffffc1f not in (0xd65f0000, 0xd61f0000) \
+                            and w & 0xfc000000 != 0x14000000 and w & 0xffe0001f != 0xd4200000 and w != 0 \
+                            and w != 0x94000002:                    # BL over an inline constant: data follows
+                        seeds.add(a + 4)
+            new = self.recover_from(seeds, data)
+            if not new:
+                break
+            todo, seeds = new, set()
+
+    def recover_from(self, seeds, data):
+        t0, t1 = self.text
+        new = []
+        for seed in sorted(seeds):
             if not (t0 <= seed < t1) or seed & 3 or seed in self.owner or self.word(seed) == 0:
                 continue
             addrs, work = set(), [seed]
@@ -104,10 +127,12 @@ class Mod:
                 work.append(a + 4)
             order = sorted(addrs)
             self.funcs[seed] = order
+            new.append(seed)
             for a in order:
                 self.owner.setdefault(a, seed)
             print('%s: recovered function %x (%d instructions%s)' % (
                 self.name, seed, len(order), ', through IDA data' if data & addrs else ''))
+        return new
 
     def plt_slot(self, ea):
         """GOT slot of `adrp x16, p; ldr x17, [x16, #o]; add x16, x16, #o; br x17`, or None."""
