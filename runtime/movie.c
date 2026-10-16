@@ -2,7 +2,8 @@
  * which needs nvdrv. The constructors main calls (tools/lifter/overrides.txt) build objects of our own instead,
  * with vtables in subsdk0's layout (offset to top, RTTI, D2, D0, methods). Our streams keep the file's timing:
  * the extractor walks the video track's samples (duration, frame rate and size from the MP4's headers) and seeks,
- * and the decoder turns each sample into a black NV12 frame with that sample's time. Media Foundation comes later.
+ * and the decoder turns each sample into an NV12 frame with that sample's time: the frame at that time, decoded by
+ * a Media Foundation source reader on the same file (black if Media Foundation can't read it).
  *
  * How main's player uses them (main+0x379f28..0x37ca88): a thread waits on the decoder's client events
  * (RegisterClientEvents: input available, output available, format changed, error) and collects input indices
@@ -15,6 +16,10 @@
 #include "hos.h"
 #include <stdlib.h>
 #include <windows.h>
+#define COBJMACROS
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 
 #define ST_OK 0u
 #define ST_EOS 0x2000u
@@ -50,8 +55,9 @@ typedef struct {
     bool started;
     struct { bool used, queued; s64 time; u32 flags; } in[NIN];
     u32 in_order[NIN], nin_order;       /* inputs sent for decoding, oldest first */
-    struct { bool used, ready; s64 time; u32 flags; } out[NOUT];
+    struct { bool used, ready; s64 time; u32 flags; u8 *frame; } out[NOUT];
     u32 out_order[NOUT], nout_order;    /* decoded outputs not yet acquired, oldest first */
+    struct Video *video;                /* the movie the last extractor opened */
 } Dec;
 
 #define STATE(c) ((void *)(uintptr_t)LD64((c)->x[0] + 8))
@@ -131,6 +137,131 @@ static void mp4_probe(Stream *s, const char *path) {
     CloseHandle(f);
 }
 
+/* ---------------------------------------------------------------------------------------------- Media Foundation */
+/* a source reader on the movie, read forwards; a request behind the last frame or far ahead seeks */
+typedef struct Video {
+    IMFSourceReader *rd;
+    s64 last;                           /* the time of the frame in `frame` (us), -1 if none */
+    u32 w, h;
+    u8 *frame;                          /* NV12, stride w */
+    bool eos;
+} Video;
+
+static Video *current_video;            /* the extractor's movie, for the decoder started next */
+
+static void video_size(Video *v) {
+    IMFMediaType *t = NULL;
+    if (FAILED(IMFSourceReader_GetCurrentMediaType(v->rd, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &t))) return;
+    UINT64 fs = 0;
+    if (SUCCEEDED(IMFMediaType_GetUINT64(t, &MF_MT_FRAME_SIZE, &fs))) {
+        u32 w = (u32)(fs >> 32), h = (u32)fs;
+        if (w && h && (w != v->w || h != v->h)) {
+            free(v->frame);
+            v->w = w;
+            v->h = h;
+            v->frame = malloc((size_t)w * h * 3 / 2);
+            memset(v->frame, 16, (size_t)w * h);
+            memset(v->frame + (size_t)w * h, 128, (size_t)w * h / 2);
+        }
+    }
+    IMFMediaType_Release(t);
+}
+
+static Video *video_open(const char *path) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+        InitOnceComplete(&once, 0, NULL);
+    }
+    WCHAR wpath[1400];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1400);
+    IMFAttributes *attr = NULL;
+    MFCreateAttributes(&attr, 1);
+    IMFAttributes_SetUINT32(attr, &MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);   /* any format -> NV12 */
+    IMFSourceReader *rd = NULL;
+    HRESULT hr = MFCreateSourceReaderFromURL(wpath, attr, &rd);
+    IMFAttributes_Release(attr);
+    if (FAILED(hr)) {
+        hlog(0, "movie: Media Foundation can't open %s (%lx)", path, hr);
+        return NULL;
+    }
+    IMFSourceReader_SetStreamSelection(rd, (DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+    IMFSourceReader_SetStreamSelection(rd, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+    IMFMediaType *t = NULL;
+    MFCreateMediaType(&t);
+    IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFVideoFormat_NV12);
+    hr = IMFSourceReader_SetCurrentMediaType(rd, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, t);
+    IMFMediaType_Release(t);
+    if (FAILED(hr)) {
+        hlog(0, "movie: no NV12 output for %s (%lx)", path, hr);
+        IMFSourceReader_Release(rd);
+        return NULL;
+    }
+    Video *v = calloc(1, sizeof *v);
+    v->rd = rd;
+    v->last = -1;
+    video_size(v);
+    return v;
+}
+
+/* the decoded frame shown at time t (us) */
+static const u8 *video_frame(Video *v, s64 t, s64 frame) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (v->last < 0 || t < v->last - frame / 2 || t > v->last + 2000000) {
+        PROPVARIANT pos;
+        PropVariantInit(&pos);
+        pos.vt = VT_I8;
+        pos.hVal.QuadPart = t * 10;
+        IMFSourceReader_SetCurrentPosition(v->rd, &GUID_NULL, &pos);
+        v->last = -1;
+        v->eos = false;
+    }
+    while (!v->eos && (v->last < 0 || v->last < t - frame / 2)) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        IMFSample *smp = NULL;
+        if (FAILED(IMFSourceReader_ReadSample(v->rd, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, NULL, &flags, &ts,
+                                              &smp)) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) {
+            v->eos = true;
+            if (smp) IMFSample_Release(smp);
+            break;
+        }
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) video_size(v);
+        if (!smp) continue;
+        IMFMediaBuffer *mb = NULL;
+        if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(smp, &mb))) {
+            IMF2DBuffer *b2 = NULL;
+            BYTE *p = NULL;
+            LONG pitch = 0;
+            DWORD len = 0;
+            if (SUCCEEDED(IMFMediaBuffer_QueryInterface(mb, &IID_IMF2DBuffer, (void **)&b2)) &&
+                SUCCEEDED(IMF2DBuffer_Lock2D(b2, &p, &pitch)) && pitch > 0) {
+                /* the chroma plane follows the luma rows, which may be padded: rows = 2/3 of the buffer's rows */
+                DWORD cur = 0;
+                IMFMediaBuffer_GetCurrentLength(mb, &cur);
+                u32 rows = (u32)(cur / (DWORD)pitch * 2 / 3);
+                if (rows < v->h) rows = v->h;
+                for (u32 y = 0; y < v->h; y++) memcpy(v->frame + (size_t)y * v->w, p + (size_t)y * pitch, v->w);
+                for (u32 y = 0; y < v->h / 2; y++)
+                    memcpy(v->frame + (size_t)v->w * v->h + (size_t)y * v->w, p + (size_t)(rows + y) * pitch, v->w);
+                IMF2DBuffer_Unlock2D(b2);
+            } else if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &p, NULL, &len))) {
+                size_t n = (size_t)v->w * v->h * 3 / 2;
+                memcpy(v->frame, p, len < n ? len : n);
+                IMFMediaBuffer_Unlock(mb);
+            }
+            if (b2) IMF2DBuffer_Release(b2);
+            IMFMediaBuffer_Release(mb);
+        }
+        IMFSample_Release(smp);
+        v->last = ts / 10;
+    }
+    return v->frame;
+}
+
 /* ---------------------------------------------------------------------------------------------- guest helpers */
 static void describe_track(Ctx *c, u64 md, u32 w, u32 h) {
     static u64 set_string, set_int32, set_rect;
@@ -190,6 +321,13 @@ static u32 decode(Dec *d) {
         d->out[o].used = d->out[o].ready = true;
         d->out[o].time = d->in[k].time;
         d->out[o].flags = d->in[k].flags & FLAG_EOS;
+        if (d->video && d->video->w == d->width && d->video->h == d->height) {
+            if (!d->out[o].frame) d->out[o].frame = malloc((size_t)d->width * d->height * 3 / 2);
+            memcpy(d->out[o].frame, video_frame(d->video, d->out[o].time, 16666), (size_t)d->width * d->height * 3 / 2);
+        } else if (d->out[o].frame) {
+            free(d->out[o].frame);
+            d->out[o].frame = NULL;
+        }
         d->out_order[d->nout_order++] = (u32)o;
         d->in[k].used = d->in[k].queued = false;
         ev |= 3;
@@ -199,7 +337,11 @@ static u32 decode(Dec *d) {
 
 static void dec_reset(Dec *d) {
     memset(d->in, 0, sizeof d->in);
-    memset(d->out, 0, sizeof d->out);
+    for (int i = 0; i < NOUT; i++) {
+        u8 *f = d->out[i].frame;
+        memset(&d->out[i], 0, sizeof d->out[i]);
+        d->out[i].frame = f;
+    }
     d->nin_order = d->nout_order = 0;
 }
 
@@ -239,6 +381,7 @@ static void decoder_call(Ctx *c, int slot, Dec *d) {
     case 7:                                                       /* Start */
         EnterCriticalSection(&d->lock);
         d->started = true;
+        d->video = current_video;
         LeaveCriticalSection(&d->lock);
         ev = 1;
         break;
@@ -306,9 +449,11 @@ static void decoder_call(Ctx *c, int slot, Dec *d) {
         u64 b = c->x[2];
         if (!b) return;
         black_frame(d->width, d->height);
+        u32 o = (u32)c->x[1];
+        const u8 *src = o < NOUT && d->out[o].frame ? d->out[o].frame : frame_data;
         u64 n = (u64)d->width * d->height * 3 / 2, data = LD64(b + 0x28), cap = LD64(b + 0x18);
         if (data && cap) {
-            memcpy((void *)(uintptr_t)data, frame_data, n < cap ? n : cap);
+            memcpy((void *)(uintptr_t)data, src, n < cap ? n : cap);
             ST32(b, 0);
             ST32(b + 4, (u32)(n < cap ? n : cap));
         } else {
@@ -348,8 +493,10 @@ static void extractor_call(Ctx *c, int slot, Stream *s) {
         char host[1400];
         snprintf(host, sizeof host, "%s/%s", fs_romfs_dir(), rel);
         mp4_probe(s, host);
-        hlog(1, "movie: %s: %lld.%03lld s, %lld us per frame, %ux%u (frames are black)", rel,
-             s->duration / 1000000, s->duration / 1000 % 1000, s->frame, s->width, s->height);
+        Video *v = video_open(host);
+        if (v) current_video = v;       /* earlier movies' readers stay open (decoders may hold them) */
+        hlog(1, "movie: %s: %lld.%03lld s, %lld us per frame, %ux%u%s", rel, s->duration / 1000000,
+             s->duration / 1000 % 1000, s->frame, s->width, s->height, v ? "" : " (frames are black)");
         return;
     }
     case 5: return;                                               /* SetDataSource(data, size) */

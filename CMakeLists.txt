@@ -41,7 +41,7 @@ target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /c
 target_compile_definitions(mk8recomp PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 set(DEPS "${CMAKE_SOURCE_DIR}/../deps")
 target_include_directories(mk8recomp PRIVATE "${DEPS}/Vulkan-Headers/include" "${DEPS}/SDL3/SDL3-3.4.18/include")
-target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi "${DEPS}/SDL3/SDL3-3.4.18/lib/x64/SDL3.lib")
+target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 "${DEPS}/SDL3/SDL3-3.4.18/lib/x64/SDL3.lib")
 add_custom_command(TARGET mk8recomp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                    "${DEPS}/SDL3/SDL3-3.4.18/lib/x64/SDL3.dll" "$<TARGET_FILE_DIR:mk8recomp>")
 # /DEBUG: a PDB whose public symbols name the lifted functions (f_<guest address>) in crash reports
