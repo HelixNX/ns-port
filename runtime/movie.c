@@ -5,6 +5,7 @@
  * Status values (movie::Status, from subsdk0's AndroidErrorToNnError): 0 ok, 0x2000 end of stream,
  * 0x5003 try again later, 0x4004 output format changed. */
 #include "hos.h"
+#include <stdlib.h>
 
 #define ST_OK 0u
 #define ST_EOS 0x2000u
@@ -46,6 +47,44 @@ static void describe_track(Ctx *c, u64 md) {
     *c = saved;
 }
 
+/* the player's DecoderEvents (four nn::os events: input available, output available, format changed, error):
+ * signalled so that its thread wakes up, asks for output and finds the end of the stream */
+static u64 client_events;
+static void signal_events(Ctx *c) {
+    static u64 signal_event;
+    if (!signal_event) signal_event = sym_lookup("_ZN2nn2os11SignalEventEPNS0_9EventTypeE");
+    if (!client_events || !signal_event) return;
+    Ctx saved = *c;
+    for (int i = 0; i < 4; i++) {
+        u64 ev = LD64(client_events + 8 * i);
+        if (!ev) continue;
+        c->x[0] = ev;
+        guest_call(c, signal_event);
+    }
+    *c = saved;
+}
+
+/* one black 1280x720 frame (NV12: Y 0, UV 128), handed out once with the end-of-stream flag */
+static u8 *black_frame;
+#define FRAME_BYTES (1280 * 720 * 4)
+static int outputs;                     /* output buffers handed out */
+static void give_buffer(Ctx *c, u64 buffer) {
+    static u64 set_data, set_range;
+    if (!set_data) {
+        set_data = sym_lookup("_ZN5movie6Buffer18SetDataAndCapacityEPvm");
+        set_range = sym_lookup("_ZN5movie6Buffer8SetRangeEii");
+    }
+    if (!black_frame) {
+        black_frame = calloc(1, FRAME_BYTES);
+        memset(black_frame + 1280 * 720, 128, 1280 * 720 / 2);
+    }
+    if (!buffer || !set_data) return;
+    Ctx saved = *c;
+    c->x[0] = buffer; c->x[1] = (u64)(uintptr_t)black_frame; c->x[2] = FRAME_BYTES; guest_call(c, set_data);
+    if (set_range) { c->x[0] = buffer; c->x[1] = 0; c->x[2] = 1280 * 720 * 3 / 2; guest_call(c, set_range); }
+    *c = saved;
+}
+
 static void m_call(Ctx *c) {
     const char *cls = "?", *name = "?";
     int slot = -1;
@@ -62,11 +101,25 @@ static void m_call(Ctx *c) {
     case 6: if (c->x[1]) ST32(c->x[1], 1); c->x[0] = ST_OK; return;        /* GetTrackCount: one */
     case 7: describe_track(c, c->x[2]); c->x[0] = ST_OK; return;          /* GetTrackConfiguration */
     case 8: case 9: case 10: case 16: c->x[0] = ST_OK; return;  /* Select / Unselect / SeekTo / GetBufferedRange */
-    case 104: case 105: case 107: case 108: case 109: case 110: case 117: c->x[0] = ST_OK; return;
+    case 105: client_events = c->x[1]; c->x[0] = ST_OK; return; /* RegisterClientEvents */
+    case 107: signal_events(c); c->x[0] = ST_OK; return;        /* Start */
+    case 104: case 108: case 109: case 110: c->x[0] = ST_OK; return;
+    case 117: signal_events(c); c->x[0] = ST_OK; return;        /* ReleaseOutputBufferIndex: the next one is due */
     case 106: case 120: describe_track(c, c->x[1]); c->x[0] = ST_OK; return;  /* GetOutputFormat */
     case 116: if (c->x[1]) ST32(c->x[1], 1280 * 720 * 3 / 2); if (c->x[2]) ST32(c->x[2], 1); c->x[0] = ST_OK; return;
     case 118: c->x[0] = ST_OK; return;                          /* GetLastError */
     case 111: c->x[0] = ST_AGAIN; return;                       /* AcquireInputBufferIndex: nothing to feed */
+    case 114: {                                                 /* AcquireOutputBufferIndex(index, timeUs, flags) */
+        /* one black frame, then the end of the stream */
+        if (outputs >= 2) { c->x[0] = ST_AGAIN; return; }
+        if (c->x[1]) ST32(c->x[1], 0);
+        if (c->x[2]) ST64(c->x[2], outputs * 33333);
+        if (c->x[3]) ST32(c->x[3], outputs ? 4 : 0);            /* BUFFER_FLAG_END_OF_STREAM */
+        outputs++;
+        c->x[0] = ST_OK;
+        return;
+    }
+    case 115: case 119: give_buffer(c, c->x[2]); c->x[0] = ST_OK; return;   /* GetOutputBuffer(index, buffer) */
     default: c->x[0] = ST_EOS; return;                          /* reads, samples, outputs: the end */
     }
 }
