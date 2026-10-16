@@ -113,8 +113,14 @@ typedef struct KThread {
     KObj obj;                       /* signalled once the thread has exited */
     Ctx *ctx;
     u64 id, entry, arg, stack_top, tls;
-    s32 prio, core;
+    s32 prio, core;                 /* core: the ideal core */
     u64 affinity;
+    /* core ownership, under klock (see kernel.c) */
+    s32 cur_core;                   /* the core it owns (or was preempted on), or -1 */
+    bool ready;                     /* waiting for a core */
+    bool preempted;                 /* suspended on cur_core by a higher-priority thread */
+    volatile bool preempt_req;      /* give the core up at the next SVC */
+    u64 ready_seq;
     u32 handle;                     /* the handle the creator got (used as the mutex tag by the SDK) */
     void *host;                     /* Windows thread handle */
     u32 host_id;
@@ -143,6 +149,11 @@ __declspec(noreturn) void thread_exit(void);
 u32 thread_wait_sync(KObj **objs, int n, s64 timeout_ns, s32 *index);
 u32 thread_cancel_sync(KThread *t);
 void thread_sleep(s64 ns);
+void thread_set_core(KThread *t, s32 core, u64 mask);
+void core_leave(void);                              /* around host work that is a wait on the console (IPC) */
+void core_enter(void);
+void kernel_svc_exit(void);                         /* end of every SVC: give the core up if asked to */
+extern u64 lifted_lo, lifted_hi;                    /* host code range of lifted code and a64rt (dispatch.c) */
 u32 arbitrate_lock(u32 owner, u64 addr, u32 tag);
 u32 arbitrate_unlock(u64 addr);
 u32 condvar_wait(u64 mutex, u64 key, u32 tag, s64 timeout_ns);

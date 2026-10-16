@@ -41,8 +41,9 @@ target_compile_options(mk8recomp PRIVATE /clang:-O2 /clang:-march=haswell /W3 /c
 target_compile_definitions(mk8recomp PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 target_link_libraries(mk8recomp PRIVATE lifted a64rt dbghelp bcrypt psapi)
 # /DEBUG: a PDB whose public symbols name the lifted functions (f_<guest address>) in crash reports
-# /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range
-target_link_options(mk8recomp PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO)
+# /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
+# /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)
+target_link_options(mk8recomp PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO /MAP)
 
 # links every lifted function with stub runtime entry points (M2 check)
 add_executable(linkcheck runtime/linkcheck.c)

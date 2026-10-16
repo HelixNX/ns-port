@@ -6,7 +6,16 @@
  * `woken` and `wait_result` and wakes it.
  *
  * Waiter lists for mutexes, condition variables and the address arbiter are not kept: the few dozen threads are
- * scanned for the waiting ones (highest priority first, then first come). */
+ * scanned for the waiting ones (highest priority first, then first come).
+ *
+ * Cores: the console gives the game three cores and runs one thread at a time on each, the highest-priority ready
+ * one, which keeps its core until it waits or a higher-priority thread for that core becomes ready (equal
+ * priorities take turns only when they yield). Games rely on it, e.g. with per-core scratch data indexed by
+ * GetCurrentProcessorNumber. So a guest thread runs only while it owns a core from its affinity mask: it gives the
+ * core up whenever it waits in the kernel (and during IPC) and takes one back afterwards.
+ * Preemption: a thread that becomes ready while every core it may use is owned by a lower-priority thread takes the
+ * core of the lowest-priority owner. If that owner is in lifted code it is suspended there on the spot (lifted code
+ * never holds host locks); otherwise it is asked to give the core up at the end of its current SVC. */
 #include "hos.h"
 #include <stdlib.h>
 #include <windows.h>
@@ -125,22 +134,169 @@ u32 handle_close(u32 h) {
     return R_OK;
 }
 
+/* ---------------------------------------------------------------------------------------------- cores */
+#define NCORES 3
+static KThread *core_owner[NCORES];        /* under klock */
+static u64 ready_seq;
+u64 lifted_lo, lifted_hi;
+
+static void core_assign(KThread *t, int c) {
+    core_owner[c] = t;
+    t->cur_core = c;
+    t->ready = false;
+    if (t->preempted) {
+        t->preempted = false;
+        ResumeThread((HANDLE)t->host);
+    } else {
+        WakeConditionVariable((CONDITION_VARIABLE *)t->cv);
+    }
+}
+
+/* who gets a free core first: higher priority, then a preempted thread (it was running), then the longest ready */
+static bool better(KThread *a, KThread *b) {
+    if (!b) return true;
+    if (a->prio != b->prio) return a->prio < b->prio;
+    if (a->preempted != b->preempted) return a->preempted;
+    return a->ready_seq < b->ready_seq;
+}
+
+static KThread *next_for_core(int c) {
+    KThread *best = NULL;
+    for (KThread *t = threads; t; t = t->next) {
+        if (t->preempted ? t->cur_core != c : !(t->ready && (t->affinity >> c & 1))) continue;
+        if (better(t, best)) best = t;
+    }
+    return best;
+}
+
+static void core_release(KThread *t) {
+    int c = t->cur_core;
+    if (c < 0) return;
+    t->cur_core = -1;
+    t->preempt_req = false;
+    core_owner[c] = NULL;
+    KThread *n = next_for_core(c);
+    if (n) core_assign(n, c);
+}
+
+/* stop o where it is if it is in lifted code */
+static bool try_suspend(KThread *o) {
+    if (!lifted_hi || !o->host || SuspendThread((HANDLE)o->host) == (DWORD)-1) return false;
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if (GetThreadContext((HANDLE)o->host, &ctx) && ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi) return true;
+    ResumeThread((HANDLE)o->host);
+    return false;
+}
+
+/* give t a core now if it can have one: 1 done, 0 wait for a release, -1 retry soon (an owner was asked to yield) */
+static int core_try_place(KThread *t) {
+    int ideal = t->core;
+    if (ideal >= 0 && ideal < NCORES && (t->affinity >> ideal & 1) && !core_owner[ideal]) {
+        core_assign(t, ideal);
+        return 1;
+    }
+    for (int c = 0; c < NCORES; c++)
+        if ((t->affinity >> c & 1) && !core_owner[c]) {
+            core_assign(t, c);
+            return 1;
+        }
+    int v = -1;
+    for (int c = 0; c < NCORES; c++)
+        if ((t->affinity >> c & 1) && core_owner[c]->prio > t->prio && (v < 0 || core_owner[c]->prio > core_owner[v]->prio))
+            v = c;
+    if (v < 0) return 0;
+    KThread *o = core_owner[v];
+    if (!try_suspend(o)) {
+        o->preempt_req = true;
+        return -1;
+    }
+    o->preempted = true;
+    core_owner[v] = NULL;
+    core_assign(t, v);
+    return 1;
+}
+
+static void core_acquire(KThread *t) {
+    if (t->cur_core >= 0) return;
+    t->ready = true;
+    t->ready_seq = ++ready_seq;
+    for (;;) {
+        int r = core_try_place(t);
+        if (r == 1 || t->cur_core >= 0) break;
+        SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, r < 0 ? 1 : INFINITE, 0);
+        if (t->cur_core >= 0) break;
+    }
+    t->ready = false;
+}
+
+void core_leave(void) {
+    klock();
+    core_release(cur_thread);
+    kunlock();
+}
+
+void core_enter(void) {
+    klock();
+    core_acquire(cur_thread);
+    kunlock();
+}
+
+void kernel_svc_exit(void) {
+    KThread *t = cur_thread;
+    if (!t->preempt_req) return;
+    klock();
+    t->preempt_req = false;
+    KThread *n = t->cur_core >= 0 ? next_for_core(t->cur_core) : NULL;
+    if (n && n->prio < t->prio) {
+        core_release(t);
+        core_acquire(t);
+    }
+    kunlock();
+}
+
+void thread_set_core(KThread *t, s32 core, u64 mask) {
+    klock();
+    if (mask) t->affinity = mask & ((1u << NCORES) - 1);
+    if (core >= 0) t->core = core;
+    if (!(t->affinity >> t->core & 1)) t->core = t->affinity ? (s32)__builtin_ctzll(t->affinity) : 0;
+    if (!t->affinity) t->affinity = 1ull << t->core;
+    hlog(1, "%s: ideal core %d, mask %llx", t->name, t->core, t->affinity);
+    if (t == cur_thread && t->cur_core >= 0 && !(t->affinity >> t->cur_core & 1)) {
+        core_release(t);
+        core_acquire(t);
+    } else if (t->cur_core >= 0 && !(t->affinity >> t->cur_core & 1)) {
+        t->preempt_req = true;                         /* moves at its next SVC */
+    }
+    kunlock();
+}
+
 /* ---------------------------------------------------------------------------------------------- waiting */
-/* Sleep until end_wait (klock held on entry and exit). Returns the wait result, or R_TIMED_OUT if the deadline
- * passed first; the caller then takes the thread off whatever it waits on. */
+/* Sleep until end_wait (klock held on entry and exit), without the core. Returns the wait result, or R_TIMED_OUT
+ * if the deadline passed first; the caller then takes the thread off whatever it waits on. */
 static u32 block(KThread *t, s64 timeout_ns) {
     ULONGLONG deadline = 0;
     if (timeout_ns > 0) deadline = GetTickCount64() + (ULONGLONG)((timeout_ns + 999999) / 1000000);
-    while (!t->woken) {
+    core_release(t);
+    u32 r;
+    for (;;) {
+        if (t->woken) { r = t->wait_result; break; }
         DWORD ms = INFINITE;
         if (timeout_ns >= 0) {
             ULONGLONG now = GetTickCount64();
-            if (now >= deadline) return R_TIMED_OUT;
+            if (now >= deadline) {
+                /* nobody may end this wait any more while the thread waits for its core */
+                t->woken = true;
+                r = R_TIMED_OUT;
+                break;
+            }
             ms = (DWORD)(deadline - now);
         }
         SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, ms, 0);
     }
-    return t->wait_result;
+    core_acquire(t);
+    return r;
 }
 
 static void begin_wait(KThread *t, int kind) {
@@ -389,6 +545,7 @@ KThread *thread_create(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 core) {
     InitializeConditionVariable((CONDITION_VARIABLE *)t->cv);
     t->entry = entry; t->arg = arg; t->stack_top = stack_top; t->prio = prio; t->core = core;
     t->affinity = 1ull << (core < 0 ? 0 : core);
+    t->cur_core = -1;
     klock();
     t->id = next_thread_id++;
     if ((tls_next & 0xfff) == 0) mem_map(tls_next, 0x1000, MS_TLS, MP_RW);
@@ -408,6 +565,7 @@ KThread *thread_create(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 core) {
 void run_guest_main(KThread *t) {
     cur_thread = t;
     host_thread_init(t->ctx);
+    core_enter();
     guest_call(t->ctx, t->entry);
     hlog(1, "%s: entry returned", t->name);
     thread_exit();
@@ -435,6 +593,7 @@ void thread_exit(void) {
     klock();
     t->exited = true;
     kobj_notify(&t->obj);
+    core_release(t);
     kunlock();
     hlog(2, "%s exits", t->name);
     kobj_unref(&t->obj);
@@ -443,16 +602,32 @@ void thread_exit(void) {
 }
 
 void thread_sleep(s64 ns) {
-    if (ns <= 0) {
-        SwitchToThread();                              /* 0, -1, -2: the yield variants */
+    KThread *t = cur_thread;
+    if (ns <= 0) {                                     /* 0, -1, -2: the yield variants, to equal priorities */
+        klock();
+        KThread *n = t->cur_core >= 0 ? next_for_core(t->cur_core) : NULL;
+        if (n && n->prio <= t->prio) {
+            core_release(t);
+            core_acquire(t);
+        }
+        kunlock();
+        if (!n) SwitchToThread();
         return;
     }
+    klock();
+    t->wait = W_SLEEP;
+    core_release(t);
+    kunlock();
     static __declspec(thread) HANDLE timer;
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER due;
     due.QuadPart = -(ns + 99) / 100;
     if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
     else Sleep((DWORD)((ns + 999999) / 1000000));
+    klock();
+    t->wait = W_NONE;
+    core_acquire(t);
+    kunlock();
 }
 
 /* ---------------------------------------------------------------------------------------------- events */
@@ -485,10 +660,11 @@ void kernel_dump_threads(void) {
     for (KThread *t = threads; t; t = t->next) {
         if (t->exited) continue;
         char b[200];
-        hlog(0, "%s (id %llx, prio %d): %s%s addr %llx key %llx; lr %s", t->name, t->id, t->prio,
-             t->started ? "" : "not started, ", kinds[t->wait < 6 ? t->wait : 0], t->wait_addr, t->cv_key,
-             describe_addr(t->ctx->x[30], b, sizeof b));
-        if (t->host && t->wait == W_NONE) {                  /* running: where it is now, five samples */
+        hlog(0, "%s (id %llx, prio %d, core %d/%llx): %s%s addr %llx key %llx; lr %s", t->name, t->id, t->prio,
+             t->cur_core, t->affinity, t->started ? "" : "not started, ",
+             t->ready ? "waiting for a core" : t->preempted ? "preempted" : kinds[t->wait < 6 ? t->wait : 0],
+             t->wait_addr, t->cv_key, describe_addr(t->ctx->x[30], b, sizeof b));
+        if (t->host && t->wait == W_NONE && !t->ready && !t->preempted) {                  /* running: where it is now, five samples */
             char where[5][128];
             for (int k = 0; k < 5; k++) {
                 host_where(t->host, where[k], sizeof where[k]);

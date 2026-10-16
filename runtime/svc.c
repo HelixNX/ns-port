@@ -135,14 +135,12 @@ void svc_dispatch(Ctx *c, u32 n) {
         KThread *o = get_thread((u32)x[0]);
         if (!o) { r = R_INVALID_HANDLE; break; }
         s32 core = (s32)x[1];
-        if (core == -3) core = o->core;               /* keep the ideal core */
-        else if (core == -2) core = 0;
-        if (core >= 0) o->core = core;
-        if (x[2]) o->affinity = x[2];
+        if (core == -2) core = 0;                     /* the process's ideal core; -1 and -3 keep the current one */
+        thread_set_core(o, core, x[2]);
         kobj_unref(&o->obj);
         break;
     }
-    case 0x10: x[0] = (u64)(t->core < 0 ? 0 : t->core); return;
+    case 0x10: x[0] = (u64)(t->cur_core < 0 ? 0 : t->cur_core); kernel_svc_exit(); return;
     case 0x11: case 0x12: case 0x17: {
         KEvent *e = (KEvent *)handle_get((u32)x[0], KO_EVENT);
         if (!e) { r = R_INVALID_HANDLE; break; }
@@ -189,8 +187,9 @@ void svc_dispatch(Ctx *c, u32 n) {
     case 0x1c: r = condvar_wait(x[0], x[1], (u32)x[2], (s64)x[3]); break;
     case 0x1d: condvar_signal(x[0], (s32)x[1]); break;
     case 0x1f: { u32 h = 0; r = ipc_connect_named_port((const char *)(uintptr_t)x[1], &h); x[1] = h; break; }
-    case 0x21: r = ipc_send_sync_request((u32)x[0], t->tls, 0x100); break;
-    case 0x22: r = ipc_send_sync_request((u32)x[2], x[0], x[1]); break;
+    /* the client waits for the server on the console: other threads may have its core meanwhile */
+    case 0x21: core_leave(); r = ipc_send_sync_request((u32)x[0], t->tls, 0x100); core_enter(); break;
+    case 0x22: core_leave(); r = ipc_send_sync_request((u32)x[2], x[0], x[1]); core_enter(); break;
     case 0x25: {
         KThread *o = get_thread((u32)x[1]);
         if (!o) { r = R_INVALID_HANDLE; break; }
@@ -241,4 +240,5 @@ done:
     if (r && log_level >= 1 && n != 0x18 && n != 0x34 && n != 0x1c && !(n == 0x29))
         hlog(1, "svc %s -> %x", svc_name(n), r);
     x[0] = r;
+    kernel_svc_exit();
 }

@@ -22,9 +22,25 @@ void dispatch_init(void) {
         t->span = m->text_end - m->base;
         t->name = m->name;
         t->tab = calloc(t->span / 4, sizeof(GuestFn));
-        for (const FnEntry *e = m->entries; e->fn; e++)
+        for (const FnEntry *e = m->entries; e->fn; e++) {
             t->tab[(e->addr - m->base) / 4] = e->fn;
+            u64 h = (u64)(uintptr_t)e->fn;
+            if (!lifted_lo || h < lifted_lo) lifted_lo = h;
+            if (h > lifted_hi) lifted_hi = h;
+        }
     }
+    /* Where lifted code is, for preemption (kernel.c): the linker puts lifted.lib's code in one block, right after
+     * the runtime's objects and followed by a64rt.c's (lock-free helpers, so the range may include them). If that
+     * ever changes, preemption waits for SVCs instead of suspending threads. */
+    if ((u64)(uintptr_t)stxp64 > lifted_hi) lifted_hi = (u64)(uintptr_t)stxp64;
+    const u64 host_fns[] = {(u64)(uintptr_t)svc_dispatch, (u64)(uintptr_t)hlog, (u64)(uintptr_t)call_ind,
+                            (u64)(uintptr_t)dispatch_init, (u64)(uintptr_t)nvn_init};
+    for (size_t i = 0; i < sizeof host_fns / sizeof *host_fns; i++)
+        if (host_fns[i] >= lifted_lo && host_fns[i] < lifted_hi) {
+            hlog(0, "runtime code lies among lifted code: threads are preempted only at SVCs");
+            lifted_lo = lifted_hi = 0;
+            break;
+        }
 }
 
 u64 hostcall_register(const char *name, GuestFn fn) {
