@@ -80,6 +80,40 @@ void jump_ind(Ctx *c) {
     MUSTTAIL return f(c);
 }
 
+/* setjmp/longjmp (a64rt.h): the host jump buffers of each thread's latest setjmp calls, by guest jmp_buf */
+#define HOST_JMPS 16
+typedef struct { u64 guest; jmp_buf buf; } HostJmp;
+static __declspec(thread) HostJmp host_jmps[HOST_JMPS];
+static __declspec(thread) unsigned host_jmp_next;
+
+static HostJmp *host_jmp_find(u64 guest_buf) {
+    for (int i = 0; i < HOST_JMPS; i++)
+        if (host_jmps[i].guest == guest_buf) return &host_jmps[i];
+    return NULL;
+}
+
+jmp_buf *guest_jmp_slot(u64 guest_buf) {
+    HostJmp *j = host_jmp_find(guest_buf);
+    if (!j) {
+        j = &host_jmps[host_jmp_next++ % HOST_JMPS];
+        j->guest = guest_buf;
+    }
+    return &j->buf;
+}
+
+void h_longjmp(Ctx *c) {
+    u64 b = c->x[0], val = c->x[1];
+    HostJmp *j = host_jmp_find(b);
+    if (!j) guest_trap(c, "longjmp to a jmp_buf no lifted setjmp call set", c->x[30]);
+    const u64 *g = (const u64 *)(uintptr_t)b;      /* the sdk's layout: x19-x30, sp at 0x68, d8-d15 at 0x70 */
+    for (int i = 0; i < 12; i++) c->x[19 + i] = g[i];
+    c->x[31] = g[0x68 / 8];
+    for (int i = 0; i < 8; i++) c->v[8 + i] = (v128){g[0x70 / 8 + i], 0};
+    c->x[0] = val ? val : 1;
+    longjmp(j->buf, 1);
+}
+void h__longjmp(Ctx *c) { h_longjmp(c); }
+
 void guest_call(Ctx *c, u64 addr) {
     c->x[30] = HOSTCALL_BASE;          /* a return address that is not guest code */
     call_ind(c, addr);

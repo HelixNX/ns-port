@@ -206,10 +206,13 @@ static void la_pop_out(SvcObj *o, IpcReq *r) {
     LibApplet *a = o->data;
     if (a->popped || !a->done) { r->result = 0x680; return; }          /* am: no data */
     a->popped = true;
-    u8 out[0x100] = {0};
+    /* the web applets (web, shop, offline web, login, wifi auth, my page) return exactly a 0x1010-byte
+     * ReturnValue {u64 exit reason, last URL[0x1000], u64 URL size}: exit reason 1 = back button */
+    bool web = a->id == 0x10 || a->id == 0x11 || (a->id >= 0x17 && a->id <= 0x1a);
+    u8 out[0x1010] = {0};
     u32 cancelled = 1;
     memcpy(out, &cancelled, 4);
-    out_object(r, storage_new(out, sizeof out));
+    out_object(r, storage_new(out, web ? 0x1010 : 0x100));
 }
 static void la_false(SvcObj *o, IpcReq *r) { out_u8(r, 0); }
 static const Iface iface_la = {"ILibraryAppletAccessor", (const IpcCmd[]){

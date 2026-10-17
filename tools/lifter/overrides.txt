@@ -9,3 +9,6 @@ _ZN5movie9ExtractorC1ENS_13ContainerTypeE
 _ZN5movie9ExtractorC2ENS_13ContainerTypeE
 _ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE
 _ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE
+# runtime/dispatch.c: longjmp goes back through the host jump buffer of the matching setjmp call (a64rt.h)
+longjmp
+_longjmp

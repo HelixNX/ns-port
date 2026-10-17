@@ -314,7 +314,8 @@ static void sync_wait(Ctx *c) {
 }
 
 /* ---------------------------------------------------------------------------------------------- views */
-void view_resolve(const TexInfo *t, const TexView *v, ViewInfo *o) {
+void view_resolve(const Texture *tex, const TexView *v, ViewInfo *o) {
+    const TexInfo *t = &tex->info;
     memset(o, 0, sizeof *o);
     o->format = v && v->flags & VIEW_FORMAT ? v->format : t->format;
     o->target = v && v->flags & VIEW_TARGET ? v->target : t->target;
@@ -336,9 +337,11 @@ void view_resolve(const TexInfo *t, const TexView *v, ViewInfo *o) {
         o->min_layer = (u16)v->min_layer;
         o->num_layers = (u16)(v->num_layers ? v->num_layers : layers - v->min_layer);
     }
+    /* what a view leaves unset comes from the texture (nvnTextureBuilderSetSwizzle: e.g. BC5 as R R R G) */
     static const u8 identity[4] = {2, 3, 4, 5};
-    memcpy(o->swizzle, v && v->flags & VIEW_SWIZZLE ? v->swizzle : identity, 4);
-    o->ds_mode = v && v->flags & VIEW_DS_MODE ? v->ds_mode : 0;
+    const u8 *sw = v && v->flags & VIEW_SWIZZLE ? v->swizzle : tex->b.swizzle;
+    memcpy(o->swizzle, sw[0] | sw[1] | sw[2] | sw[3] ? sw : identity, 4);     /* all ZERO: never set */
+    o->ds_mode = v && v->flags & VIEW_DS_MODE ? v->ds_mode : tex->b.ds_mode;
 }
 
 /* ---------------------------------------------------------------------------------------------- textures */
@@ -469,15 +472,21 @@ static void write_texels(Ctx *c, s64 row, s64 image) {
     Texture *t = obj_get(A(0), T_TEXTURE);
     if (!t || !A(2) || !A(3)) return;
     ViewInfo v;
-    view_resolve(&t->info, A(1) ? P(TexView, 1) : NULL, &v);
+    view_resolve(t, A(1) ? P(TexView, 1) : NULL, &v);
     gpu_texture_written(&t->info, &v, P(CopyRegion, 2), P(void, 3), row, image);
 }
 static void tex_write_texels(Ctx *c) { write_texels(c, 0, 0); }
 static void tex_write_texels_strided(Ctx *c) { write_texels(c, (s64)A(4), (s64)A(5)); }
-static void tex_read_texels(Ctx *c) {
-    static bool logged;
-    if (!logged) { logged = true; hlog(0, "nvn: ReadTexels: not supported yet (zeroes)"); }
+/* nvnTextureReadTexels / Strided: the CPU reads texels back (the ghost thumbnail of Time Trials) */
+static void read_texels(Ctx *c, s64 row, s64 image) {
+    Texture *t = obj_get(A(0), T_TEXTURE);
+    if (!t || !A(2) || !A(3)) return;
+    ViewInfo v;
+    view_resolve(t, A(1) ? P(TexView, 1) : NULL, &v);
+    gpu_texture_read(&t->info, &v, P(CopyRegion, 2), P(void, 3), row, image);
 }
+static void tex_read_texels(Ctx *c) { read_texels(c, 0, 0); }
+static void tex_read_texels_strided(Ctx *c) { read_texels(c, (s64)A(4), (s64)A(5)); }
 
 static void view_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(TexView)); }
 static void view_levels(Ctx *c) { TexView *v = P(TexView, 0); v->base_level = (u16)A(1); v->num_levels = (u16)A(2); v->flags |= VIEW_LEVELS; }
@@ -659,7 +668,7 @@ static void texpool_register(Ctx *c) {
     TexDesc d;
     memset(&d, 0, sizeof d);
     d.t = t->info;
-    view_resolve(&t->info, A(3) ? P(TexView, 3) : NULL, &d.v);
+    view_resolve(t, A(3) ? P(TexView, 3) : NULL, &d.v);
     write_desc(descpool(A(0)), (u32)A(1), TDESC_MAGIC, tdesc_intern(&d));
 }
 /* nvnSamplerPoolRegisterSampler(pool, int id, const NVNsampler *) / ...SamplerBuilder(pool, id, builder) */
@@ -1168,7 +1177,7 @@ static bool texref(u64 tex, u64 view, TexRef *r) {
     memset(r, 0, sizeof *r);
     if (!t) return false;
     r->t = t->info;
-    view_resolve(&t->info, view ? (const TexView *)PTR(view) : NULL, &r->v);
+    view_resolve(t, view ? (const TexView *)PTR(view) : NULL, &r->v);
     return true;
 }
 
@@ -1820,7 +1829,7 @@ static const NvnProc procs[] = {
     {"nvnTextureWriteTexels", tex_write_texels},
     {"nvnTextureWriteTexelsStrided", tex_write_texels_strided},
     {"nvnTextureReadTexels", tex_read_texels},
-    {"nvnTextureReadTexelsStrided", tex_read_texels},
+    {"nvnTextureReadTexelsStrided", tex_read_texels_strided},
     {"nvnTextureViewSetDefaults", view_defaults},
     {"nvnTextureViewSetLevels", view_levels},
     {"nvnTextureViewSetLayers", view_layers},

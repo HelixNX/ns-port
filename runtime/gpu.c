@@ -1530,7 +1530,12 @@ static VkPrimitiveTopology topology(u32 mode) {
 
 /* MK8_TRACE=n or n-m: the frames whose draws and dispatches are logged (MK8_TRACE_FILTER: only draws whose
  * trace contains that text, e.g. a texture's "128x128x1 f56") */
+static volatile LONG capture_request;      /* F12 (vk.c): dump and trace the next whole frame */
+static u64 capture_frame;
+void gpu_capture_next(void) { InterlockedExchange(&capture_request, 1); }
+
 static bool trace_frame(void) {
+    if (capture_frame && frame_no + 1 == capture_frame) return true;
     static long lo = -2, hi = -1;
     if (lo == -2) {
         const char *e = getenv("MK8_TRACE");
@@ -1800,15 +1805,22 @@ static void draw(u32 op, const void *payload) {
             TP("   u0[%u] = %g %g %g %g\n", row, f[0], f[1], f[2], f[3]);
         }
         o = 0;
-        for (u32 k = 0; k < 8 && st.texpool.addr; k++) {
+        char tb2[2048];
+        for (u32 k = 0; k < 32 && st.texpool.addr && o < 1900; k++) {
             u32 h = (u32)st.tex[ST_FRAGMENT][k], id = h & 0xfffff;
             if (!h || id >= st.texpool.count) continue;
             u64 a = st.texpool.addr + 32ull * id;
             const TexDesc *td = LD32(a) == TDESC_MAGIC ? tdesc_get(LD32(a + 4)) : NULL;
-            if (td) o += snprintf(b + o, sizeof b - o, " t%u:%ux%ux%u f%u L%u/%u+%u tg%u @%llx", k, td->t.width, td->t.height,
+            if (td) o += snprintf(tb2 + o, sizeof tb2 - o, " t%u:%ux%ux%u f%u L%u/%u+%u tg%u @%llx", k, td->t.width, td->t.height,
                                   td->t.depth, td->v.format, td->v.base_level, td->t.levels, td->v.num_levels, td->v.target, td->t.addr);
         }
-        if (o) TP("   tex%s\n", b);
+        if (o) TP("   tex%s\n", tb2);
+        o = 0;      /* render targets as viewed: texture shape and target, view level and layers */
+        for (u32 i = 0; i < st.nrt && i < 8; i++)
+            o += snprintf(b + o, sizeof b - o, " rt%u:%ux%ux%u tg%u L%u ly%u+%u @%llx", i, st.rt[i].t.width, st.rt[i].t.height,
+                          st.rt[i].t.depth, st.rt[i].t.target, st.rt[i].v.base_level, st.rt[i].v.min_layer,
+                          st.rt[i].v.num_layers, st.rt[i].t.addr);
+        if (o) TP("   rts%s\n", b);
 #undef TP
         static const char *filter;
         if (!filter) filter = getenv("MK8_TRACE_FILTER") ? getenv("MK8_TRACE_FILTER") : "";
@@ -2216,6 +2228,45 @@ void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *
     LeaveCriticalSection(&gpu_cs);
 }
 
+/* the CPU reads texels (nvnTextureReadTexels): copy the region out of the image after the work submitted so far */
+void gpu_texture_read(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, void *data,
+                      s64 row_stride, s64 image_stride) {
+    EnterCriticalSection(&gpu_cs);
+    TexRef tr = {*t, *v};
+    ViewInfo vv;
+    Image *im = image_ref(&tr, &vv);
+    v = &vv;
+    if (im && r->w > 0 && !format_is_astc(t->format)) {
+        u32 bpb, bw, bh;
+        format_info(t->format, &bpb, &bw, &bh);
+        u32 h = r->h > 0 ? (u32)r->h : 1, d = r->d > 0 ? (u32)r->d : 1;
+        u64 row = row_stride > 0 ? (u64)row_stride : (u64)(r->w + bw - 1) / bw * bpb;
+        u64 img = image_stride > 0 ? (u64)image_stride : row * ((h + bh - 1) / bh);
+        u64 size = img * d;
+        VkBuf b;
+        vk_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &b);
+        image_upload(im);
+        CmdCopyBT c = {0};
+        c.tex.t = *t;
+        c.tex.v = *v;
+        c.r = *r;
+        c.row_stride = (s64)row;
+        c.image_stride = (s64)img;
+        VkBufferImageCopy reg = bt_region(&c, im, 0);
+        end_rendering();
+        barrier();
+        vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, b.buf, 1, &reg);
+        flush();
+        gpu_wait(submitted, UINT64_MAX);
+        memcpy(data, b.a.map, size);
+        vk_buffer_free(&b);
+    } else {
+        hlog(0, "gpu: ReadTexels of %ux%u f%u: no image (left as is)", t->width, t->height, t->format);
+    }
+    LeaveCriticalSection(&gpu_cs);
+}
+
 /* ---------------------------------------------------------------------------------------------- present */
 /* MK8_DUMP=n[,m...]: at those frames, write the presented window texture (frame_<n>.ppm) and every render target
  * the frame drew into (frame_<n>_<w>x<h>_<format>_<address>.ppm) to build/frames */
@@ -2290,6 +2341,11 @@ static void dump_image(Image *im, const char *name) {
     if (slash) *slash = 0;
     snprintf(path, sizeof path, "%s\\..\\frames", exe);
     CreateDirectoryA(path, NULL);
+    if (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        snprintf(path, sizeof path, "%s\\..\\frames\\%s.raw", exe, name);  /* float targets: exact values too */
+        FILE *rf = fopen(path, "wb");
+        if (rf) { fwrite(b.a.map, 1, (size_t)w * h * bpp, rf); fclose(rf); }
+    }
     snprintf(path, sizeof path, "%s\\..\\frames\\%s.ppm", exe, name);
     FILE *f = fopen(path, "wb");
     if (f) {
@@ -2318,7 +2374,7 @@ static void dump_frame(Image *win, u64 frame) {
     }
     char key[32], name[128];
     snprintf(key, sizeof key, ",%llu,", frame);
-    if (!list[0] || !strstr(list, key)) return;
+    if (frame != capture_frame && (!list[0] || !strstr(list, key))) return;
     int n = 0;
     for (int bkt = 0; bkt < IMAGE_BUCKETS; bkt++)
         for (Image *im = buckets[bkt]; im; im = im->next)
@@ -2388,6 +2444,10 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     }
     if (image_bytes > budget) images_evict(budget / 4 * 3, false);
     dump_frame(im, frame_no + 1);
+    if (InterlockedExchange(&capture_request, 0)) {
+        capture_frame = frame_no + 2;
+        hlog(0, "gpu: F12: frame %llu is traced and dumped to build/frames", capture_frame);
+    }
     u64 frames = ++frame_no;
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);

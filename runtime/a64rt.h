@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <setjmp.h>
 
 typedef uint8_t u8;   typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int8_t s8;    typedef int16_t s16;  typedef int32_t s32;  typedef int64_t s64;
@@ -53,6 +54,13 @@ void guest_svc(Ctx *c, u32 imm);
 void host_yield(void);
 u64 host_cntpct(void);
 void host_set_fpcr(Ctx *c);
+
+/* setjmp/longjmp (the sdk's libjpeg reports errors by longjmp). A call of the guest setjmp also sets a host jump
+ * buffer in the lifted caller's frame, keyed by the guest jmp_buf (x0); h_longjmp restores the guest registers
+ * from the guest jmp_buf and longjmps there, so the caller resumes after its setjmp call (LOAD) with x0 = value.
+ * The CRT's setjmp unwinds the host frames in between; __builtin_setjmp crashes on Windows x64. */
+jmp_buf *guest_jmp_slot(u64 guest_buf);
+#define GUEST_SETJMP(fn) do { if (setjmp(*guest_jmp_slot(c->x[0])) == 0) fn(c); } while (0)
 
 /* ---------------------------------------------------------------------------------------------- memory */
 /* Guest loads and stores are volatile: another guest thread may change memory at any time, and a guest loop that

@@ -106,6 +106,7 @@ void pl_register(const char *save_dir);
 void set_register(void);
 void nifm_register(void);
 void friends_register(void);
+void ldn_register(void);
 void fs_register(const char *game_dir, const char *save_dir);
 
 #endif

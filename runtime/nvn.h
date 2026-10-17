@@ -82,7 +82,7 @@ typedef struct TexBuilder {
 } TexBuilder;
 typedef struct Texture { TexBuilder b; TexInfo info; u64 size; } Texture;
 
-void view_resolve(const TexInfo *t, const TexView *v, ViewInfo *out);
+void view_resolve(const Texture *t, const TexView *v, ViewInfo *out);
 
 /* interned descriptors: texture pool entries hold {TDESC_MAGIC, index} */
 #define TDESC_MAGIC 0x43534454u         /* 'TDSC' */
@@ -215,6 +215,8 @@ void gpu_pool_created(Pool *p);
 void gpu_pool_destroyed(Pool *p);
 void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, const void *data,
                          s64 row_stride, s64 image_stride);
+void gpu_texture_read(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, void *data,
+                      s64 row_stride, s64 image_stride);
 void gpu_shaders_set(ShaderCode *s);                    /* a new shader: load its translation */
 void gpu_window_created(Window *w);
 void gpu_device_modes(u32 window_origin, u32 depth_mode);

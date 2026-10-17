@@ -168,6 +168,10 @@ class Program:
         return None
 
 
+# calls of these also set a host jump buffer in the caller's frame (a64rt.h GUEST_SETJMP); longjmp is an override
+SETJMP = {'setjmp', '_setjmp', '__setjmp'}
+
+
 def mangle(sym):
     return ''.join(ch if ch.isalnum() or ch == '_' else '_%02x' % ord(ch) for ch in sym)
 
@@ -244,6 +248,8 @@ class Fn:
         """BL target: set LR, call, reload."""
         self.wx.add(30)
         self.fk = None
+        if self.mod.plt.get(target - self.mod.base) in SETJMP:
+            return 'X30 = 0x%xull; SAVE; GUEST_SETJMP(%s); LOAD;' % (ret_addr, self.env.callee(target))
         return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, self.env.callee(target))
 
     def call_ind(self, expr, ret_addr):

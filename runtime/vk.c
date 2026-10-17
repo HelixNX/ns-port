@@ -15,6 +15,7 @@ Vk vk;
 static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
+void gpu_capture_next(void);
 static volatile LONG resized;
 
 /* ---------------------------------------------------------------------------------------------- window */
@@ -38,6 +39,7 @@ void window_loop(void *guest_main_thread) {
                     ExitProcess(0);
                 }
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
             } while (SDL_PollEvent(&e));
         }
         input_poll();
