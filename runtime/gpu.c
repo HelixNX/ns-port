@@ -654,8 +654,13 @@ static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
             astc_decode(blocks, lv->w, lv->h, L->bw, L->bh, srgb, dst + layer * lsize, w, h);
             static int dumped;
             if (l == 0 && layer == 0 && getenv("MK8_DUMP_ASTC") && dumped < 40) {
-                char path[MAX_PATH];
-                snprintf(path, sizeof path, "E:/projects/ns-port/build/frames/astc_%02d_%ux%u_f%u.pam", dumped++, w, h,
+                char path[MAX_PATH], exe[MAX_PATH];
+                GetModuleFileNameA(NULL, exe, sizeof exe);
+                char *slash = strrchr(exe, '\\');
+                if (slash) *slash = 0;
+                snprintf(path, sizeof path, "%s\\..\\frames", exe);
+                CreateDirectoryA(path, NULL);
+                snprintf(path, sizeof path, "%s\\..\\frames\\astc_%02d_%ux%u_f%u.pam", exe, dumped++, w, h,
                          im->info.format);
                 FILE *f = fopen(path, "wb");
                 if (f) {
@@ -1820,7 +1825,27 @@ static void draw(u32 op, const void *payload) {
             o += snprintf(b + o, sizeof b - o, " rt%u:%ux%ux%u tg%u L%u ly%u+%u @%llx", i, st.rt[i].t.width, st.rt[i].t.height,
                           st.rt[i].t.depth, st.rt[i].t.target, st.rt[i].v.base_level, st.rt[i].v.min_layer,
                           st.rt[i].v.num_layers, st.rt[i].t.addr);
+        if (st.has_depth)
+            o += snprintf(b + o, sizeof b - o, " ds:%ux%ux%u f%u L%u ly%u+%u @%llx", st.depth.t.width, st.depth.t.height,
+                          st.depth.t.depth, st.depth.v.format, st.depth.v.base_level, st.depth.v.min_layer,
+                          st.depth.v.num_layers, st.depth.t.addr);
         if (o) TP("   rts%s\n", b);
+        /* MK8_TRACE_FUBO=<bank>:<row>[,row...]: those 16-byte rows of the fragment stage's uniform buffer c[3 + bank] */
+        const char *fub = getenv("MK8_TRACE_FUBO");
+        if (fub && strchr(fub, ':')) {
+            u32 bank = (u32)strtoul(fub, NULL, 10);
+            const BufferRange *ub = bank < 15 ? &st.ubo[ST_FRAGMENT][bank] : NULL;
+            u8 *fu = ub && ub->addr ? gpu_cpu(ub->addr, ub->size) : NULL;
+            for (const char *q = strchr(fub, ':') + 1; fu && *q;) {
+                u32 row = (u32)strtoul(q, (char **)&q, 10);
+                if (*q == ',') q++;
+                else if (*q) break;
+                if (16ull * row + 16 > ub->size) continue;
+                float f[4];
+                memcpy(f, fu + 16 * row, 16);
+                TP("   fc%u[%u] = %g %g %g %g\n", 3 + bank, row, f[0], f[1], f[2], f[3]);
+            }
+        }
 #undef TP
         static const char *filter;
         if (!filter) filter = getenv("MK8_TRACE_FILTER") ? getenv("MK8_TRACE_FILTER") : "";

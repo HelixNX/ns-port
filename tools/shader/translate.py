@@ -1466,7 +1466,7 @@ def main():
         print('  %4d  %s  (e.g. %s)' % (len(hs), why, hs[0]))
     if check or spv:
         from concurrent.futures import ThreadPoolExecutor
-        glslang = os.path.join(here, '../../../deps/glslang/bin/glslang.exe')
+        glslang = os.path.join(here, '../../../../deps/glslang/bin/glslang.exe')
         spvdir = os.path.join(src, 'spv')
         os.makedirs(spvdir, exist_ok=True)
 
