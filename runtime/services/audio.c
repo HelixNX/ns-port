@@ -25,7 +25,7 @@ enum { EFFECT_USED = 3, EFFECT_REMOVED = 4 };
 #define MIX_IN 0x930
 #define SINK_IN 0x140
 
-static bool trace;                         /* MK8_AUDIO_TRACE: voices as the game sets them up */
+static bool trace;                         /* NX_AUDIO_TRACE: voices as the game sets them up */
 
 static u32 rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 static u64 rd64(const u8 *p) { u64 v; memcpy(&v, p, 8); return v; }
@@ -406,7 +406,7 @@ static const Iface iface_audren = {"audren:u", (const IpcCmd[]){
 static SvcObj *open_audren(const char *name) { return svcobj_new(&iface_audren, NULL, name); }
 
 void audio_register(void) {
-    trace = getenv("MK8_AUDIO_TRACE") != NULL;
+    trace = getenv("NX_AUDIO_TRACE") != NULL;
     device_event = event_create();
     service_register("audren:u", open_audren);
 }

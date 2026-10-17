@@ -1441,7 +1441,12 @@ def main():
     check = '--check' in sys.argv
     spv = '--spv' in sys.argv
     here = os.path.dirname(os.path.abspath(__file__))
-    src = args[0] if args else os.path.join(here, '../../../build/shaders')
+    if args:
+        src = args[0]
+    else:
+        sys.path.insert(0, os.path.join(here, '..'))
+        import gamecfg
+        src = os.path.join(gamecfg.BUILD, 'shaders')
     dst = args[1] if len(args) > 1 else os.path.join(src, 'glsl')
     os.makedirs(dst, exist_ok=True)
     ok, failed = 0, {}
@@ -1466,7 +1471,7 @@ def main():
         print('  %4d  %s  (e.g. %s)' % (len(hs), why, hs[0]))
     if check or spv:
         from concurrent.futures import ThreadPoolExecutor
-        glslang = os.path.join(here, '../../../../deps/glslang/bin/glslang.exe')
+        glslang = os.path.join(here, '../../../deps/glslang/bin/glslang.exe')
         spvdir = os.path.join(src, 'spv')
         os.makedirs(spvdir, exist_ok=True)
 

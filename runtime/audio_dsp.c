@@ -495,7 +495,7 @@ void ar_render_frame(ArRenderer *r) {
 
 /* ---------------------------------------------------------------------------------------------- host device */
 static SDL_AudioStream *stream;
-static FILE *dump;                          /* MK8_AUDIO_DUMP=<file.wav>: everything sent to the device */
+static FILE *dump;                          /* NX_AUDIO_DUMP=<file.wav>: everything sent to the device */
 static u32 dumped;
 static SRWLOCK out_lock = SRWLOCK_INIT;
 
@@ -511,9 +511,9 @@ static void dump_header(void) {
 }
 
 void audio_init(void) {
-    const char *path = getenv("MK8_AUDIO_DUMP");
+    const char *path = getenv("NX_AUDIO_DUMP");
     if (path && *path && (dump = fopen(path, "wb"))) dump_header();
-    if (getenv("MK8_NOAUDIO")) return;
+    if (getenv("NX_NOAUDIO")) return;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         hlog(0, "audio: no SDL audio: %s", SDL_GetError());
         return;

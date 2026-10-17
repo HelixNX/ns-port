@@ -4,8 +4,7 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <bcrypt.h>
-
-#define PROGRAM_ID 0x0100152000022000ull
+#include "game_config.h"
 
 static const char *svc_name(u32 n) {
     static const char *const names[0x80] = {
@@ -51,7 +50,7 @@ static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
     case 14: *out = STACK_BASE; return R_OK;
     case 15: *out = STACK_SIZE; return R_OK;
     case 16: case 17: *out = 0; return R_OK;                           /* system resource */
-    case 18: *out = PROGRAM_ID; return R_OK;
+    case 18: *out = NX_TITLE_ID; return R_OK;
     case 20: *out = 0; return R_OK;                                    /* user exception context */
     case 21: *out = TOTAL_MEMORY; return R_OK;
     case 22: *out = mem_used(); return R_OK;

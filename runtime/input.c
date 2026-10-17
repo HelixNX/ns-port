@@ -2,7 +2,7 @@
  *
  * Keyboard: arrows = left stick and D-pad, Z = A, X = B, C = X, V = Y, Q = L, E = R, 1 = ZL, 3 = ZR,
  * Enter = +, Backspace = -, IJKL = right stick. Gamepads map by label (an Xbox pad's bottom button is A).
- * MK8_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
+ * NX_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
  * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
  * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN. */
 #include "hos.h"
@@ -35,13 +35,13 @@ void input_event(const SDL_Event *e) {
 
 static s32 axis(s32 v) { return v < -32767 ? -32767 : v; }
 
-/* MK8_INPUT */
+/* NX_INPUT */
 static u64 scripted(u64 frame) {
     static char *script;
     static bool init;
     if (!init) {
         init = true;
-        const char *e = getenv("MK8_INPUT");
+        const char *e = getenv("NX_INPUT");
         if (e) script = _strdup(e);
     }
     if (!script) return 0;

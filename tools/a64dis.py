@@ -1,6 +1,6 @@
 """Disassemble the function containing a guest offset, naming calls through PLT stubs and exports.
 
-Usage: python a64dis.py <module> <offset hex> [<offset hex>...]     (module: main, sdk, subsdk0)
+Usage: python a64dis.py <module> <offset hex> [<offset hex>...]     (module: one of game.json's)
        python a64dis.py <module> <start hex>-<end hex>             (a raw range)
 """
 import os

@@ -1,12 +1,12 @@
-"""Static recompiler: AArch64 -> C, for the 64-bit modules of MK8DX 3.0.5 (main, subsdk0, sdk).
+"""Static recompiler: AArch64 -> C, for the modules of a Switch game (game.json, see ../gamecfg.py).
 
-Design (see ../../../CLAUDE.md):
+Design (see the game's CLAUDE.md, e.g. mk8dx/CLAUDE.md):
 - every guest function becomes `void f_<address>(Ctx *c)`; the guest registers are C locals of that function
   (X0..X30, SP, V0..V31, the flags NF ZF CF VF), loaded from the Ctx on entry and stored back only at calls,
   returns and indirect branches (the per-function SAVE / LOAD macros), so clang can keep them in host registers
   and delete what is never used;
 - guest memory is identity-mapped: a guest address is a host pointer (modules at fixed addresses, BASES);
-- a call through a PLT stub is resolved here, across the three modules, to a direct call of the provider's
+- a call through a PLT stub is resolved here, across the modules, to a direct call of the provider's
   lifted function (or of a host replacement `h_<symbol>`);
 - an indirect branch looks the target up in a per-module table indexed by (address - text start) / 4;
 - a switch (BR with a jump table that IDA resolved) becomes a C switch of gotos.
@@ -15,8 +15,8 @@ Instruction semantics live in a64insn.py (integer, branches, loads and stores, s
 
 Usage:
     python a64lift.py cover <module> [...]                 coverage statistics, nothing written
-    python a64lift.py lift  <outdir> [--only mod:0xOFF,...] lift main, subsdk0 and sdk into <outdir>
-Modules are read from ../../../dump_v21/elf/<module>.elf and ../../../build/analysis_305/<module>_ida.json.
+    python a64lift.py lift  <outdir> [--only mod:0xOFF,...] lift every module into <outdir>
+Modules are read from <dump>/elf/<module>.elf and <analysis>/<module>_ida.json (game.json).
 """
 import collections
 import io
@@ -25,16 +25,16 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, HERE)
 
+import gamecfg                                  # noqa: E402
 from nxmod import Module                       # noqa: E402
 from a64insn import Unimpl, lift_insn, branch_targets   # noqa: E402
 
 # load order = symbol lookup order (as rtld does it: main, then the subsdks, then sdk)
-MODULES = ['main', 'subsdk0', 'sdk']
-BASES = {'main': 0x7100000000, 'subsdk0': 0x7101400000, 'sdk': 0x7101c00000}
+MODULES = gamecfg.MODULES
+BASES = gamecfg.BASES
 
 NREG = 32          # X0..X30 and SP (31)
 LINE_INFO = os.environ.get('LIFT_LINES', '1') != '0'   # #line <guest offset> before every instruction
@@ -50,8 +50,8 @@ class Mod:
 
     def __init__(self, name, elf=None, ida=None):
         self.name = name
-        self.m = Module(elf or os.path.join(ROOT, 'dump_v21', 'elf', name + '.elf'))
-        ida = json.load(open(ida or os.path.join(ROOT, 'build', 'analysis_305', name + '_ida.json')))
+        self.m = Module(elf or os.path.join(gamecfg.ELF, name + '.elf'))
+        ida = json.load(open(ida or os.path.join(gamecfg.ANALYSIS, name + '_ida.json')))
         self.base = BASES[name]
         self.text = self.m.text
         data = set()
@@ -149,7 +149,7 @@ class Mod:
 
 
 class Program:
-    """All three modules, with imports resolved between them."""
+    """All the modules, with imports resolved between them."""
 
     def __init__(self, names=MODULES, overrides=None):
         self.mods = {n: Mod(n) for n in names}
@@ -629,10 +629,12 @@ class Out(io.StringIO):
 
 
 def load_overrides():
-    path = os.path.join(HERE, 'overrides.txt')
-    if not os.path.exists(path):
-        return set()
-    return {ln.split('#')[0].strip() for ln in open(path) if ln.split('#')[0].strip()}
+    """The shared host replacements (overrides.txt here) and the game's own (overrides.txt next to game.json)."""
+    out = set()
+    for path in (os.path.join(HERE, 'overrides.txt'), gamecfg.OVERRIDES):
+        if os.path.exists(path):
+            out |= {ln.split('#')[0].strip() for ln in open(path) if ln.split('#')[0].strip()}
+    return out
 
 
 if __name__ == '__main__':

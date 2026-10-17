@@ -12,7 +12,7 @@ Output, one file per module, <outdir>/<module>.img (little-endian):
     string table
     image bytes: text, ro, data up to the end of initialised data (bss is zero-filled by the runtime)
 
-Usage: python a64image.py <outdir>      (e.g. ../../../build/image)
+Usage: python a64image.py <outdir>      (e.g. <build>/image)
 """
 import os
 import struct

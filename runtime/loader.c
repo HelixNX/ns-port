@@ -10,9 +10,9 @@ typedef struct ImgHeader {
 } ImgHeader;
 
 #define IMG_MAGIC 0x4d494b4du
-static const char *const mod_names[] = {"main", "subsdk0", "sdk"};      /* load order = lookup order */
+extern const ModInfo lifted_modules[];          /* a64lift's table: the game's modules in load order = lookup order */
 
-LoadedMod loaded_mods[3];
+LoadedMod loaded_mods[MAX_MODS];
 int num_loaded_mods;
 
 static void *read_file(const char *path, size_t *size) {
@@ -98,7 +98,10 @@ static void set_global(const char *sym, u64 value) {
 }
 
 void loader_load(const char *dir) {
-    for (int i = 0; i < 3; i++) load_one(dir, mod_names[i]);
+    for (const ModInfo *m = lifted_modules; m->name; m++) {
+        if (num_loaded_mods == MAX_MODS) fatal("more than %d modules", MAX_MODS);
+        load_one(dir, m->name);
+    }
     /* rtld's data the sdk points at: two empty module lists (no ModuleObjects: nothing loads NROs), the debug flag
      * and the manual-lookup slot that nn::ro fills in */
     mem_map(MISC_BASE, 0x1000, MS_CODEDATA, MP_RW);

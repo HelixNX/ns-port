@@ -2,7 +2,12 @@
 import collections, glob, os, sys
 from maxwell import Shader, opcode
 
-d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '../../../build/shaders')
+if len(sys.argv) > 1:
+    d = sys.argv[1]
+else:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    import gamecfg
+    d = os.path.join(gamecfg.BUILD, 'shaders')
 ops, st, unknown, where = collections.Counter(), collections.Counter(), collections.Counter(), {}
 total = 0
 for f in sorted(glob.glob(os.path.join(d, '*.bin'))):

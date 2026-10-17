@@ -1,6 +1,6 @@
 """Differential test of a64lift against Unicorn.
 
-Instructions are sampled from the three modules, grouped by shape (capstone mnemonic and operand pattern),
+Instructions are sampled from the modules, grouped by shape (capstone mnemonic and operand pattern),
 up to --per instances of each shape. Every test runs one instruction from a random state (registers that are
 pointers into a scratch window, small integers or random 64-bit values; V registers with a mix of floats and
 random bits) in Unicorn and in the lifted C; registers, flags, the next PC and the scratch window are compared.
@@ -9,7 +9,7 @@ With --pairs, the samples are pairs of consecutive instructions: one that sets t
 them (this checks the compare-and-branch folding, which spans two instructions).
 
 Usage: python a64test.py [--per N] [--seed S] [--filter REGEX] [--states K] [--pairs]
-Work files go to ../../../build/a64test.
+Work files go to <build>/a64test (game.json).
 """
 import collections
 import os
@@ -29,8 +29,7 @@ import a64lift                                   # noqa: E402
 from a64lift import Fn, Env, Program, emit      # noqa: E402
 from a64insn import Unimpl, lift_insn           # noqa: E402
 
-ROOT = a64lift.ROOT
-WORK = os.path.join(ROOT, 'build', 'a64test')
+WORK = os.path.join(a64lift.gamecfg.BUILD, 'a64test')
 WIN, WIN_SIZE = 0x7200000000, 0x20000
 VCVARS = r'E:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat'
 CLANG = r'C:\msys64\mingw64\bin\clang-cl.exe'
@@ -389,7 +388,7 @@ int main(int argc, char **argv) {
 
 
 def build():
-    rt = os.path.join(ROOT, 'mk8recomp', 'runtime')
+    rt = os.path.join(HERE, '..', '..', 'runtime')
     bat = os.path.join(WORK, 'build.bat')
     with open(bat, 'w') as f:
         f.write('@echo off\ncall "%s" >nul\ncd /d "%s"\n"%s" %s /I"%s" tests.c "%s" /Fea64test.exe /link /STACK:8388608\n' % (

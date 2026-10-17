@@ -1,5 +1,6 @@
 /* Vulkan: instance and device (the discrete GPU), the SDL window and its swapchain, device memory. See vk.h. */
 #include "vk.h"
+#include "game_config.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <stdlib.h>
@@ -22,7 +23,7 @@ static volatile LONG resized;
 void window_init(void) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) fatal("SDL_Init: %s", SDL_GetError());
     if (!SDL_Vulkan_LoadLibrary(NULL)) fatal("no Vulkan: %s", SDL_GetError());
-    window = SDL_CreateWindow("Mario Kart 8 Deluxe", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    window = SDL_CreateWindow(NX_TITLE, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) fatal("SDL_CreateWindow: %s", SDL_GetError());
 }
 
@@ -53,7 +54,7 @@ static bool has_ext(const VkExtensionProperties *e, u32 n, const char *name) {
     return false;
 }
 
-/* validation layer messages (MK8_VK_VALIDATION): each message id is logged its first few times */
+/* validation layer messages (NX_VK_VALIDATION): each message id is logged its first few times */
 static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBitsEXT sev,
                                                VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
@@ -84,12 +85,12 @@ static void load_instance(void) {
     for (u32 i = 0; i < n && next < 15; i++) ext[next++] = sdl_ext[i];
     const char *layers[1];
     u32 nlayers = 0;
-    bool validate = getenv("MK8_VK_VALIDATION") != NULL;
+    bool validate = getenv("NX_VK_VALIDATION") != NULL;
     if (validate) {
         layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
         ext[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "mk8recomp",
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = NX_NAME,
                              .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = next, .ppEnabledExtensionNames = ext,

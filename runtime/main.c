@@ -1,15 +1,16 @@
-/* mk8recomp: start-up. Does what the console's loader and rtld do, then enters the sdk:
+/* Start-up. Does what the console's loader and rtld do, then enters the sdk:
  *   nn::init::Start(main thread handle, main's base, rtld's "initialised" callback, rtld's "run DT_INIT" callback)
  * on the main thread, whose stack size, priority and core come from main.npdm.
  *
- * Usage: mk8recomp [--game <dump dir>] [--image <image dir>] [--save <dir>] [--log <0-2>]
- *   --game   the dumped game: exefs/main.npdm, romfs/ (default: ../../dump_v21 from the executable)
+ * Usage: <game> [--game <dump dir>] [--image <image dir>] [--save <dir>] [--log <0-2>]
+ *   --game   the dumped game: exefs/main.npdm, romfs/ (default: game.json's dump, NX_GAME_DIR in game_config.h)
  *   --image  module images from tools/lifter/a64image.py (default: ../image from the executable)
  *   --save   save data folders (default: ../save from the executable, i.e. build/save)
  *   --dump-after N   after N seconds, print every guest thread's state and backtrace, then exit */
 #include "ipc.h"
 #include "vk.h"
 #include "audio_dsp.h"
+#include "game_config.h"
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
@@ -64,7 +65,7 @@ static Npdm read_npdm(void) {
 }
 
 int main(int argc, char **argv) {
-    exe_relative(game_dir, sizeof game_dir, "..\\..\\dump_v21");
+    exe_relative(game_dir, sizeof game_dir, NX_GAME_DIR);
     exe_relative(image_dir, sizeof image_dir, "..\\image");
     exe_relative(save_dir, sizeof save_dir, "..\\save");
     for (int i = 1; i < argc; i++) {
@@ -73,7 +74,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--save") && i + 1 < argc) snprintf(save_dir, sizeof save_dir, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_level = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-after") && i + 1 < argc) dump_after = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: mk8recomp [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
+        else { fprintf(stderr, "usage: " NX_NAME " [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
     mem_init();

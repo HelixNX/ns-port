@@ -653,7 +653,7 @@ static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
             }
             astc_decode(blocks, lv->w, lv->h, L->bw, L->bh, srgb, dst + layer * lsize, w, h);
             static int dumped;
-            if (l == 0 && layer == 0 && getenv("MK8_DUMP_ASTC") && dumped < 40) {
+            if (l == 0 && layer == 0 && getenv("NX_DUMP_ASTC") && dumped < 40) {
                 char path[MAX_PATH], exe[MAX_PATH];
                 GetModuleFileNameA(NULL, exe, sizeof exe);
                 char *slash = strrchr(exe, '\\');
@@ -784,11 +784,11 @@ static void end_rendering(void) {
     barrier();
 }
 
-/* MK8_WATCH=<hex address>: log every GPU write to that texture storage */
+/* NX_WATCH=<hex address>: log every GPU write to that texture storage */
 static u64 watch_addr = ~0ull;
 static void watch(const char *what, const TexRef *r) {
     if (watch_addr == ~0ull) {
-        const char *e = getenv("MK8_WATCH");
+        const char *e = getenv("NX_WATCH");
         watch_addr = e ? strtoull(e, NULL, 16) : 0;
     }
     if (!watch_addr || r->t.addr != watch_addr) return;
@@ -1533,7 +1533,7 @@ static VkPrimitiveTopology topology(u32 mode) {
     }
 }
 
-/* MK8_TRACE=n or n-m: the frames whose draws and dispatches are logged (MK8_TRACE_FILTER: only draws whose
+/* NX_TRACE=n or n-m: the frames whose draws and dispatches are logged (NX_TRACE_FILTER: only draws whose
  * trace contains that text, e.g. a texture's "128x128x1 f56") */
 static volatile LONG capture_request;      /* F12 (vk.c): dump and trace the next whole frame */
 static u64 capture_frame;
@@ -1543,7 +1543,7 @@ static bool trace_frame(void) {
     if (capture_frame && frame_no + 1 == capture_frame) return true;
     static long lo = -2, hi = -1;
     if (lo == -2) {
-        const char *e = getenv("MK8_TRACE");
+        const char *e = getenv("NX_TRACE");
         lo = e ? atol(e) : -1;
         hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : lo;
     }
@@ -1748,11 +1748,11 @@ static void draw(u32 op, const void *payload) {
     VkShaderModule vs = shader_module(pr->stage[ST_VERTEX]);
     VkShaderModule fs = pr->stage[ST_FRAGMENT] ? shader_module(pr->stage[ST_FRAGMENT]) : NULL;
     if (!vs || (pr->stage[ST_FRAGMENT] && !fs)) { skip_draw("shader not translated"); return; }
-    /* MK8_GPU_SKIP: bisecting GPU faults (1 all draws, 2 global memory, 4 textures) */
+    /* NX_GPU_SKIP: bisecting GPU faults (1 all draws, 2 global memory, 4 textures) */
     static int skip = -1;
-    if (skip < 0) skip = getenv("MK8_GPU_SKIP") ? atoi(getenv("MK8_GPU_SKIP")) : 0;
+    if (skip < 0) skip = getenv("NX_GPU_SKIP") ? atoi(getenv("NX_GPU_SKIP")) : 0;
     u32 caps = pr->stage[ST_VERTEX]->caps | (pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->caps : 0);
-    if (skip & 1 || (skip & 2 && caps & SHC_GLOBAL) || (skip & 4 && caps & SHC_TEXTURE)) { skip_draw("MK8_GPU_SKIP"); return; }
+    if (skip & 1 || (skip & 2 && caps & SHC_GLOBAL) || (skip & 4 && caps & SHC_TEXTURE)) { skip_draw("NX_GPU_SKIP"); return; }
     DescSet *ts = descset_get(&st.texpool, false), *ss = descset_get(&st.smppool, true);
     descset_sync(ts);
     descset_sync(ss);
@@ -1798,8 +1798,8 @@ static void draw(u32 op, const void *payload) {
         for (u32 i = 0; i < 6; i++)
             o += snprintf(b + o, sizeof b - o, " u%u:%llx+%llx", i, st.ubo[ST_VERTEX][i].addr, st.ubo[ST_VERTEX][i].size);
         TP("  %s\n", b);
-        /* MK8_TRACE_UBO=<16-byte row>[,row...]: those rows of the vertex stage's uniform buffer 0 */
-        const char *rows = getenv("MK8_TRACE_UBO");
+        /* NX_TRACE_UBO=<16-byte row>[,row...]: those rows of the vertex stage's uniform buffer 0 */
+        const char *rows = getenv("NX_TRACE_UBO");
         u8 *u0 = rows && st.ubo[ST_VERTEX][0].addr ? gpu_cpu(st.ubo[ST_VERTEX][0].addr, st.ubo[ST_VERTEX][0].size) : NULL;
         for (const char *q = rows; u0 && q && *q;) {
             u32 row = (u32)strtoul(q, (char **)&q, 10);
@@ -1830,8 +1830,8 @@ static void draw(u32 op, const void *payload) {
                           st.depth.t.depth, st.depth.v.format, st.depth.v.base_level, st.depth.v.min_layer,
                           st.depth.v.num_layers, st.depth.t.addr);
         if (o) TP("   rts%s\n", b);
-        /* MK8_TRACE_FUBO=<bank>:<row>[,row...]: those 16-byte rows of the fragment stage's uniform buffer c[3 + bank] */
-        const char *fub = getenv("MK8_TRACE_FUBO");
+        /* NX_TRACE_FUBO=<bank>:<row>[,row...]: those 16-byte rows of the fragment stage's uniform buffer c[3 + bank] */
+        const char *fub = getenv("NX_TRACE_FUBO");
         if (fub && strchr(fub, ':')) {
             u32 bank = (u32)strtoul(fub, NULL, 10);
             const BufferRange *ub = bank < 15 ? &st.ubo[ST_FRAGMENT][bank] : NULL;
@@ -1848,7 +1848,7 @@ static void draw(u32 op, const void *payload) {
         }
 #undef TP
         static const char *filter;
-        if (!filter) filter = getenv("MK8_TRACE_FILTER") ? getenv("MK8_TRACE_FILTER") : "";
+        if (!filter) filter = getenv("NX_TRACE_FILTER") ? getenv("NX_TRACE_FILTER") : "";
         if (tn > 0 && tn < (int)sizeof tb && tb[tn - 1] == '\n') tb[--tn] = 0;
         if (!filter[0] || strstr(tb, filter)) hlog(0, "%s", tb);
     }
@@ -2293,7 +2293,7 @@ void gpu_texture_read(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, 
 }
 
 /* ---------------------------------------------------------------------------------------------- present */
-/* MK8_DUMP=n[,m...]: at those frames, write the presented window texture (frame_<n>.ppm) and every render target
+/* NX_DUMP=n[,m...]: at those frames, write the presented window texture (frame_<n>.ppm) and every render target
  * the frame drew into (frame_<n>_<w>x<h>_<format>_<address>.ppm) to build/frames */
 
 static float half_to_float(u16 h) {
@@ -2393,9 +2393,9 @@ static void dump_frame(Image *win, u64 frame) {
     static int init;
     if (!init) {
         init = 1;
-        const char *e = getenv("MK8_DUMP");
+        const char *e = getenv("NX_DUMP");
         if (e) snprintf(list, sizeof list, ",%s,", e);
-        if ((e = getenv("MK8_DUMP_TEX")) != NULL) dump_tex = strtoull(e, NULL, 16);   /* and every image at this address */
+        if ((e = getenv("NX_DUMP_TEX")) != NULL) dump_tex = strtoull(e, NULL, 16);   /* and every image at this address */
     }
     char key[32], name[128];
     snprintf(key, sizeof key, ",%llu,", frame);

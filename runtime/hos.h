@@ -25,10 +25,10 @@
 #define MAINSTACK_MAX   0x0010000000ull
 #define RES_BASE        ALIAS_BASE
 #define RES_END         (MAINSTACK_BASE + MAINSTACK_MAX)
-#define MODULES_BASE    0x7100000000ull     /* modules at a64lift.BASES */
-#define MODULES_END     0x7103000000ull
-#define MISC_BASE       0x7103000000ull     /* one page of loader data (rtld's lists) */
-#define HOSTCALL_BASE   0x7104000000ull     /* guest addresses of host functions (never mapped) */
+#define MODULES_BASE    0x7100000000ull     /* modules at a64lift.BASES (game.json) */
+#define MODULES_END     0x7180000000ull
+#define MISC_BASE       0x7180000000ull     /* one page of loader data (rtld's lists) */
+#define HOSTCALL_BASE   0x7181000000ull     /* guest addresses of host functions (never mapped) */
 #define HOSTCALL_MAX    4096
 
 #define TOTAL_MEMORY    0xcd500000ull       /* the application pool reported to the game */
@@ -192,7 +192,8 @@ typedef struct LoadedMod {
 } LoadedMod;
 typedef struct ImgSym { u64 addr; u32 name, size; } ImgSym;
 
-extern LoadedMod loaded_mods[3];
+#define MAX_MODS 16
+extern LoadedMod loaded_mods[MAX_MODS];
 extern int num_loaded_mods;
 void loader_load(const char *image_dir);
 u64 sym_lookup(const char *name);                   /* first definition in load order, or 0 */

@@ -31,7 +31,7 @@ static u32 rnd(u32 n) {                                  /* 0..n-1 (xorshift; go
 }
 
 /* a plain face, then gender-specific hair; `random` varies the parts. Default Miis (random false) have fixed
- * create ids, so the same default is the same Mii every time. */
+ * create ids, so the same default is the same Mii every time (the text stays "mk8recomp": MK8 saves hold these ids). */
 static void make_mii(u8 *ci, u32 gender, bool random, u32 index) {
     memset(ci, 0, CI_SIZE);
     if (random) BCryptGenRandom(NULL, ci, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
