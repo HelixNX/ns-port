@@ -1,0 +1,67 @@
+# ns-port
+
+Workspace for static recompilations of the user's own Nintendo Switch games to native Windows x64 programs. Each
+game is a project folder with its own `CLAUDE.md`; shared tools, keys, firmware, libraries and references sit at the
+root.
+
+| Project | What |
+|---|---|
+| `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (AArch64 lifter, SDK over emulated kernel/services, NVN on Vulkan). See `mk8dx/CLAUDE.md` |
+| `pokemon-violet/` | Pokémon Violet 4.0.0 + DLC (V4 graphics in progress: first-boot screens and the opening cutscene render). See `pokemon-violet/CLAUDE.md` |
+
+Current focus (the user's call, 2026-10-18): **Pokémon Violet only**. Changes to the shared `nxrecomp/` need no MK8
+regression checks (no MK8 builds, boots or shader diffs); the user checks MK8 themselves.
+
+Rules: nothing derived from a game (dumps, keys, lifted C, IDA databases) goes anywhere shareable; it stays in the
+project's game-data folders (`rom/`, `dump*/`, `extract*/`, `build/`) or in `keys/` and `firmware/`. Big outputs go
+on E:, because C: is nearly full. Ask before downloading anything new. References (`ref/`, `deps/suyu`) are for
+behaviour only: our own implementation, never copied code.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `/` | workspace repo `s1099/ns-port` (private): README, CLAUDE.md files, placeholder folders; nxrecomp, mk8recomp and violetrecomp are submodules (each private on GitHub, branch `main`). Its `.gitignore` is a whitelist: game data, keys, firmware, deps and tools stay out |
+| `<project>/` | one game: `rom/` (the user's NSPs), extracted/dumped data, `build/`, and the source repo |
+| `nxrecomp/` | shared source, a git repo (split from MK8's on 2026-10-17, history kept): `runtime/` (kernel, SVCs, IPC and services, NVN on Vulkan, audio, input), `tools/` (lifter, image builder, shader translator, IDA export), `nxrecomp.cmake` (`nx_game`). A game's repo holds `game.json` (name, title, title id, modules with fixed bases, dump/analysis/build paths; see `tools/gamecfg.py`), an optional `overrides.txt` and a `CMakeLists.txt` calling `nx_game`; run the tools from inside the game's repo |
+| `keys/` | `prod.keys`, `title.keys`; `.switch/` holds copies for nstool (see Tool notes) |
+| `firmware/` | `Firmware_22.5.0.zip` and its contents in `22.5.0/` (NCAs; `keys/prod.keys` covers it). MiiModel is `99d7c22f….nca`; find others with `nstool <nca>` (ProgID) and extract with `nstool -x / <dir> <nca>` |
+| `deps/` | `SDL3/SDL3-3.4.18` (VC), `Vulkan-Headers` (v1.4.341), `glslang` (16.6.0 release), `suyu` (sparse Eden checkout, `src/core/hle/service/mii` only; widen it with `git -C deps/suyu sparse-checkout add <dir>` for service or shader references) |
+| `ref/` | `ssbu-recomp` (reference only) |
+| `.tools/` | `nstool.exe`, `ida-mcp` (headless IDA for REA) |
+| `.claude/`, `.mcp.json` | Claude Code settings, REA MCP config |
+
+## Toolchain (shared)
+
+- Compiler: **clang-cl 19** (MSYS2 `C:\msys64\mingw64\bin\clang-cl.exe`) in MSVC mode, with MSVC `link.exe`.
+  No LLVM 9 and no mingw ABI. Run inside `E:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat`.
+- Flags: `-O1 -ffp-contract=off -fno-strict-aliasing`. If one file compiles too slowly, build it at -O0 or split it.
+- Build: Python generates the C sources; CMake + Ninja build them. Projects reach shared libraries as `../deps`.
+- Verified: a clang-cl test linked SDL3 and glslang statically and ran. A 2.6 M-instruction lift compiled with
+  clang 19 in 5.4 min on 12 cores.
+- GPU: GTX 1650 Ti; Vulkan loader 1.4.341. Machine: 16 GB RAM, 12 cores.
+
+## Tool notes
+
+- nstool reads `title.keys` only from `%USERPROFILE%\.switch`; private copies are in `keys/.switch`. Run it from
+  PowerShell (Git Bash rewrites `/0`): `$env:USERPROFILE='E:\projects\ns-port\keys'; E:\projects\ns-port\.tools\nstool.exe …`
+  - An update's ExeFS sits at the end of its NCA. To peek at a new update without copying it all, write a sparse
+    file with only the header (first 0x4000) and that range.
+- Python: unicorn 2.1.4 and capstone 5.0.7 are in user site-packages, so don't run them with `python -I`.
+- The shell here sets NoDefaultCurrentDirectoryInExePath, so run a program in the current folder as `.\x.exe`.
+- A shell whose current directory is inside a folder keeps Windows from moving or deleting that folder.
+
+## REA / IDA cleanup
+
+REA uses headless IDA (`.claude/ida-mcp.json` → `.tools/ida-mcp`). `close_binary` always returns
+`cleanup_incomplete`, leaving worker processes and a temp workspace. After REA analysis (after `close_binary`, even if
+it errors), and never while a binary is still open:
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'ida-mcp' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false -ErrorAction SilentlyContinue }
+Get-ChildItem "$env:LOCALAPPDATA\Temp" -Directory -Filter 'rea-ida-*' |
+  Remove-Item -Recurse -Force -Confirm:$false
+```
+
+Match on the command line (other Python processes are unrelated), then verify nothing remains.

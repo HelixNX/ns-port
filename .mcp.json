@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "rea": {
+      "type": "stdio",
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/c",
+        "npx",
+        "-y",
+        "rea-agents@6.5.0",
+        "mcp"
+      ],
+      "env": {
+        "REA_ANALYSIS_PROVIDER": "ida",
+        "REA_IDA_MCP_CONFIG": "E:\\projects\\ns-port\\.claude\\ida-mcp.json"
+      }
+    }
+  }
+}
