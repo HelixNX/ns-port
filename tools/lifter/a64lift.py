@@ -30,7 +30,7 @@ sys.path.insert(0, HERE)
 
 import gamecfg                                  # noqa: E402
 from nxmod import Module                       # noqa: E402
-from a64insn import Unimpl, lift_insn, branch_targets, sext   # noqa: E402
+from a64insn import Unimpl, lift_insn, branch_targets, sext, decode_bitmask   # noqa: E402
 
 # load order = symbol lookup order (as rtld does it: main, then the subsdks, then sdk)
 MODULES = gamecfg.MODULES
@@ -142,24 +142,69 @@ class Mod:
         bounds check of its own): clang's
             adrp xT, tab; add xT, xT, #lo; adr xB, base; ldr{b,h,sh,sw,w} wE, [xT, xI{, lsl #k}];
             add xD, xB, xE{, lsl #s | sxtw #s}; br xD
-        Entries are read while the target stays inside the function; reading a few too many (into the next table)
-        only adds labels, and a target outside the cases still takes the dynamic path."""
-        found = 0
-        for f, offs in self.funcs.items():
-            inside = set(offs)
-            for i, a in enumerate(offs):
-                w = self.word(a)
-                if w & 0xfffffc1f != 0xd61f0000 or a in self.switches:
-                    continue
-                cases = self.jump_table(offs[max(0, i - 16):i], (w >> 5) & 31, inside)
-                if cases:
+        Definitions are tracked over the 512 words before the BR in address order, whoever owns them (the table
+        address is often loaded once before a loop, sometimes in a part IDA split off), any other write forgetting
+        them. Entries are read while the target is
+        in the function, in no function at all, or nearby in another function (an entry there); reading a few too many (into the next table) only adds labels, and
+        a target outside the cases still takes the dynamic path. Case code in no function (IDA never reached it) is
+        added to the function, which can bring more tables: repeated until nothing changes."""
+        found = grown = 0
+        todo = set(self.funcs)
+        while todo:
+            changed = set()
+            for f in sorted(todo):
+                offs = self.funcs[f]
+                inside = set(offs)
+                for i, a in enumerate(offs):
+                    w = self.word(a)
+                    if w & 0xfffffc1f != 0xd61f0000 or a in self.switches:
+                        continue
+                    cases = (self.jump_table(range(max(self.text[0], a - 0x800), a, 4), (w >> 5) & 31, inside) or
+                             self.jump_table(range(max(self.text[0], a - 0x4000), a, 4), (w >> 5) & 31, inside))
+                    if not cases:
+                        continue
                     self.switches[a] = cases
                     found += 1
+                    new = self.flow({t for t in cases if t not in inside and t not in self.owner})
+                    if new:
+                        inside |= new
+                        for t in new:
+                            self.owner.setdefault(t, f)
+                        grown += len(new)
+                        changed.add(f)
+                if f in changed:
+                    self.funcs[f] = sorted(inside)
+            todo = changed
         if found:
-            print('%s: %d jump tables found beyond IDA\'s' % (self.name, found))
+            print('%s: %d jump tables found beyond IDA\'s (%d instructions of case code added)' % (self.name, found, grown))
+
+    def flow(self, starts):
+        """Instructions reachable from starts without entering any function's code (as recover_from walks)."""
+        t0, t1 = self.text
+        addrs, work = set(), list(starts)
+        while work:
+            a = work.pop()
+            if a in addrs or not (t0 <= a < t1) or a in self.owner:
+                continue
+            w = self.word(a)
+            addrs.add(a)
+            if w == 0 or w & 0xffe0001f == 0xd4200000:
+                continue
+            work.extend(t - self.base for t in branch_targets(w, self.base + a) if w & 0xfc000000 != 0x94000000)
+            if w & 0xfffffc1f in (0xd65f0000, 0xd61f0000) or w & 0xfc000000 == 0x14000000:
+                continue
+            work.append(a + 4)
+        return addrs
 
     def jump_table(self, before, reg, inside):
+        """The cases of `br reg` after the instructions `before` (module offsets, in order), or None. The number of
+        entries comes from the index's bound when one is seen (AND with a low mask, UBFX / UXTB / UXTH; a CMP #n
+        shortly before the BR, guarding B.HI); without one, up to 256 entries are read while their targets stay
+        within 16 KB."""
         defs = {}                                   # register -> (kind, ...), from the instructions before the BR
+        bounds = {}                                 # register -> entries its value can index (AND mask)
+        last_cmp = None                             # (offset, n + 1) of the last CMP #n
+        before = list(before)
         for a in before:
             w = self.word(a)
             rd = w & 31
@@ -180,26 +225,47 @@ class Mod:
                     defs[rd] = None
                     continue
                 tab = defs.get((w >> 5) & 31)
-                defs[rd] = ('entry', tab[1], 1 << size, signed) if tab and tab[0] == 'addr' else None
+                idx = (w >> 16) & 31
+                defs[rd] = ('entry', tab[1], 1 << size, signed, bounds.get(idx)) if tab and tab[0] == 'addr' else None
             elif w & 0xff200000 == 0x8b000000 and (w >> 22) & 3 == 0:          # ADD (shifted register), LSL
                 defs[rd] = self._table_sum(defs, (w >> 5) & 31, (w >> 16) & 31, (w >> 10) & 63)
             elif w & 0xffe00000 == 0x8b200000 and (w >> 13) & 7 in (2, 6):    # ADD (extended register), UXTW/SXTW
                 defs[rd] = self._table_sum(defs, (w >> 5) & 31, (w >> 16) & 31, (w >> 10) & 7)
-            elif rd in defs:
-                defs[rd] = None                     # anything else that may write rd
+            else:                                   # anything else: forget what it writes
+                if w & 0x7f80001f == 0x7100001f:                                # CMP (immediate)
+                    last_cmp = (a, (((w >> 10) & 0xfff) << (12 if w & (1 << 22) else 0)) + 1)
+                for r in self._writes(w):
+                    defs[r] = None
+                    bounds.pop(r, None)
+                if w & 0x7f800000 == 0x12000000:                                # AND (immediate)
+                    try:
+                        m = decode_bitmask((w >> 22) & 1, (w >> 10) & 63, (w >> 16) & 63, w >> 31)
+                    except Unimpl:
+                        m = 0
+                    if m and m & (m + 1) == 0 and m < 0x10000:
+                        bounds[rd] = m + 1
+                elif w & 0x7f800000 == 0x53000000:                              # UBFM: UBFX, UXTB, UXTH, LSR
+                    immr, imms = (w >> 16) & 63, (w >> 10) & 63
+                    if imms >= immr and imms - immr < 16:
+                        bounds[rd] = 1 << (imms - immr + 1)
         d = defs.get(reg)
         if not d or d[0] != 'table':
             return None
-        _, base, tab, esize, signed, shift = d
+        _, base, tab, esize, signed, shift, bound = d
+        if last_cmp and before and before[-1] - last_cmp[0] <= 0x30 and last_cmp[1] <= 0x10000:
+            bound = min(bound, last_cmp[1]) if bound else last_cmp[1]
         cases = []
         t0, t1 = self.text
-        for k in range(1024):
+        for k in range(bound if bound else 256):
             ea = tab + k * esize
             if not (self.m.ro[0] <= ea < self.m.ro[1] or t0 <= ea < t1):
-                break
+                return cases or None
             e = int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed)
             t = base + (e << shift)
-            if t not in inside:
+            if bound:                               # a known size: every entry must be code nearby
+                if t & 3 or not (t0 <= t < t1) or abs(t - base) >= 0x10000 or not self.word(t):
+                    return None
+            elif t & 3 or not (t in inside or (t0 <= t < t1 and abs(t - base) < 0x4000 and self.word(t))):
                 break
             cases.append(t)
         return cases or None
@@ -208,8 +274,28 @@ class Mod:
     def _table_sum(defs, rn, rm, shift):
         b, e = defs.get(rn), defs.get(rm)
         if b and e and b[0] == 'addr' and e[0] == 'entry':
-            return ('table', b[1], e[1], e[2], e[3], shift)
+            return ('table', b[1], e[1], e[2], e[3], shift, e[4])
         return None
+
+    @staticmethod
+    def _writes(w):
+        """General registers an instruction may write (a superset is fine: it only makes the slice give up)."""
+        op0 = (w >> 25) & 15
+        if op0 & 0b1110 == 0b1000 or op0 & 0b0111 == 0b0101:               # data processing: Rd
+            return (w & 31,)
+        if op0 & 0b0101 == 0b0100:                                          # loads and stores
+            if w & 0x04000000:                                              # SIMD&FP registers: only writeback
+                return ((w >> 5) & 31,) if w & 0x01000000 == 0 else ()
+            out = [(w >> 5) & 31]                                           # writeback (pre / post index)
+            if w & 0x00400000 or w & 0x3f000000 in (0x18000000, 0x98000000):  # loads (and LDR literal)
+                out += [w & 31, (w >> 10) & 31]                             # Rt, Rt2 of a pair
+            return tuple(out)
+        if w & 0xfc000000 == 0x94000000 or w & 0xfffffc1f == 0xd63f0000:  # BL, BLR: the caller-saved registers
+            return tuple(range(19)) + (30,)
+        if w & 0xfff00000 == 0xd5300000:                                    # MRS
+            return (w & 31,)
+        return ()
+
 
     def plt_slot(self, ea):
         """GOT slot of `adrp x16, p; ldr x17, [x16, #o]; add x16, x16, #o; br x17`, or None."""
@@ -435,6 +521,13 @@ def secondary_entries(mod):
             o = mod.owner.get(nxt)
             if o is not None and o != off:
                 sec[o].add(nxt)
+    # jump table cases in another function (IDA made the cases a function of their own): entered by jump_ind
+    for br, cases in mod.switches.items():
+        o = mod.owner.get(br)
+        for t in cases:
+            ot = mod.owner.get(t)
+            if ot is not None and ot != o and t not in mod.funcs:
+                sec[ot].add(t)
     # code whose address is taken (relocation targets, exports, init_array, ADR / ADRP+ADD) and that IDA put
     # inside another function: it is entered through call_ind, so it needs an entry too
     for t in set(mod.m.code_seeds()) | mod.addr_refs:

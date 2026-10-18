@@ -18,7 +18,7 @@ set(NX_RUNTIME_SOURCES
     main.c loader.c dispatch.c mem.c kernel.c kmem.c svc.c ipc.c
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
-    services/nifm.c services/friends.c services/ldn.c services/fs.c romfs.c
+    services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/fs.c romfs.c
     nvn.c gpu.c tex.c vk.c astc.c input.c movie.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 

@@ -54,7 +54,7 @@ static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
     case 16: *out = system_resource_size; return R_OK;                 /* system resource (page tables): main.npdm */
     case 17: *out = system_resource_size / 4; return R_OK;
     case 18: *out = NX_TITLE_ID; return R_OK;
-    case 20: *out = 0; return R_OK;                                    /* user exception context */
+    case 20: *out = user_exception_context(); return R_OK;
     case 21: *out = TOTAL_MEMORY; return R_OK;
     case 22: *out = mem_used(); return R_OK;
     case 0xf0000002: *out = 0; return R_OK;                            /* thread tick count */
@@ -236,8 +236,9 @@ void svc_dispatch(Ctx *c, u32 n) {
     }
     }
 done:
-    /* routine failures: timeouts, GetInfo probes, resetting an event that isn't signalled */
-    if (r && log_level >= 1 && n != 0x18 && n != 0x34 && n != 0x1c && !(n == 0x29) && !(n == 0x17 && r == 0xfa01))
+    /* routine failures: timeouts, GetInfo probes, resetting an event that isn't signalled, signalling an address
+     * whose value has changed */
+    if (r && log_level >= 1 && n != 0x18 && n != 0x34 && n != 0x1c && !(n == 0x29) && !((n == 0x17 || n == 0x35) && r == 0xfa01))
         hlog(1, "svc %s -> %x", svc_name(n), r);
     x[0] = r;
     kernel_svc_exit();

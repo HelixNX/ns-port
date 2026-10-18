@@ -751,15 +751,16 @@ static ShaderCode *shader_intern(u64 data, u64 control) {
     return s;
 }
 
-/* nvnProgramSetShaders(program, int count, const NVNshaderData *): {NVNbufferAddress code; const void *control} */
-static void program_set_shaders(Ctx *c) {
+/* nvnProgramSetShaders(program, int count, const NVNshaderData *): {NVNbufferAddress code; const void *control};
+ * nvnProgramSetShadersExt (newer SDKs): the same with a third pointer per stage (0x18 bytes; not used here) */
+static void set_shaders(Ctx *c, u32 stride) {
     Program *p = obj_get(A(0), T_PROGRAM);
     if (!p) { RET(0); return; }
     Shaders set;
     memset(&set, 0, sizeof set);
     u32 n = (u32)A(1);
     for (u32 i = 0; i < n; i++) {
-        u64 data = LD64(A(2) + 16 * i), ctl = LD64(A(2) + 16 * i + 8);
+        u64 data = LD64(A(2) + stride * i), ctl = LD64(A(2) + stride * i + 8);
         if (!data || !ctl || LD32(ctl) != 0x98761234u) {
             hlog(0, "nvn: SetShaders: stage %u has no GLSLC control section", i);
             continue;
@@ -783,6 +784,8 @@ static void program_set_shaders(Ctx *c) {
     p->shaders = found;
     RET(1);
 }
+static void program_set_shaders(Ctx *c) { set_shaders(c, 16); }
+static void program_set_shaders_ext(Ctx *c) { set_shaders(c, 24); }
 static void program_initialize(Ctx *c) { obj_new(A(0), T_PROGRAM, sizeof(Program)); RET(1); }
 static void program_finalize(Ctx *c) { obj_free(A(0)); }
 
@@ -1906,6 +1909,7 @@ static const NvnProc procs[] = {
     {"nvnProgramFinalize", program_finalize},
     {"nvnProgramSetDebugLabel", nothing},
     {"nvnProgramSetShaders", program_set_shaders},
+    {"nvnProgramSetShadersExt", program_set_shaders_ext},
     {"nvnProgramSetSubroutineLinkage", return_true},
 
     {"nvnWindowBuilderSetDefaults", wb_defaults},

@@ -177,6 +177,9 @@ void services_init(const char *game_dir, const char *save_dir) {
     nifm_register();
     friends_register();
     ldn_register();
+    bcat_register();
+    system_register();
+    audout_register();
     fs_register(game_dir, save_dir);
 }
 

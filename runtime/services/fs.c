@@ -2,6 +2,7 @@
  * Save data lives in <save dir>/<type>-<user id>/; it is created when first opened, as if the game's
  * EnsureSaveData had made it. */
 #include "../ipc.h"
+#include "game_config.h"
 #include <stdlib.h>
 #include <windows.h>
 
@@ -265,6 +266,12 @@ static void fsp_open_save(SvcObj *o, IpcReq *r) {
     u8 space = in_u8(r, 0);
     u64 program = in_u64(r, 8), user_lo = in_u64(r, 16), user_hi = in_u64(r, 24), sys_id = in_u64(r, 32);
     u8 type = in_u8(r, 40);
+    /* another title's save (games look for their predecessors' saves for bonuses): none on this console */
+    if (program && program != NX_TITLE_ID) {
+        hlog(1, "fs: OpenSaveDataFileSystem(space %u, program %llx, type %u): not ours, not found", space, program, type);
+        r->result = R_FS_TARGET_NOT_FOUND;
+        return;
+    }
     HostFs *fs = calloc(1, sizeof *fs);
     wchar_t wroot[1024];
     MultiByteToWideChar(CP_UTF8, 0, save_root, -1, wroot, 1024);
@@ -347,6 +354,7 @@ static const Iface iface_fsp = {"fsp-srv", (const IpcCmd[]){
     {18, fsp_open_sd, "OpenSdCardFileSystem"},
     {22, ipc_noop, "CreateSaveDataFileSystem"},
     {51, fsp_open_save, "OpenSaveDataFileSystem"},
+    {53, fsp_open_save, "OpenReadOnlySaveDataFileSystem"},
     {200, fsp_open_romfs, "OpenDataStorageByCurrentProcess"},
     {202, fsp_open_data_by_id, "OpenDataStorageByDataId"},
     {203, fsp_open_patch, "OpenPatchDataStorageByCurrentProcess"},

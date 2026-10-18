@@ -535,6 +535,19 @@ static void thread_destroy(KObj *o) {
 
 static u64 tls_next = TLS_BASE;
 
+/* svcGetInfo(UserExceptionContextAddress): a page of the process's thread-local region (the last page of ours,
+ * which thread slots never reach), where newer SDKs keep e.g. the dying-message region */
+u64 user_exception_context(void) {
+    static u64 page;
+    klock();
+    if (!page) {
+        page = TLS_BASE + TLS_SIZE - 0x1000;
+        mem_map(page, 0x1000, MS_TLS, MP_RW);
+    }
+    kunlock();
+    return page;
+}
+
 KThread *thread_create(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 core) {
     KThread *t = calloc(1, sizeof *t);
     kobj_init(&t->obj, KO_THREAD, thread_destroy, thread_signaled);

@@ -76,6 +76,8 @@ static const Iface iface_csg = {"ICommonStateGetter", (const IpcCmd[]){
 /* ---------------------------------------------------------------------------------------------- ISelfController */
 static void sc_launchable_event(SvcObj *o, IpcReq *r) { out_event(r, launchable_event); }
 static void sc_create_layer(SvcObj *o, IpcReq *r) { out_u64(r, 1); }
+/* the display layer, and the layer for screenshots / recording (newer SDKs) */
+static void sc_create_separable_layer(SvcObj *o, IpcReq *r) { out_u64(r, 1); out_u64(r, 2); }
 static void sc_u32_zero(SvcObj *o, IpcReq *r) { out_u32(r, 0); }
 static void sc_u64_zero(SvcObj *o, IpcReq *r) { out_u64(r, 0); }
 static void sc_false(SvcObj *o, IpcReq *r) { out_u8(r, 0); }
@@ -97,6 +99,7 @@ static const Iface iface_sc = {"ISelfController", (const IpcCmd[]){
     {16, ipc_noop, "SetOutOfFocusSuspendingEnabled"},
     {19, ipc_noop, "SetAlbumImageOrientation"},
     {40, sc_create_layer, "CreateManagedDisplayLayer"},
+    {44, sc_create_separable_layer, "CreateManagedDisplaySeparableLayer"},
     {50, ipc_noop, "SetHandlesRequestToDisplay"},
     {51, ipc_noop, "ApproveToDisplay"},
     {60, ipc_noop, "OverrideAutoSleepTimeAndDimmingTime"},

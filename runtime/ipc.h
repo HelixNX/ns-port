@@ -107,6 +107,9 @@ void set_register(void);
 void nifm_register(void);
 void friends_register(void);
 void ldn_register(void);
+void bcat_register(void);
+void system_register(void);
+void audout_register(void);
 void fs_register(const char *game_dir, const char *save_dir);
 
 #endif
