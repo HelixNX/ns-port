@@ -800,6 +800,33 @@ class Translator:
         e = mn if p == 'true' else mx if p == 'false' else '(%s ? %s : %s)' % (p, mn, mx)
         self.set_r(bits(w, 0, 8), 'uint(%s)' % e if bits(w, 48, 1) else e)
 
+    def op_LEA(self, w, form, pc):
+        """LO: Rd = B + (Ra << scale); HI: Rd = B + the high word of (Rc:Ra << scale) (the upper half of a 64-bit
+        scaled index). Negation as given; no carry chains (X, CC, the carry predicate)"""
+        part, _, f = form.partition('_')
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        if bits(w, 47, 1) or bits(w, 48, 3) != PT:
+            raise Unsupported('LEA.CC/carry predicate')
+        if part == 'LO':
+            scale, neg, x = bits(w, 39, 5), bits(w, 45, 1), bits(w, 46, 1)
+            b = self.op_b_u(w, f)
+            if x:
+                raise Unsupported('LEA.LO.X')
+            off = '(0u - %s)' % a if neg else a
+            self.set_r(d, '%s + (%s << %du)' % (b, off, scale))
+            return
+        if f == 'R':
+            scale, neg, x, b = bits(w, 28, 5), bits(w, 37, 1), bits(w, 38, 1), self.R(bits(w, 20, 8))
+        else:
+            scale, neg, x, b = bits(w, 51, 5), bits(w, 56, 1), bits(w, 57, 1), self.op_b_u(w, 'C')
+        if x:
+            raise Unsupported('LEA.HI.X')
+        self.uses.add('global')     # 64-bit integer types
+        v = 'packUint2x32(uvec2(%s, %s))' % (a, self.R(bits(w, 39, 8)))
+        if neg:
+            v = '(0ul - %s)' % v
+        self.set_r(d, '%s + uint(%s >> %du)' % (b, v, 32 - scale))
+
     def op_BFI(self, w, form, pc):
         """Rd = Rc (base) with Ra inserted at the offset / count packed in operand B"""
         if bits(w, 47, 1):
@@ -1117,6 +1144,27 @@ class Translator:
         self.indent -= 1
         self.emit('}')
 
+    def op_ATOM(self, w, form, pc):
+        """global atomic with a result: op at 52, size at 49 (U32, S32), address Ra(.E: pair) + imm20 at 28"""
+        op, size = bits(w, 52, 4), bits(w, 49, 3)
+        f = {0: 'atomicAdd', 1: 'atomicMin', 2: 'atomicMax', 5: 'atomicAnd', 6: 'atomicOr', 7: 'atomicXor',
+             8: 'atomicExchange'}.get(op)
+        if f is None or size > 1:
+            raise Unsupported('ATOM op %d size %d' % (op, size))
+        a, off = bits(w, 8, 8), sext(bits(w, 28, 20), 20)
+        self.uses.add('global')
+        if bits(w, 48, 1):
+            base = 'packUint2x32(uvec2(%s, %s))' % (self.R(a), self.R(a + 1 if a != RZ else RZ))
+        else:
+            base = 'uint64_t(%s)' % self.R(a)
+        addr = '(%s + %d)' % (base, off) if off else base
+        b = self.R(bits(w, 20, 8))
+        if size:
+            self.uses.add('global_i')
+            self.set_r(bits(w, 0, 8), 'uint(%s(GMemI(%s).v, int(%s)))' % (f, addr, b))
+        else:
+            self.set_r(bits(w, 0, 8), '%s(GMem(%s).v, %s)' % (f, addr, b))
+
     def local_addr(self, w):
         a, off = bits(w, 8, 8), sext(bits(w, 20, 24), 24)
         self.uses.add('lmem')
@@ -1425,6 +1473,100 @@ class Translator:
         self.indent -= 1
         self.emit('}')
 
+    # --- storage images (NVN images: the handle, an image id in the texture pool, is read from c[2] at 0x120 + 8k)
+    SURF = {0: ('1D', 1), 2: ('1DARRAY', 1), 3: ('2D', 2), 4: ('2DARRAY', 2), 5: ('3D', 3)}
+
+    def surface(self, w, kind):
+        """image array element and integer coordinates; kind: 'f' formatted float, 'a' r32ui (atomics), 'ai' r32i"""
+        st = bits(w, 33, 3)
+        if st not in self.SURF:
+            raise Unsupported('surface type %d' % st)
+        dim, n = self.SURF[st]
+        if bits(w, 49, 2):
+            raise Unsupported('surface clamp %d' % bits(w, 49, 2))
+        c = bits(w, 8, 8)
+        r = lambda i: 'int(%s)' % self.R(c + i if c != RZ else RZ)
+        coords = [r(i) for i in range(n)]
+        if dim.endswith('ARRAY'):
+            coords.append('int(%s & 0xffffu)' % self.R(c + n if c != RZ else RZ))
+        coords = coords[0] if len(coords) == 1 else 'ivec%d(%s)' % (len(coords), ', '.join(coords))
+        h = self.cbuf(2, bits(w, 36, 13) * 4) if bits(w, 51, 1) else self.R(bits(w, 39, 8))
+        name = {'f': 'i', 'a': 'ua', 'ai': 'ia'}[kind] + dim.lower()
+        self.uses.add('img_' + name)
+        return '%s[nonuniformEXT(min(%s & 0xfffffu, 65535u))]' % (name, h), coords
+
+    def op_SUST(self, w, form, pc):
+        if bits(w, 52, 1):
+            raise Unsupported('SUST.D')
+        if bits(w, 20, 4) != 15:
+            raise Unsupported('SUST.P partial mask')
+        img, coords = self.surface(w, 'f')
+        d = bits(w, 0, 8)
+        v = ', '.join(self.Rf(d + i if d != RZ else RZ) for i in range(4))
+        self.emit('imageStore(%s, %s, vec4(%s));' % (img, coords, v))
+
+    def op_SULD(self, w, form, pc):
+        if bits(w, 52, 1):
+            raise Unsupported('SULD.D')
+        mask = bits(w, 20, 4)
+        img, coords = self.surface(w, 'f')
+        self.emit('{ vec4 v_ = imageLoad(%s, %s);' % (img, coords))
+        self.indent += 1
+        self.store_mask(bits(w, 0, 8), mask, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    ATOM = {0: 'imageAtomicAdd', 1: 'imageAtomicMin', 2: 'imageAtomicMax', 5: 'imageAtomicAnd', 6: 'imageAtomicOr',
+            7: 'imageAtomicXor'}
+
+    def op_SURED(self, w, form, pc):
+        """surface reduction (an atomic without a result): op at 24, size at 20 (U32, S32)"""
+        op, size = bits(w, 24, 3), bits(w, 20, 3)
+        if op not in self.ATOM or size > 1:
+            raise Unsupported('SURED op %d size %d' % (op, size))
+        img, coords = self.surface(w, 'ai' if size else 'a')
+        v = self.R(bits(w, 0, 8))
+        self.emit('%s(%s, %s, %s);' % (self.ATOM[op], img, coords, 'int(%s)' % v if size else v))
+
+    def op_VMNMX(self, w, form, pc):
+        """video min/max: the min or max of byte/half/word lanes of A and B, then MIN or MAX with C"""
+        op, sat = bits(w, 51, 3), bits(w, 55, 1)
+        if op not in (5, 6) or sat or bits(w, 47, 1):
+            raise Unsupported('VMNMX op %d sat %d' % (op, sat))
+        breg = bits(w, 50, 1)
+        sa, sb, sd = bits(w, 48, 1), bits(w, 49, 1), bits(w, 54, 1)
+
+        def lane(x, width, sel, signed):
+            if width == 3:
+                return 'int(%s)' % x if signed else x
+            n = 16 if width == 2 else 8
+            return 'bitfieldExtract(%s(%s), %d, %d)' % ('int' if signed else '', x, sel * n, n)
+        a = lane(self.R(bits(w, 8, 8)), bits(w, 37, 2), bits(w, 36, 2), sa)
+        if breg:
+            b = lane(self.R(bits(w, 20, 8)), bits(w, 29, 2), bits(w, 28, 2), sb)
+        else:
+            b = lane('%du' % bits(w, 20, 16), 2, 0, sb)
+        # the first min/max compares as B's signedness says, the second as the destination's
+        cast = (lambda x: 'int(%s)' % x) if sb else (lambda x: 'uint(%s)' % x)
+        first = '%s(%s, %s)' % ('max' if bits(w, 56, 1) else 'min', cast(a), cast(b))
+        cast = (lambda x: 'int(%s)' % x) if sd else (lambda x: 'uint(%s)' % x)
+        self.set_r(bits(w, 0, 8), 'uint(%s(%s, %s))' % ('max' if op == 6 else 'min', cast(first), cast(self.R(bits(w, 39, 8)))))
+
+    def op_VOTE(self, w, form, pc):
+        """Rd = the ballot of Ps over the active threads; Pd = ALL / ANY / EQ of it"""
+        mode = bits(w, 48, 2)
+        if mode > 2:
+            raise Unsupported('VOTE mode %d' % mode)
+        self.uses.update(('subgroup', 'ballot'))
+        self.emit('{ bool v_ = %s;' % self.P(bits(w, 39, 3), bits(w, 42, 1)))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'subgroupBallot(v_).x')
+        if bits(w, 45, 3) != PT:
+            self.uses.add('vote')
+            self.set_p(bits(w, 45, 3), {0: 'subgroupAll(v_)', 1: 'subgroupAny(v_)', 2: 'subgroupAllEqual(v_)'}[mode])
+        self.indent -= 1
+        self.emit('}')
+
     def op_KIL(self, w, form, pc):
         t = self.flow(bits(w, 0, 5))
         if t == 'true':
@@ -1471,7 +1613,7 @@ class Translator:
                 o = opcode(ins[j][1])
                 if o in ('BRA', 'BRX', 'EXIT', 'SYNC', 'BRK'):
                     return None, None
-                if bits(ins[j][1], 0, 8) == reg and o not in ('ST', 'STG', 'STL', 'STS', 'AST', 'RED', 'SUST'):
+                if bits(ins[j][1], 0, 8) == reg and o not in ('ST', 'STG', 'STL', 'STS', 'AST', 'RED', 'SUST', 'SURED'):
                     return (j, ins[j][1]) if o in ops else (None, None)
             return None, None
         j, ldc = find(ra, i, ('LDC',))
@@ -1666,7 +1808,10 @@ class Translator:
         if 'global' in self.uses:
             out += ['#extension GL_EXT_buffer_reference : require',
                     '#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require']
-        for u, ext in (('subgroup', 'basic'), ('quad', 'quad'), ('shuffle', 'shuffle'), ('ballot', 'ballot')):
+        if any(u.startswith('img_i') and not u.startswith('img_ia') for u in self.uses):
+            out.append('#extension GL_EXT_shader_image_load_formatted : require')
+        for u, ext in (('subgroup', 'basic'), ('quad', 'quad'), ('shuffle', 'shuffle'), ('ballot', 'ballot'),
+                       ('vote', 'vote')):
             if u in self.uses:
                 out.append('#extension GL_KHR_shader_subgroup_%s : require' % ext)
         if 'layer' in self.uses:
@@ -1691,8 +1836,16 @@ class Translator:
                 if 'tex_' + name in self.uses:
                     out.append('layout(set = 1, binding = 0) uniform %s %s[];' % (typ, name))
             out.append('layout(set = 2, binding = 0) uniform sampler smp[];')
+        # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)
+        idecl = {'1d': 'image1D', '1darray': 'image1DArray', '2d': 'image2D', '2darray': 'image2DArray', '3d': 'image3D'}
+        for dim, typ in idecl.items():
+            for pre, fmt, t in (('i', '', typ), ('ua', ', r32ui', 'u' + typ), ('ia', ', r32i', 'i' + typ)):
+                if 'img_' + pre + dim in self.uses:
+                    out.append('layout(set = 3, binding = 0%s) uniform %s %s%s[];' % (fmt, t, pre, dim))
         if 'global' in self.uses:
             out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMem { uint v; };')
+            if 'global_i' in self.uses:
+                out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMemI { int v; };')
         if self.stage == 'vertex':
             for k in sorted(self.in_attrs):
                 out.append('layout(location = %d) in vec4 in_a%d;' % (k, k))
