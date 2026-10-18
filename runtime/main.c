@@ -25,10 +25,6 @@ static unsigned __stdcall dump_thread(void *p) {
     fatal("stopped after %d seconds", dump_after);
 }
 
-void u_nnosGetDefaultUserExceptionStackForApplication(Ctx *c) {
-    guest_trap(c, "call to the unresolved nnosGetDefaultUserExceptionStackForApplication", c->x[30]);
-}
-
 static void h_rtld_initialized(Ctx *c) { (void)c; }
 
 /* rtld walks its module list from the front, where each module it found was inserted: sdk, subsdk0, main */

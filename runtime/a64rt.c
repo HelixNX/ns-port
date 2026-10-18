@@ -186,7 +186,8 @@ static v1u64 narrow(v128 a, int wbits, int n, int round, int sgn, int kind) {
     v1u64 vuqrshrn##w(v128 a, int n) { return narrow(a, w, n, 1, 0, 2); } \
     v1u64 vrshrn##w(v128 a, int n) { return narrow(a, w, n, 1, 0, 0); } \
     v1u64 vsqshrun##w(v128 a, int n) { return narrow(a, w, n, 0, 1, 3); } \
-    v1u64 vsqrshrun##w(v128 a, int n) { return narrow(a, w, n, 1, 1, 3); }
+    v1u64 vsqrshrun##w(v128 a, int n) { return narrow(a, w, n, 1, 1, 3); } \
+    v1u64 vsqxtun##w(v128 a) { return narrow(a, w, 0, 0, 1, 3); }
 DEF_NARROW(16) DEF_NARROW(32) DEF_NARROW(64)
 #undef DEF_NARROW
 

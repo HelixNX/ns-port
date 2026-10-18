@@ -305,7 +305,9 @@ DEF_QADD(32, 4, -2147483647 - 1, 2147483647, 0xffffffffu) DEF_QADD(64, 2, -92233
     static inline v128 vuhadd##b(v128 a, v128 c) { v##n##u##b x = (v##n##u##b)a, y = (v##n##u##b)c, r; for (int i = 0; i < n; i++) r[i] = (u##b)(((u##w)x[i] + y[i]) >> 1); return (v128)r; } \
     static inline v128 vurhadd##b(v128 a, v128 c) { v##n##u##b x = (v##n##u##b)a, y = (v##n##u##b)c, r; for (int i = 0; i < n; i++) r[i] = (u##b)(((u##w)x[i] + y[i] + 1) >> 1); return (v128)r; } \
     static inline v128 vshadd##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; for (int i = 0; i < n; i++) r[i] = (s##b)(((s##w)x[i] + y[i]) >> 1); return (v128)r; } \
-    static inline v128 vsrhadd##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; for (int i = 0; i < n; i++) r[i] = (s##b)(((s##w)x[i] + y[i] + 1) >> 1); return (v128)r; }
+    static inline v128 vsrhadd##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; for (int i = 0; i < n; i++) r[i] = (s##b)(((s##w)x[i] + y[i] + 1) >> 1); return (v128)r; } \
+    static inline v128 vuhsub##b(v128 a, v128 c) { v##n##u##b x = (v##n##u##b)a, y = (v##n##u##b)c, r; for (int i = 0; i < n; i++) r[i] = (u##b)(((s##w)x[i] - (s##w)y[i]) >> 1); return (v128)r; } \
+    static inline v128 vshsub##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; for (int i = 0; i < n; i++) r[i] = (s##b)(((s##w)x[i] - y[i]) >> 1); return (v128)r; }
 DEF_HADD(8, 16, 16) DEF_HADD(16, 8, 32) DEF_HADD(32, 4, 64)
 #undef DEF_HADD
 #define DEF_CLZ(b, n) \
@@ -325,6 +327,39 @@ static inline v128 vrbit8(v128 a) { v16u8 x = (v16u8)a, r; for (int i = 0; i < 1
         memcpy(&o, r, 8); return o; }
 DEF_QXTN(16, 8, 8) DEF_QXTN(32, 4, 16) DEF_QXTN(64, 2, 32)
 #undef DEF_QXTN
+/* SQDMULH / SQRDMULH: the high half of 2*a*b (rounded), saturated (only min * min overflows);
+ * (2p + 2^(b-1)) >> b is computed as (p + 2^(b-2)) >> (b-1) so that p stays in 64 bits */
+#define DEF_QDMULH(b, n) \
+    static inline v128 vsqdmulh##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; \
+        for (int i = 0; i < n; i++) { s64 p = ((s64)x[i] * y[i]) >> ((b) - 1); r[i] = (s##b)(p > (s##b)(((u##b)1 << ((b) - 1)) - 1) ? (s##b)(((u##b)1 << ((b) - 1)) - 1) : p); } return (v128)r; } \
+    static inline v128 vsqrdmulh##b(v128 a, v128 c) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)c, r; \
+        for (int i = 0; i < n; i++) { s64 p = ((s64)x[i] * y[i] + ((s64)1 << ((b) - 2))) >> ((b) - 1); r[i] = (s##b)(p > (s##b)(((u##b)1 << ((b) - 1)) - 1) ? (s##b)(((u##b)1 << ((b) - 1)) - 1) : p); } return (v128)r; }
+DEF_QDMULH(16, 8) DEF_QDMULH(32, 4)
+#undef DEF_QDMULH
+/* SQSHL / SQRSHL (register): shift by the signed low byte of the other lane, saturating left shifts, rounding
+ * right shifts for SQRSHL; SQABS; SRSHR / URSHR (immediate n, 1..b): rounding right shift */
+#define DEF_QSHL(b, n) \
+    static inline s##b sqshl_lane##b(s##b x, int sh, int round) { \
+        const s64 lo = -((s64)1 << ((b) - 1)), hi = ((s64)1 << ((b) - 1)) - 1; \
+        if (sh >= 0) { if (!x) return 0; if (sh >= (b)) return x < 0 ? (s##b)lo : (s##b)hi; \
+                       s64 v = (s64)x * ((s64)1 << sh); return (s##b)(v < lo ? lo : v > hi ? hi : v); } \
+        sh = -sh; if (sh >= 63) return round ? 0 : x < 0 ? -1 : 0; \
+        return (s##b)(((s64)x + (round ? (s64)1 << (sh - 1) : 0)) >> sh); } \
+    static inline v128 vsqshl##b(v128 a, v128 s) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)s, r; \
+        for (int i = 0; i < n; i++) r[i] = sqshl_lane##b(x[i], (s8)y[i], 0); return (v128)r; } \
+    static inline v128 vsqrshl##b(v128 a, v128 s) { v##n##s##b x = (v##n##s##b)a, y = (v##n##s##b)s, r; \
+        for (int i = 0; i < n; i++) r[i] = sqshl_lane##b(x[i], (s8)y[i], 1); return (v128)r; } \
+    static inline v128 vsqabs##b(v128 a) { v##n##s##b x = (v##n##s##b)a, r; \
+        for (int i = 0; i < n; i++) r[i] = x[i] == (s##b)((u##b)1 << ((b) - 1)) ? (s##b)(((u##b)1 << ((b) - 1)) - 1) : x[i] < 0 ? -x[i] : x[i]; return (v128)r; }
+DEF_QSHL(8, 16) DEF_QSHL(16, 8) DEF_QSHL(32, 4)
+#undef DEF_QSHL
+#define DEF_RSHR(b, n, W, UW) \
+    static inline v128 vsrshr##b(v128 a, int sh) { v##n##s##b x = (v##n##s##b)a, r; \
+        for (int i = 0; i < n; i++) r[i] = (s##b)(((W)x[i] + ((W)1 << (sh - 1))) >> sh); return (v128)r; } \
+    static inline v128 vurshr##b(v128 a, int sh) { v##n##u##b x = (v##n##u##b)a, r; \
+        for (int i = 0; i < n; i++) r[i] = (u##b)(((UW)x[i] + ((UW)1 << (sh - 1))) >> sh); return (v128)r; }
+DEF_RSHR(8, 16, s32, u32) DEF_RSHR(16, 8, s32, u32) DEF_RSHR(32, 4, s64, u64) DEF_RSHR(64, 2, __int128, unsigned __int128)
+#undef DEF_RSHR
 /* narrowing right shifts by n (with rounding r, signed/unsigned saturation) */
 v1u64 vsqshrn16(v128 a, int n);  v1u64 vsqshrn32(v128 a, int n);  v1u64 vsqshrn64(v128 a, int n);
 v1u64 vuqshrn16(v128 a, int n);  v1u64 vuqshrn32(v128 a, int n);  v1u64 vuqshrn64(v128 a, int n);
@@ -333,6 +368,7 @@ v1u64 vuqrshrn16(v128 a, int n); v1u64 vuqrshrn32(v128 a, int n); v1u64 vuqrshrn
 v1u64 vrshrn16(v128 a, int n);   v1u64 vrshrn32(v128 a, int n);   v1u64 vrshrn64(v128 a, int n);
 v1u64 vsqshrun16(v128 a, int n); v1u64 vsqshrun32(v128 a, int n); v1u64 vsqshrun64(v128 a, int n);
 v1u64 vsqrshrun16(v128 a, int n); v1u64 vsqrshrun32(v128 a, int n); v1u64 vsqrshrun64(v128 a, int n);
+v1u64 vsqxtun16(v128 a);         v1u64 vsqxtun32(v128 a);         v1u64 vsqxtun64(v128 a);
 
 v128 vtbl(const v128 *t, int n, v128 idx, v128 dflt);
 v128 pmull8(v128 a, v128 b, int hi);

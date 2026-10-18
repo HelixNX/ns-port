@@ -358,6 +358,14 @@ def three_same(fn, w):
     if opcode in (0x00, 0x02):                                        # SHADD/UHADD, SRHADD/URHADD
         return put(fn, rd, q, 'v%s%shadd%d(%s, %s)' % ('u' if u else 's', 'r' if opcode == 2 else '', 8 << size,
                                                       fn.v(rn), fn.v(rm)))
+    if opcode == 0x04:                                                # SHSUB/UHSUB
+        if size == 3:
+            raise Unimpl('hsub-64')
+        return put(fn, rd, q, 'v%shsub%d(%s, %s)' % ('u' if u else 's', 8 << size, fn.v(rn), fn.v(rm)))
+    if opcode == 0x16 and size in (1, 2):                             # SQDMULH, SQRDMULH
+        return put(fn, rd, q, 'vsq%sdmulh%d(%s, %s)' % ('r' if u else '', 8 << size, fn.v(rn), fn.v(rm)))
+    if opcode in (0x09, 0x0b) and not u and size != 3:                # SQSHL, SQRSHL (register)
+        return put(fn, rd, q, 'vsq%sshl%d(%s, %s)' % ('r' if opcode == 0x0b else '', 8 << size, fn.v(rn), fn.v(rm)))
     if opcode in (0x14, 0x15):                                        # SMAXP/UMAXP, SMINP/UMINP
         n = lanes
         ev = shuffle(X, Y, [2 * i for i in range(n // 2)] + [(16 >> size) + 2 * i for i in range(n // 2)]
@@ -432,8 +440,17 @@ def scalar_three_same(fn, w):
         if key in names:
             return fwrite(fn, rd, sz, '%s_%s(%s, %s)' % (names[key], t, A, B))
         raise Unimpl('s3same-fp-%x' % opcode)
-    if size != 3:
-        raise Unimpl('s3same-size')
+    if size != 3:                                                     # saturating ops: the vector op's lane 0
+        k = 'u' if u else 's'
+        if opcode in (0x01, 0x05):                                    # SQADD/UQADD, SQSUB/UQSUB
+            e = 'v%sq%s%d(%s, %s)' % (k, 'add' if opcode == 1 else 'sub', 8 << size, fn.v(rn), fn.v(rm))
+        elif opcode == 0x16 and size in (1, 2):                       # SQDMULH, SQRDMULH
+            e = 'vsq%sdmulh%d(%s, %s)' % ('r' if u else '', 8 << size, fn.v(rn), fn.v(rm))
+        elif opcode in (0x09, 0x0b) and not u:                        # SQSHL, SQRSHL (register)
+            e = 'vsq%sshl%d(%s, %s)' % ('r' if opcode == 0x0b else '', 8 << size, fn.v(rn), fn.v(rm))
+        else:
+            raise Unimpl('s3same-size')
+        return iwrite(fn, rd, size, '((%s)%s)[0]' % (vt(size), e))
     A, B = iread(fn, rn, 3), iread(fn, rm, 3)
     SA, SB = '(s64)' + A, '(s64)' + B
     if opcode == 0x10:
@@ -475,6 +492,12 @@ def three_diff(fn, w):
                                                      widen(rn), widen(rm)))
     if opcode in (0x0, 0x2):                                          # SADDL/UADDL, SSUBL/USUBL
         return fn.setv(rd, '(v128)(%s %s %s)' % (widen(rn), '+' if opcode == 0 else '-', widen(rm)))
+    if opcode in (0x5, 0x7):                                          # SABAL/UABAL, SABDL/UABDL
+        d = '{ %s a = %s, b = %s; %s }'
+        diff = vsel('a > b', 'a - b', 'b - a')
+        if opcode == 0x7:
+            return d % (wide, widen(rn), widen(rm), fn.setv(rd, '(v128)(%s)' % diff))
+        return d % (wide, widen(rn), widen(rm), fn.setv(rd, '(v128)(%s + (%s)%s)' % (view(fn, rd, size + 1, k), wide, diff)))
     if opcode in (0x1, 0x3):                                          # SADDW, SSUBW
         return fn.setv(rd, '(v128)(%s %s %s)' % (view(fn, rn, size + 1, k), '+' if opcode == 1 else '-', widen(rm)))
     raise Unimpl('3diff-%x' % opcode)
@@ -491,8 +514,11 @@ def two_misc(fn, w, scalar):
         return two_misc_fp(fn, w, q, u, size, opcode, rn, rd, scalar)
     if scalar:
         if size != 3:
-            if opcode in (0x12, 0x14):
-                raise Unimpl('s2misc-narrow')
+            if opcode == 0x14 or opcode == 0x12 and u:                # SQXTN/UQXTN, SQXTUN (scalar)
+                f = 'sqxtun' if opcode == 0x12 else ('uqxtn' if u else 'sqxtn')
+                return iwrite(fn, rd, size, '(u%d)(v%s%d(%s))[0]' % (8 << size, f, 16 << size, fn.v(rn)))
+            if opcode == 0x07 and not u:                              # SQABS (scalar)
+                return iwrite(fn, rd, size, '((%s)vsqabs%d(%s))[0]' % (vt(size), 8 << size, fn.v(rn)))
             raise Unimpl('s2misc-size')
         A = iread(fn, rn, 3)
         if opcode == 0x0b:
@@ -538,6 +564,12 @@ def two_misc(fn, w, scalar):
         else:
             narrow = '(%s)v%sqxtn%d(%s)' % (vt(size, 'u', 0), 'u' if u else 's', 8 << wide, fn.v(rn))
         return narrow_put(fn, rd, q, size, narrow)
+    if opcode == 0x12 and u:                                          # SQXTUN
+        if size == 3:
+            raise Unimpl('sqxtun')
+        return narrow_put(fn, rd, q, size, '(%s)vsqxtun%d(%s)' % (vt(size, 'u', 0), 16 << size, fn.v(rn)))
+    if opcode == 0x07 and not u and size != 3:                        # SQABS
+        return put(fn, rd, q, 'vsqabs%d(%s)' % (8 << size, fn.v(rn)))
     if opcode == 0x13 and u:                                          # SHLL
         n = 8 >> size
         idx = list(range(n, 2 * n)) if q else list(range(n))
@@ -773,6 +805,11 @@ def shift_imm(fn, w, scalar):
                               '(%s)%s / %r' % (t, src, float(1 << fbits)))
             a = '(f64)%s * %r' % (fread(fn, rn, size), float(1 << fbits))
             return iwrite(fn, rd, size, 'fcvt_%s(%s, %d)' % ('u' if u else 's', a, esize))
+        narrows = {(0, 0x12): 'sqshrn', (1, 0x12): 'uqshrn', (0, 0x13): 'sqrshrn', (1, 0x13): 'uqrshrn',
+                   (1, 0x10): 'sqshrun', (1, 0x11): 'sqrshrun'}
+        if (u, opcode) in narrows and size != 3:                      # saturating narrows (scalar): lane 0
+            return iwrite(fn, rd, size, '(u%d)(v%s%d(%s, %d))[0]' % (esize, narrows[(u, opcode)], 2 * esize,
+                                                                     fn.v(rn), rshift))
         if size != 3:
             raise Unimpl('s-shimm-size')
         A = iread(fn, rn, 3)
@@ -783,7 +820,7 @@ def shift_imm(fn, w, scalar):
             return iwrite(fn, rd, 3, '%s << %d' % (A, lshift))
         if opcode == 0x02:                                            # SSRA/USRA
             e = '(u64)((s64)%s >> %d)' % (A, min(rshift, 63)) if not u else ('%s >> %d' % (A, rshift) if rshift < 64 else '0')
-            return iwrite(fn, rd, 3, '%s + %s' % (iread(fn, rd, 3), e))
+            return iwrite(fn, rd, 3, '%s + (%s)' % (iread(fn, rd, 3), e))
         raise Unimpl('s-shimm-%x' % opcode)
     if size == 3 and not q:
         raise Unimpl('shimm-1d')
@@ -797,9 +834,14 @@ def shift_imm(fn, w, scalar):
         d = view(fn, rd, size)
         sh = ('%s >> %d' % (A, rshift)) if u and rshift < esize else ('(%s)(%s >> %d)' % (vt(size), SA, min(rshift, esize - 1))
                                                                        if not u else '0')
-        return put(fn, rd, q, '%s + %s' % (d, sh))
+        return put(fn, rd, q, '%s + (%s)' % (d, sh))
     if opcode == 0x0a and not u:                                      # SHL
         return put(fn, rd, q, '%s << %d' % (A, lshift))
+    if opcode in (0x04, 0x06):                                        # SRSHR/URSHR, SRSRA/URSRA
+        e = 'v%srshr%d(%s, %d)' % ('u' if u else 's', esize, fn.v(rn), rshift)
+        if opcode == 0x06:
+            e = '%s + (%s)%s' % (view(fn, rd, size), vt(size), e)
+        return put(fn, rd, q, e)
     if opcode == 0x0a and u:                                          # SLI
         d = view(fn, rd, size)
         m = mask(esize) >> (esize - lshift) if lshift else 0
@@ -890,6 +932,8 @@ def by_element(fn, w, scalar):
     sp = shuffle(view(fn, rm, size), view(fn, rm, size), [idx] * lanes)
     if opcode == 0x8 and not u:
         return put(fn, rd, q, '%s * %s' % (A, sp))
+    if opcode in (0xc, 0xd) and not u:                                # SQDMULH, SQRDMULH (by element)
+        return put(fn, rd, q, 'vsq%sdmulh%d(%s, (v128)%s)' % ('r' if opcode == 0xd else '', 8 << size, fn.v(rn), sp))
     if opcode in (0x0, 0x4) and u:
         return put(fn, rd, q, '%s %s %s * %s' % (view(fn, rd, size), '+' if opcode == 0 else '-', A, sp))
     if opcode in (0xa, 0x2, 0x6):                                     # SMULL/UMULL, SMLAL, SMLSL (by element)
@@ -1035,9 +1079,9 @@ def ldst_struct(fn, w, pc):
     else:                                                             # single structure (one lane, or replicate)
         r = bits(w, 21, 21)
         s_ = bits(w, 12, 12)
-        op3 = opcode >> 1
+        scale = bits(w, 15, 14)
         selem = (bits(w, 13, 13) << 1 | r) + 1
-        if op3 == 6:                                                  # LD1R..LD4R
+        if scale == 3:                                                # LD1R..LD4R
             if not l:
                 raise Unimpl('st-r')
             esz = 1 << size
@@ -1048,13 +1092,13 @@ def ldst_struct(fn, w, pc):
                 stmts.append(put(fn, reg, q, splat(vt(size), e, 16 >> size)))
             total = esz * selem
         else:
-            if op3 == 0:
+            if scale == 0:
                 sz, idx = 0, (q << 3) | (s_ << 2) | size
-            elif op3 == 2 and not size & 1:
+            elif scale == 1 and not size & 1:
                 sz, idx = 1, (q << 2) | (s_ << 1) | (size >> 1)
-            elif op3 == 4 and size == 0:
+            elif scale == 2 and size == 0:
                 sz, idx = 2, (q << 1) | s_
-            elif op3 == 4 and size == 1 and not s_:
+            elif scale == 2 and size == 1 and not s_:
                 sz, idx = 3, q
             else:
                 raise Unimpl('ldst-single')

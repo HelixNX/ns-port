@@ -536,6 +536,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
     all_entries = {}
     all_files = []
     ext = set()
+    unresolved = {}                          # u_<mangled> -> symbol
     for n in MODULES:
         mod = prog.mods[n]
         env = Env(prog, mod)
@@ -573,6 +574,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
         all_files.extend(files)
         all_entries[n] = sorted(done)
         ext |= env.ext_callees
+        unresolved.update(('u_' + mangle(sym), sym) for sym in env.unresolved)
         if env.unresolved:
             print('%s: %d unresolved imports, e.g. %s' % (n, len(env.unresolved), ', '.join(sorted(env.unresolved)[:8])))
         print('%s: %d files, %d functions' % (n, len(files), len(done)))
@@ -595,6 +597,10 @@ def cmd_lift(outdir, only=None, per_file=40000):
             m = prog.mods[n]
             f.write('  {"%s", 0x%xull, 0x%xull, 0x%xull, fn_entries_%s},\n' % (n, m.base, m.base + m.text[1], m.m.size, n))
         f.write('  {0}\n};\n')
+        # weak imports nothing defines: rtld leaves them 0, so the guest only calls them behind a null check; a call
+        # that does happen would jump to 0 on the console, here it stops with the name
+        for u, sym in sorted(unresolved.items()):
+            f.write('void %s(Ctx *c) { guest_trap(c, "call to the unresolved weak import %s", c->x[30]); }\n' % (u, sym))
         missing = sorted(x for x in ext - defined if x.startswith('f_'))
         f.write('/* %d cross-module callees not lifted as entries */\n' % len(missing))
     written = {os.path.basename(p) for p in all_files} | {'funcs.h', 'table.c'}
