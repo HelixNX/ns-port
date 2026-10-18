@@ -256,8 +256,17 @@ void kernel_svc_exit(void) {
     kunlock();
 }
 
+/* NX_ONE_CORE: every thread on core 0, so that guest threads never run at the same time (to tell races from
+ * other bugs) */
+static int one_core = -1;
+static bool only_core0(void) {
+    if (one_core < 0) one_core = getenv("NX_ONE_CORE") != NULL;
+    return one_core;
+}
+
 void thread_set_core(KThread *t, s32 core, u64 mask) {
     klock();
+    if (only_core0()) { mask = 1; core = 0; }
     if (mask) t->affinity = mask & ((1u << NCORES) - 1);
     if (core >= 0) t->core = core;
     if (!(t->affinity >> t->core & 1)) t->core = t->affinity ? (s32)__builtin_ctzll(t->affinity) : 0;
@@ -558,6 +567,7 @@ KThread *thread_create(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 core) {
     t->ctx->host = t;
     t->cv = calloc(1, sizeof(CONDITION_VARIABLE));
     InitializeConditionVariable((CONDITION_VARIABLE *)t->cv);
+    if (only_core0()) core = 0;
     t->entry = entry; t->arg = arg; t->stack_top = stack_top; t->prio = prio; t->core = core;
     t->affinity = 1ull << (core < 0 ? 0 : core);
     t->cur_core = -1;

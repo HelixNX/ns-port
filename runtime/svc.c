@@ -75,7 +75,12 @@ void svc_dispatch(Ctx *c, u32 n) {
     case 0x02: r = mem_set_perm(x[0], x[1], (u32)x[2]); break;
     case 0x03: r = mem_set_attr(x[0], x[1], (u32)x[2], (u32)x[3]); break;
     case 0x04: r = mem_map_memory(x[0], x[1], x[2]); break;
-    case 0x2c: r = mem_map_physical(x[0], x[1]); break;
+    case 0x2c: {
+        char b[256];
+        hlog(2, "MapPhysicalMemory %llx+%llx from %s", x[0], x[1], describe_addr(c->x[30], b, sizeof b));
+        r = mem_map_physical(x[0], x[1]);
+        break;
+    }
     case 0x2d: r = mem_unmap_physical(x[0], x[1]); break;
     case 0x05: r = mem_unmap_memory(x[0], x[1], x[2]); break;
     case 0x06: {

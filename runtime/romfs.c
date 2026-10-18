@@ -287,7 +287,13 @@ bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size) {
             ov.Offset = (DWORD)fo;
             ov.OffsetHigh = (DWORD)(fo >> 32);
             DWORD chunk = n - done > 0x40000000 ? 0x40000000 : (DWORD)(n - done), got = 0;
-            if (!ReadFile(h, out + done, chunk, &got, &ov) || !got) fatal("romfs: read error in %ls", f->path);
+            if (!ReadFile(h, out + done, chunk, &got, &ov) || !got) {
+                /* pages made read-only by NX_WATCH_MEM: through a copy, so that the watch sees the write */
+                void *tmp = GetLastError() == ERROR_NOACCESS ? malloc(chunk) : NULL;
+                if (!tmp || !ReadFile(h, tmp, chunk, &got, &ov) || !got) fatal("romfs: read error in %ls", f->path);
+                memcpy(out + done, tmp, got);
+                free(tmp);
+            }
             done += got;
         }
         off += n; out += n; size -= n;

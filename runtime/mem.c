@@ -219,6 +219,7 @@ u32 mem_map_physical(u64 addr, u64 size) {
 }
 
 u32 mem_unmap_physical(u64 addr, u64 size) {
+    hlog(2, "UnmapPhysicalMemory %llx+%llx", addr, size);
     if (!alias_range_ok(addr, size)) return R_INVALID_ADDRESS;
     AcquireSRWLockExclusive(&memlock);
     for (u64 a = addr; a < addr + size;) {

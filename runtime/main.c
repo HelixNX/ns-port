@@ -20,25 +20,35 @@ static char game_dir[1024], image_dir[1024], save_dir[1024];
 void audout_dump(void);
 static int dump_after;                                  /* seconds; then print every thread's state and exit */
 
-static unsigned __stdcall dump_thread(void *p) {
-    Sleep((DWORD)dump_after * 1000);
-    hlog(0, "--dump-after %d: thread states", dump_after);
-    kernel_dump_threads();
-    audout_dump();
-    /* NX_DUMP_MEM=addr:len,...: hex dumps of guest memory (16 bytes a line); *addr dumps where the pointer at addr
-     * points */
+/* NX_DUMP_MEM=addr:len,...: hex dumps of guest memory (16 bytes a line); *addr dumps where the pointer at addr
+ * points. Printed by --dump-after and on a crash */
+static bool mem_readable(u64 a, u64 n) {
+    MemInfo mi;
+    mem_query(a, &mi);
+    return mi.state != MS_FREE && mi.state != MS_INACCESSIBLE && mi.perm & MP_R && a + n <= mi.addr + mi.size;
+}
+
+void dump_mem_env(void) {
     for (const char *e = getenv("NX_DUMP_MEM"); e && *e;) {
         char *end;
         bool deref = *e == '*';
         u64 a = strtoull(e + deref, &end, 16), n = *end == ':' ? strtoull(end + 1, &end, 16) : 0x40;
-        if (deref) a = mem_is_free(a, 8) ? 0 : *(const u64 *)(uintptr_t)a;
+        if (deref) a = mem_readable(a, 8) ? *(const u64 *)(uintptr_t)a : 0;
         hlog(0, "mem dump at %llx:", a);
-        for (u64 o = 0; o < n && !mem_is_free(a + o, 16); o += 16) {
+        for (u64 o = 0; o < n && mem_readable(a + o, 16); o += 16) {
             const u32 *w = (const u32 *)(uintptr_t)(a + o);
             hlog(0, "mem %llx: %08x %08x %08x %08x", a + o, w[0], w[1], w[2], w[3]);
         }
         e = *end == ',' ? end + 1 : end + strlen(end);
     }
+}
+
+static unsigned __stdcall dump_thread(void *p) {
+    Sleep((DWORD)dump_after * 1000);
+    hlog(0, "--dump-after %d: thread states", dump_after);
+    kernel_dump_threads();
+    audout_dump();
+    dump_mem_env();
     fatal("stopped after %d seconds", dump_after);
 }
 

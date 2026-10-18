@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <intrin.h>
+#include <process.h>
 
 extern const ModInfo lifted_modules[];
 
@@ -276,8 +277,75 @@ static u64 guest_pc_of(DWORD64 rip) {
     return 0;
 }
 
+/* NX_WATCH_MEM=addr:len@ms: from ms milliseconds after start, every write to [addr, addr+len) is logged with the
+ * writer's guest instruction, the old value and the host stack (NX_WATCH_DEPTH frames; the first 200 writes). The
+ * pages around it are read-only (from when they are first mapped) until a write, which single-steps with them
+ * writable and protects them again; other writes to those pages are logged once per writing instruction, with
+ * NX_WATCH_PAGE set. Host reads into them through the kernel (ReadFile) fail instead (romfs reads then copy).
+ * GPU writes (imported guest memory) are not seen */
+static u64 watch_lo, watch_hi, watch_a, watch_n;
+static volatile long watch_hits;
+
+static unsigned __stdcall watch_arm(void *p) {
+    Sleep((DWORD)(uintptr_t)p);
+    DWORD old;
+    while (!VirtualProtect((void *)(uintptr_t)watch_lo, watch_hi - watch_lo, PAGE_READONLY, &old)) Sleep(1);
+    hlog(0, "watch: %llx+%llx armed", watch_a, watch_n);
+    return 0;
+}
+
+static void watch_stack(void) {
+    char sb[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+    memset(sb, 0, sizeof sb);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    void *frames[24];
+    USHORT nf = RtlCaptureStackBackTrace(3, getenv("NX_WATCH_DEPTH") ? (USHORT)atoi(getenv("NX_WATCH_DEPTH")) : 24, frames, NULL);
+    for (USHORT i = 0; i < nf; i++) {
+        DWORD64 d = 0;
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)frames[i], &d, si))
+            hlog(0, "watch:   %s+%llx", si->Name, (unsigned long long)d);
+    }
+}
+
+static LONG watch_fault(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+    if (code == EXCEPTION_SINGLE_STEP && watch_lo) {
+        VirtualProtect((void *)(uintptr_t)watch_lo, watch_hi - watch_lo, PAGE_READONLY, &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code != EXCEPTION_ACCESS_VIOLATION || ep->ExceptionRecord->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
+    u64 a = ep->ExceptionRecord->ExceptionInformation[1];
+    if (a < watch_lo || a >= watch_hi) return EXCEPTION_CONTINUE_SEARCH;
+    u64 gpc = guest_pc_of(ep->ContextRecord->Rip);
+    char wb[256];
+    const char *who = gpc ? describe_addr(gpc, wb, sizeof wb) : "host code";
+    if (a + 8 > watch_a && a < watch_a + watch_n) {      /* (writes are up to 8 bytes wide: those starting just before too) */
+        if (InterlockedIncrement(&watch_hits) <= 200) {
+            u64 v = *(const u64 *)(uintptr_t)(a & ~7ull);
+            hlog(0, "watch: write to %llx (was %llx at %llx) at %s", a, v, a & ~7ull, who);
+            watch_stack();
+        }
+    } else if (getenv("NX_WATCH_PAGE")) {
+        static u64 seen[512];
+        static int nseen;
+        bool known = false;
+        for (int i = 0; i < nseen && !known; i++) known = seen[i] == (gpc ? gpc : ep->ContextRecord->Rip);
+        if (!known && nseen < 512) {
+            seen[nseen++] = gpc ? gpc : ep->ContextRecord->Rip;
+            hlog(0, "watch: write to %llx at %s", a, who);
+        }
+    }
+    VirtualProtect((void *)(uintptr_t)watch_lo, watch_hi - watch_lo, PAGE_READWRITE, &old);
+    ep->ContextRecord->EFlags |= 0x100;     /* trap after this instruction: protect again */
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (watch_lo && watch_fault(ep) == EXCEPTION_CONTINUE_EXECUTION) return EXCEPTION_CONTINUE_EXECUTION;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION && code != 0xc0000374u)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -316,6 +384,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
         hlog(0, "  registers as of the last call:");
         dump_ctx(cur_thread->ctx);
     }
+    dump_mem_env();
     fatal("crashed");
 }
 
@@ -361,4 +430,15 @@ void diag_init(void) {
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, crash_handler);
+    const char *w = getenv("NX_WATCH_MEM");
+    if (w) {
+        char *end;
+        u64 a = strtoull(w, &end, 16), n = *end == ':' ? strtoull(end + 1, &end, 16) : 8;
+        u32 ms = *end == '@' ? (u32)strtoul(end + 1, NULL, 10) : 0;
+        watch_a = a;
+        watch_n = n;
+        watch_lo = a & ~0xfffull;
+        watch_hi = (a + n + 0xfff) & ~0xfffull;
+        _beginthreadex(NULL, 0, watch_arm, (void *)(uintptr_t)ms, 0, NULL);
+    }
 }
