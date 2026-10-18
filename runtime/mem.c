@@ -189,11 +189,70 @@ u32 mem_set_heap_size(u64 size, u64 *addr) {
 
 #define ATTR_LOCKED 1
 
+/* svcMapPhysicalMemory / svcUnmapPhysicalMemory: memory from the process's pool at a chosen address in the alias
+ * region (newer SDKs' virtual address memory: nn::os reserves address space and commits pages on demand). Pages
+ * already mapped in the range stay as they are; the rest of the range must be free (map) or mapped (unmap). */
+static bool alias_range_ok(u64 addr, u64 size) {
+    return !((addr | size) & (PAGE - 1)) && size && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE;
+}
+
+u32 mem_map_physical(u64 addr, u64 size) {
+    if (!alias_range_ok(addr, size)) return R_INVALID_ADDRESS;
+    AcquireSRWLockExclusive(&memlock);
+    for (u64 a = addr; a < addr + size;) {
+        Block *b = &blocks[find(a)];
+        if (b->state != MS_FREE && b->state != MS_NORMAL) { ReleaseSRWLockExclusive(&memlock); return R_INVALID_MEMSTATE; }
+        a = b->addr + b->size;
+    }
+    for (u64 a = addr; a < addr + size;) {
+        Block *b = &blocks[find(a)];
+        u64 end = b->addr + b->size < addr + size ? b->addr + b->size : addr + size;
+        if (b->state == MS_FREE) {
+            commit(a, end - a, MP_RW);
+            set_locked(a, end - a, MS_NORMAL, MP_RW, 0);
+            used_bytes += end - a;
+        }
+        a = end;
+    }
+    ReleaseSRWLockExclusive(&memlock);
+    return R_OK;
+}
+
+u32 mem_unmap_physical(u64 addr, u64 size) {
+    if (!alias_range_ok(addr, size)) return R_INVALID_ADDRESS;
+    AcquireSRWLockExclusive(&memlock);
+    for (u64 a = addr; a < addr + size;) {
+        Block *b = &blocks[find(a)];
+        if (b->state != MS_FREE && (b->state != MS_NORMAL || b->attr)) {
+            ReleaseSRWLockExclusive(&memlock);
+            return R_INVALID_MEMSTATE;
+        }
+        a = b->addr + b->size;
+    }
+    for (u64 a = addr; a < addr + size;) {
+        Block *b = &blocks[find(a)];
+        u64 end = b->addr + b->size < addr + size ? b->addr + b->size : addr + size;
+        if (b->state == MS_NORMAL) {
+            VirtualFree((void *)(uintptr_t)a, end - a, MEM_DECOMMIT);
+            set_locked(a, end - a, MS_FREE, MP_NONE, 0);
+            used_bytes -= end - a;
+        }
+        a = end;
+    }
+    ReleaseSRWLockExclusive(&memlock);
+    return R_OK;
+}
+
 u32 mem_map_memory(u64 dst, u64 src, u64 size) {
     if ((dst | src | size) & (PAGE - 1) || !size) return R_INVALID_ADDRESS;
     if (dst < STACK_BASE || dst + size > STACK_BASE + STACK_SIZE) return R_INVALID_RANGE;
     AcquireSRWLockExclusive(&memlock);
-    if (!range_is(src, size, MS_HEAP, MP_RW, MP_RW, ATTR_LOCKED, 0) || !range_is(dst, size, MS_FREE, 0, 0, 0, 0)) {
+    /* the source is heap, a module's static data (newer SDKs give some threads stacks in .bss) or physical
+     * memory mapped in the alias region (stacks from an allocator on virtual address memory) */
+    u32 state = range_is(src, size, MS_HEAP, MP_RW, MP_RW, ATTR_LOCKED, 0) ? MS_HEAP
+              : range_is(src, size, MS_CODEDATA, MP_RW, MP_RW, ATTR_LOCKED, 0) ? MS_CODEDATA
+              : range_is(src, size, MS_NORMAL, MP_RW, MP_RW, ATTR_LOCKED, 0) ? MS_NORMAL : MS_FREE;
+    if (state == MS_FREE || !range_is(dst, size, MS_FREE, 0, 0, 0, 0)) {
         ReleaseSRWLockExclusive(&memlock);
         return R_INVALID_MEMSTATE;
     }
@@ -201,7 +260,7 @@ u32 mem_map_memory(u64 dst, u64 src, u64 size) {
     memcpy((void *)(uintptr_t)dst, (void *)(uintptr_t)src, size);
     DWORD old;
     VirtualProtect((void *)(uintptr_t)src, size, PAGE_NOACCESS, &old);
-    set_locked(src, size, MS_HEAP, MP_NONE, ATTR_LOCKED);
+    set_locked(src, size, state, MP_NONE, ATTR_LOCKED);
     set_locked(dst, size, MS_STACK, MP_RW, 0);
     ReleaseSRWLockExclusive(&memlock);
     return R_OK;
@@ -210,7 +269,10 @@ u32 mem_map_memory(u64 dst, u64 src, u64 size) {
 u32 mem_unmap_memory(u64 dst, u64 src, u64 size) {
     if ((dst | src | size) & (PAGE - 1) || !size) return R_INVALID_ADDRESS;
     AcquireSRWLockExclusive(&memlock);
-    if (!range_is(src, size, MS_HEAP, 0, 0, ATTR_LOCKED, ATTR_LOCKED) || !range_is(dst, size, MS_STACK, 0, 0, 0, 0)) {
+    u32 state = range_is(src, size, MS_HEAP, 0, 0, ATTR_LOCKED, ATTR_LOCKED) ? MS_HEAP
+              : range_is(src, size, MS_CODEDATA, 0, 0, ATTR_LOCKED, ATTR_LOCKED) ? MS_CODEDATA
+              : range_is(src, size, MS_NORMAL, 0, 0, ATTR_LOCKED, ATTR_LOCKED) ? MS_NORMAL : MS_FREE;
+    if (state == MS_FREE || !range_is(dst, size, MS_STACK, 0, 0, 0, 0)) {
         ReleaseSRWLockExclusive(&memlock);
         return R_INVALID_MEMSTATE;
     }
@@ -218,7 +280,7 @@ u32 mem_unmap_memory(u64 dst, u64 src, u64 size) {
     VirtualProtect((void *)(uintptr_t)src, size, PAGE_READWRITE, &old);
     memcpy((void *)(uintptr_t)src, (void *)(uintptr_t)dst, size);
     VirtualFree((void *)(uintptr_t)dst, size, MEM_DECOMMIT);
-    set_locked(src, size, MS_HEAP, MP_RW, 0);
+    set_locked(src, size, state, MP_RW, 0);
     set_locked(dst, size, MS_FREE, MP_NONE, 0);
     ReleaseSRWLockExclusive(&memlock);
     return R_OK;

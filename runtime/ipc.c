@@ -1,4 +1,4 @@
-/* HIPC framing, CMIF requests, sessions and domains, and the service manager (sm:). */
+/* HIPC framing, CMIF and TIPC requests, sessions and domains, and the service manager (sm:). */
 #include "ipc.h"
 #include <stdlib.h>
 #include <windows.h>
@@ -298,9 +298,17 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
         target = s->root;
         svcobj_ref(target);
     }
+    /* TIPC (newer SDKs' sm: client): type 16 + command, the arguments right after the descriptors, no header;
+     * type 15 closes the session */
+    bool tipc = r->type >= 15;
+    if (tipc) {
+        r->cmd = r->type - 16;
+        r->in = (const u8 *)raw;
+        r->in_size = raw_words * 4;
+    }
     u32 magic;
     memcpy(&magic, data, 4);
-    if (r->type != 2 && !(domain_msg && domain_cmd == 2)) {
+    if (!tipc && r->type != 2 && !(domain_msg && domain_cmd == 2)) {
         if (magic != SFCI) hlog(0, "ipc: request without SFCI header (type %u)", r->type);
         memcpy(&r->cmd, data + 8, 4);
         memcpy(&r->token, data + 12, 4);
@@ -323,7 +331,13 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
     case 5: case 7:
         control(s, r);
         break;
+    case 15:                                             /* TIPC close */
+        break;
     default:
+        if (tipc && target) {
+            dispatch(target, r);
+            break;
+        }
         hlog(0, "ipc: unsupported request type %u", r->type);
         r->result = 0x1a60a;
         break;
@@ -348,9 +362,16 @@ u32 ipc_send_sync_request(u32 handle, u64 msg, u64 size) {
     }
     u8 *rawout = (u8 *)q;
     u8 *d = (u8 *)(((uintptr_t)rawout + 15) & ~(uintptr_t)15);
-    if (r->type == 2) {
+    if (r->type == 2 || r->type == 15) {
         m[0] = 0;
         m[1] = 0;
+    } else if (tipc) {                                   /* TIPC reply: the result, then the data, unaligned */
+        memcpy(rawout, &r->result, 4);
+        memcpy(rawout + 4, r->out, r->out_size);
+        u8 *end = rawout + 4 + r->out_size;
+        if ((u8 *)m + 0x100 < end) fatal("reply overflows the message buffer");
+        m[0] = r->type;
+        m[1] = (u32)((end - rawout + 3) / 4) | (special ? 1u << 31 : 0);
     } else {
         if (domain_msg) {
             u32 n = (u32)r->nout_objs;

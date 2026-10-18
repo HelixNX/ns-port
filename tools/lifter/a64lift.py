@@ -30,7 +30,7 @@ sys.path.insert(0, HERE)
 
 import gamecfg                                  # noqa: E402
 from nxmod import Module                       # noqa: E402
-from a64insn import Unimpl, lift_insn, branch_targets   # noqa: E402
+from a64insn import Unimpl, lift_insn, branch_targets, sext   # noqa: E402
 
 # load order = symbol lookup order (as rtld does it: main, then the subsdks, then sdk)
 MODULES = gamecfg.MODULES
@@ -69,6 +69,7 @@ class Mod:
         self.switches = {int(k, 16): v for k, v in ida.get('switches', {}).items()}
         self.addr_refs = code_address_refs(self)
         self.recover_functions(data)
+        self.recover_switches()
         got = {r[0]: r[2] for r in self.m.rels if r[1] in (1025, 1026)}      # GLOB_DAT / JUMP_SLOT slot -> symbol
         self.plt = {}                        # PLT stub offset -> symbol name
         for ea in self.funcs:
@@ -96,6 +97,8 @@ class Mod:
                 for i, a in enumerate(offs):
                     w = self.word(a)
                     seeds.update(t - self.base for t in branch_targets(w, self.base + a))
+                    if w & 0xfc000000 == 0x94000000:                    # BL (branch_targets leaves calls out)
+                        seeds.add(a + (sext(w & 0x3ffffff, 26) << 2))
                     if (i + 1 == len(offs) or offs[i + 1] != a + 4) and w & 0xfffffc1f not in (0xd65f0000, 0xd61f0000) \
                             and w & 0xfc000000 != 0x14000000 and w & 0xffe0001f != 0xd4200000 and w != 0 \
                             and w != 0x94000002:                    # BL over an inline constant: data follows
@@ -133,6 +136,80 @@ class Mod:
             print('%s: recovered function %x (%d instructions%s)' % (
                 self.name, seed, len(order), ', through IDA data' if data & addrs else ''))
         return new
+
+    def recover_switches(self):
+        """Jump tables IDA did not resolve (a second dispatch on an index already bounds-checked earlier has no
+        bounds check of its own): clang's
+            adrp xT, tab; add xT, xT, #lo; adr xB, base; ldr{b,h,sh,sw,w} wE, [xT, xI{, lsl #k}];
+            add xD, xB, xE{, lsl #s | sxtw #s}; br xD
+        Entries are read while the target stays inside the function; reading a few too many (into the next table)
+        only adds labels, and a target outside the cases still takes the dynamic path."""
+        found = 0
+        for f, offs in self.funcs.items():
+            inside = set(offs)
+            for i, a in enumerate(offs):
+                w = self.word(a)
+                if w & 0xfffffc1f != 0xd61f0000 or a in self.switches:
+                    continue
+                cases = self.jump_table(offs[max(0, i - 16):i], (w >> 5) & 31, inside)
+                if cases:
+                    self.switches[a] = cases
+                    found += 1
+        if found:
+            print('%s: %d jump tables found beyond IDA\'s' % (self.name, found))
+
+    def jump_table(self, before, reg, inside):
+        defs = {}                                   # register -> (kind, ...), from the instructions before the BR
+        for a in before:
+            w = self.word(a)
+            rd = w & 31
+            if w & 0x9f000000 == 0x90000000:                                    # ADRP
+                imm = ((w >> 29) & 3) | (((w >> 5) & 0x7ffff) << 2)
+                defs[rd] = ('addr', (a & ~0xfff) + (sext(imm, 21) << 12))
+            elif w & 0x9f000000 == 0x10000000:                                  # ADR
+                imm = ((w >> 29) & 3) | (((w >> 5) & 0x7ffff) << 2)
+                defs[rd] = ('addr', a + sext(imm, 21))
+            elif w & 0xff800000 == 0x91000000:                                  # ADD (immediate), 64-bit
+                src = defs.get((w >> 5) & 31)
+                imm = ((w >> 10) & 0xfff) << (12 if w & (1 << 22) else 0)
+                defs[rd] = ('addr', src[1] + imm) if src and src[0] == 'addr' else None
+            elif w & 0x3f200c00 == 0x38200800 and (w >> 22) & 3:               # LDR, LDRS* (register offset)
+                size, opc = w >> 30, (w >> 22) & 3
+                signed = opc >= 2
+                if size == 3 or (size == 2 and opc == 3):
+                    defs[rd] = None
+                    continue
+                tab = defs.get((w >> 5) & 31)
+                defs[rd] = ('entry', tab[1], 1 << size, signed) if tab and tab[0] == 'addr' else None
+            elif w & 0xff200000 == 0x8b000000 and (w >> 22) & 3 == 0:          # ADD (shifted register), LSL
+                defs[rd] = self._table_sum(defs, (w >> 5) & 31, (w >> 16) & 31, (w >> 10) & 63)
+            elif w & 0xffe00000 == 0x8b200000 and (w >> 13) & 7 in (2, 6):    # ADD (extended register), UXTW/SXTW
+                defs[rd] = self._table_sum(defs, (w >> 5) & 31, (w >> 16) & 31, (w >> 10) & 7)
+            elif rd in defs:
+                defs[rd] = None                     # anything else that may write rd
+        d = defs.get(reg)
+        if not d or d[0] != 'table':
+            return None
+        _, base, tab, esize, signed, shift = d
+        cases = []
+        t0, t1 = self.text
+        for k in range(1024):
+            ea = tab + k * esize
+            if not (self.m.ro[0] <= ea < self.m.ro[1] or t0 <= ea < t1):
+                break
+            e = int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed)
+            t = base + (e << shift)
+            if t not in inside:
+                break
+            cases.append(t)
+        return cases or None
+
+    @staticmethod
+    def _table_sum(defs, rn, rm, shift):
+        b, e = defs.get(rn), defs.get(rm)
+        if b and e and b[0] == 'addr' and e[0] == 'entry':
+            return ('table', b[1], e[1], e[2], e[3], shift)
+        return None
 
     def plt_slot(self, ea):
         """GOT slot of `adrp x16, p; ldr x17, [x16, #o]; add x16, x16, #o; br x17`, or None."""
@@ -270,7 +347,7 @@ class Fn:
         if cases:
             self.temp('JT')
             out = ['{ JT = %s; switch (JT) {' % expr]
-            for t in cases:
+            for t in sorted(set(cases)):
                 ta = self.mod.base + t
                 if ta in self.addrs:
                     self.labels.add(ta)
@@ -345,6 +422,19 @@ def secondary_entries(mod):
                     orphans.add(t)
                 else:
                     sec[o].add(t)
+        # falling through past the end of a chunk into code IDA gave another function (it split this one at a loop
+        # head, e.g. sdk 13's SignalLightEvent): an entry there, so that the fall-through becomes a jump
+        for i, a in enumerate(offs):
+            nxt = a + 4
+            if i + 1 < len(offs) and offs[i + 1] == nxt or nxt in own or nxt in mod.funcs:
+                continue
+            w = mod.word(a)
+            if w & 0xfffffc1f in (0xd65f0000, 0xd61f0000) or w & 0xfc000000 == 0x14000000 \
+                    or w & 0xffe0001f == 0xd4200000 or w == 0 or w == 0x94000002:
+                continue
+            o = mod.owner.get(nxt)
+            if o is not None and o != off:
+                sec[o].add(nxt)
     # code whose address is taken (relocation targets, exports, init_array, ADR / ADRP+ADD) and that IDA put
     # inside another function: it is entered through call_ind, so it needs an entry too
     for t in set(mod.m.code_seeds()) | mod.addr_refs:
@@ -353,6 +443,7 @@ def secondary_entries(mod):
         o = mod.owner.get(t)
         if o is not None:
             sec[o].add(t)
+    mod.sec_entries = {t for v in sec.values() for t in v}
     return {o: sorted(v) for o, v in sec.items()}, orphans
 
 
@@ -448,7 +539,7 @@ def lift_function(env, owner, secondary=(), stats=None):
 
 def env_is_entry(env, addr):
     off = addr - env.mod.base
-    return off in env.mod.funcs
+    return off in env.mod.funcs or off in getattr(env.mod, 'sec_entries', ())
 
 
 def emit(fn, lines, entries=None):

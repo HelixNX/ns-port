@@ -51,6 +51,9 @@ u64 mem_heap_size(void);
 u32 mem_set_heap_size(u64 size, u64 *addr);
 u32 mem_map_memory(u64 dst, u64 src, u64 size);
 u32 mem_unmap_memory(u64 dst, u64 src, u64 size);
+u32 mem_map_physical(u64 addr, u64 size);                   /* alias region, on demand */
+u32 mem_unmap_physical(u64 addr, u64 size);
+extern u64 system_resource_size;                            /* main.npdm: enables nn::os virtual address memory */
 u32 mem_set_perm(u64 addr, u64 size, u32 perm);
 u32 mem_set_attr(u64 addr, u64 size, u32 mask, u32 value);
 u64 mem_used(void);

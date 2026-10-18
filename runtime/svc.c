@@ -29,6 +29,8 @@ static const char *svc_name(u32 n) {
     return n < 0x80 && names[n] ? names[n] : "?";
 }
 
+u64 system_resource_size;
+
 static KThread *get_thread(u32 h) { return (KThread *)handle_get(h, KO_THREAD); }
 
 static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
@@ -49,7 +51,8 @@ static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
     case 13: *out = AS_END - AS_BASE; return R_OK;
     case 14: *out = STACK_BASE; return R_OK;
     case 15: *out = STACK_SIZE; return R_OK;
-    case 16: case 17: *out = 0; return R_OK;                           /* system resource */
+    case 16: *out = system_resource_size; return R_OK;                 /* system resource (page tables): main.npdm */
+    case 17: *out = system_resource_size / 4; return R_OK;
     case 18: *out = NX_TITLE_ID; return R_OK;
     case 20: *out = 0; return R_OK;                                    /* user exception context */
     case 21: *out = TOTAL_MEMORY; return R_OK;
@@ -72,6 +75,8 @@ void svc_dispatch(Ctx *c, u32 n) {
     case 0x02: r = mem_set_perm(x[0], x[1], (u32)x[2]); break;
     case 0x03: r = mem_set_attr(x[0], x[1], (u32)x[2], (u32)x[3]); break;
     case 0x04: r = mem_map_memory(x[0], x[1], x[2]); break;
+    case 0x2c: r = mem_map_physical(x[0], x[1]); break;
+    case 0x2d: r = mem_unmap_physical(x[0], x[1]); break;
     case 0x05: r = mem_unmap_memory(x[0], x[1], x[2]); break;
     case 0x06: {
         MemInfo mi;
@@ -211,11 +216,6 @@ void svc_dispatch(Ctx *c, u32 n) {
     }
     case 0x29: { u64 v = 0; r = get_info((u32)x[1], (u32)x[2], x[3], &v); x[1] = v; break; }
     case 0x2a: break;
-    case 0x2c: case 0x2d: {
-        if ((x[0] | x[1]) & 0xfff || x[0] < ALIAS_BASE || x[0] + x[1] > ALIAS_BASE + ALIAS_SIZE) { r = R_INVALID_ADDRESS; break; }
-        if (n == 0x2c) mem_map(x[0], x[1], MS_ALIAS, MP_RW); else mem_unmap(x[0], x[1]);
-        break;
-    }
     case 0x34: r = address_wait(x[0], (u32)x[1], (s32)x[2], (s64)x[3]); break;
     case 0x35: r = address_signal(x[0], (u32)x[1], (s32)x[2], (s32)x[3]); break;
     case 0x45: {

@@ -1,5 +1,6 @@
 /* Start-up. Does what the console's loader and rtld do, then enters the sdk:
- *   nn::init::Start(main thread handle, main's base, rtld's "initialised" callback, rtld's "run DT_INIT" callback)
+ *   nn::init::Start(main thread handle, main's base, rtld's "initialised" callback, rtld's "run DT_INIT" callback
+ *                   [, rtld's "run DT_FINI" callback: newer SDKs])
  * on the main thread, whose stack size, priority and core come from main.npdm.
  *
  * Usage: <game> [--game <dump dir>] [--image <image dir>] [--save <dir>] [--log <0-2>]
@@ -37,6 +38,16 @@ static void h_rtld_run_dt_init(Ctx *c) {
     }
 }
 
+/* finalisers in the opposite order: main, subsdk0, sdk */
+static void h_rtld_run_dt_fini(Ctx *c) {
+    for (int i = 0; i < num_loaded_mods; i++) {
+        LoadedMod *m = &loaded_mods[i];
+        if (!m->dt_fini) continue;
+        hlog(1, "DT_FINI of %s", m->name);
+        guest_call(c, m->dt_fini);
+    }
+}
+
 static void exe_relative(char *out, size_t n, const char *rel) {
     char exe[MAX_PATH];
     GetModuleFileNameA(NULL, exe, sizeof exe);
@@ -45,7 +56,7 @@ static void exe_relative(char *out, size_t n, const char *rel) {
     snprintf(out, n, "%s\\%s", exe, rel);
 }
 
-typedef struct Npdm { u8 prio, core; u32 stack_size; } Npdm;
+typedef struct Npdm { u8 prio, core; u32 stack_size, system_resource_size; } Npdm;
 
 static Npdm read_npdm(void) {
     char path[1100];
@@ -57,6 +68,7 @@ static Npdm read_npdm(void) {
     fclose(f);
     Npdm n = {meta[0xe], meta[0xf], 0};
     memcpy(&n.stack_size, meta + 0x1c, 4);
+    memcpy(&n.system_resource_size, meta + 0x14, 4);
     return n;
 }
 
@@ -83,10 +95,15 @@ int main(int argc, char **argv) {
     vk_init();
     nvn_init();
     Npdm npdm = read_npdm();
+    system_resource_size = npdm.system_resource_size;
     u64 stack_size = (npdm.stack_size + 0xfffull) & ~0xfffull;
     if (stack_size > MAINSTACK_MAX) fatal("main thread stack of %llx bytes is too large", stack_size);
     mem_map(MAINSTACK_BASE, stack_size, MS_STACK, MP_RW);
+    /* SDK 4 (MK8): Start(handle, base, initialised, DT_INIT); later SDKs (13: Violet) add a DT_FINI callback,
+     * called after nnMain returns */
     u64 start = sym_lookup("_ZN2nn4init5StartEmmPFvvES2_");
+    bool with_fini = false;
+    if (!start && (start = sym_lookup("_ZN2nn4init5StartEmmPFvvES2_S2_")) != 0) with_fini = true;
     if (!start) fatal("no nn::init::Start in the sdk");
     KThread *t = thread_create(start, 0, MAINSTACK_BASE + stack_size, npdm.prio, npdm.core);
     snprintf(t->name, sizeof t->name, "main");
@@ -98,6 +115,7 @@ int main(int argc, char **argv) {
     c->x[1] = loaded_mods[0].base;
     c->x[2] = hostcall_register("rtld initialised", h_rtld_initialized);
     c->x[3] = hostcall_register("rtld DT_INIT", h_rtld_run_dt_init);
+    if (with_fini) c->x[4] = hostcall_register("rtld DT_FINI", h_rtld_run_dt_fini);
     hlog(1, "main thread: stack %llx bytes, priority %u, core %u", stack_size, npdm.prio, npdm.core);
     thread_start(t);
     if (dump_after) _beginthreadex(NULL, 0, dump_thread, NULL, 0, NULL);

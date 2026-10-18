@@ -147,12 +147,39 @@ static void ss_snapshot(SvcObj *o, IpcReq *r) {
     s[0xcf] = in_u8(r, 0);
 }
 
+/* GetSharedMemoryNativeHandle (newer SDKs read the clocks from it): 0x1000 bytes of lock-free values, each
+ * {u32 counter; pad; T value[2]} with value[counter & 1] current:
+ *   0x00 steady clock context {u64 internal offset (ns), u128 source id}
+ *   0x38 local system clock context, 0x80 network system clock context {s64 offset, s64 steady time, u128 id}
+ *   0xc8 automatic correction enabled (bool) */
+static KShmem *time_shmem;
+static void ss_shared_memory(SvcObj *o, IpcReq *r) {
+    if (!time_shmem) {
+        time_shmem = shmem_create(0x1000, "time");
+        u8 *m = shmem_ptr(time_shmem);
+        memset(m, 0, 0x1000);
+        for (int i = 0; i < 2; i++) memcpy(m + 8 + i * 0x18 + 8, clock_source_id, 16);   /* offset 0 */
+        s64 steady = steady_seconds(), off = now_posix() - steady;
+        for (int c = 0; c < 2; c++)
+            for (int i = 0; i < 2; i++) {
+                u8 *v = m + (c ? 0x80 : 0x38) + 8 + i * 0x20;
+                memcpy(v, &off, 8);
+                memcpy(v + 8, &steady, 8);
+                memcpy(v + 0x10, clock_source_id, 16);
+            }
+    }
+    u32 h;
+    if (handle_new(&time_shmem->obj, &h)) fatal("out of handles");
+    out_copy_handle(r, h);
+}
+
 static const Iface iface_time = {"time", (const IpcCmd[]){
     {0, ss_system_clock, "GetStandardUserSystemClock"},
     {1, ss_system_clock, "GetStandardNetworkSystemClock"},
     {2, ss_steady_clock, "GetStandardSteadyClock"},
     {3, ss_tz, "GetTimeZoneService"},
     {4, ss_system_clock, "GetStandardLocalSystemClock"},
+    {20, ss_shared_memory, "GetSharedMemoryNativeHandle"},
     {100, ss_false, "IsStandardUserSystemClockAutomaticCorrectionEnabled"},
     {300, ss_monotonic_base, "CalculateMonotonicSystemClockBaseTimePoint"},
     {400, ss_snapshot, "GetClockSnapshot"},
