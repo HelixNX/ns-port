@@ -5,5 +5,6 @@
   "modules": [["main", "0x7100000000"], ["subsdk0", "0x7104800000"], ["sdk", "0x7105000000"]],
   "dump": "../dump",
   "analysis": "../build/analysis",
-  "build": "../build"
+  "build": "../build",
+  "dlc": [1]
 }
