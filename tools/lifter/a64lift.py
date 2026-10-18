@@ -303,12 +303,28 @@ class Mod:
         if op0 & 0b1110 == 0b1000 or op0 & 0b0111 == 0b0101:               # data processing: Rd
             return (w & 31,)
         if op0 & 0b0101 == 0b0100:                                          # loads and stores
-            if w & 0x04000000:                                              # SIMD&FP registers: only writeback
-                return ((w >> 5) & 31,) if w & 0x01000000 == 0 else ()
-            out = [(w >> 5) & 31]                                           # writeback (pre / post index)
-            if w & 0x00400000 or w & 0x3f000000 in (0x18000000, 0x98000000):  # loads (and LDR literal)
-                out += [w & 31, (w >> 10) & 31]                             # Rt, Rt2 of a pair
-            return tuple(out)
+            rn, rt, rt2 = (w >> 5) & 31, w & 31, (w >> 10) & 31
+            simd = w & 0x04000000
+            if w & 0x3b000000 == 0x18000000:                                # LDR (literal)
+                return () if simd else (rt,)
+            if w & 0x3f000000 == 0x08000000:                                # exclusive / acquire-release
+                if w & 0x00400000:                                          # loads: Rt (and Rt2 of a pair)
+                    return (rt, rt2) if w & 0x00200000 else (rt,)
+                return () if w & 0x00800000 else ((w >> 16) & 31,)          # STXR / STXP: the status register
+            if w & 0x3a000000 == 0x28000000:                                # pairs
+                wb = (w >> 23) & 3 in (1, 3)                                # post / pre index
+                load = w & 0x00400000 and not simd
+                return ((rn,) if wb else ()) + ((rt, rt2) if load else ())
+            if w & 0x3b000000 == 0x39000000:                                # unsigned offset: no writeback
+                wb = False
+            elif w & 0x3b200c00 == 0x38200800:                              # register offset
+                wb = False
+            elif w & 0x3b200000 == 0x38000000:                              # imm9: post / pre index write back
+                wb = (w >> 10) & 3 in (1, 3)
+            else:                                                           # anything else: assume the worst
+                return (rn, rt, rt2)
+            load = (w >> 22) & 3 != 0 and not simd                          # LDR*, LDRS* (PRFM: no harm)
+            return ((rn,) if wb else ()) + ((rt,) if load else ())
         if w & 0xfc000000 == 0x94000000 or w & 0xfffffc1f == 0xd63f0000:  # BL, BLR: the caller-saved registers
             return tuple(range(19)) + (30,)
         if w & 0xfff00000 == 0xd5300000:                                    # MRS
