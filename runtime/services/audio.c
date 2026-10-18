@@ -294,13 +294,14 @@ static void ar_request_update(SvcObj *o, IpcReq *r) {
     r->result = request_update(o->data, (const u8 *)(uintptr_t)in->addr, in->size, (u8 *)(uintptr_t)out->addr, out->size);
 }
 static void ar_start(SvcObj *o, IpcReq *r) { ((ArRenderer *)o->data)->started = true; }
-static void ar_stop(SvcObj *o, IpcReq *r) { ((ArRenderer *)o->data)->started = false; }
+static void ar_stop(SvcObj *o, IpcReq *r) { ((ArRenderer *)o->data)->started = false; hlog(1, "audren: renderer stopped"); }
 static void ar_event(SvcObj *o, IpcReq *r) { out_event(r, ((ArRenderer *)o->data)->event); }
 static void ar_time_limit(SvcObj *o, IpcReq *r) { out_u32(r, 100); }
 
 static void renderer_destroy(SvcObj *o) {
     ArRenderer *rr = o->data;
     rr->closing = true;                              /* the thread exits on its next tick and leaks rr: rare */
+    hlog(1, "audren: renderer closed");
 }
 
 static const Iface iface_renderer = {"IAudioRenderer", (const IpcCmd[]){
@@ -359,10 +360,45 @@ static const Iface iface_device = {"IAudioDevice", (const IpcCmd[]){
 /* ---------------------------------------------------------------------------------------------- audren:u */
 /* AudioRendererParameter: sample rate, sample count, mix buffers, sub mixes, voices, sinks, effects, performance
  * frames, flags, splitter infos, splitter destinations, external context size, revision */
+/* The work buffer (transfer memory) is never touched here, but games size their heaps by it: Bink, for one, gives
+ * its renderer a fixed 192 KB sub-heap and overruns it if the size is too large. So the size follows the console
+ * service's sum of its per-renderer state (sizes of its records estimated where nothing documents them): mix
+ * state, voices (info, channel resource, state), sample buffers for the mix and sink channels, the mix graph
+ * (REV2+), splitters, memory pools (4 per voice), upsamplers, sinks, performance frames and the command buffer
+ * (sized from the parameters from REV5 on, fixed before). */
+#define ALIGN(x, a) (((x) + (a) - 1) & ~(u64)((a) - 1))
+static u64 renderer_work_size(const u8 *p) {
+    u64 count = rd32(p + 4), mixes = rd32(p + 8), subs = rd32(p + 12), voices = rd32(p + 16), sinks = rd32(p + 20),
+        effects = rd32(p + 24), perf = rd32(p + 28), splitters = rd32(p + 36), dests = rd32(p + 40);
+    u32 rev = (rd32(p + 0x30) >> 24) - '0';
+    enum { MIX = 0x940, VOICE = 0x220, CHANNEL = 0x70, VSTATE = 0x100, POOL = 0x20, UPSAMPLER = 0x280,
+           EFFECT = 0x5c0, RESULT = 0x80, SINK = 0x170, SPLITTER = 0x20, DEST = 0xe0, CMD = 0x20, VOICE_CMDS = 0x300 };
+    u64 n = ALIGN(mixes * 4, 0x40) + subs * 256 * 4 + (subs + 1) * MIX + voices * (VOICE + CHANNEL + VSTATE) +
+            ALIGN((subs + 1) * 8, 0x10) + ALIGN(voices * 8, 0x10) +
+            ALIGN(((sinks + subs) * 240 * 4 + count * 4) * (mixes + 6), 0x40);
+    if (rev >= 2) {                                 /* mix graph: node states and edge matrix */
+        u64 nodes = subs + 1;
+        n += ALIGN(ALIGN(nodes, 0x40) / 8 * 2 + nodes * 0x10 + nodes * (nodes + 1) * 4 + ALIGN(nodes * nodes, 0x40) / 8,
+                   0x10);
+        n += dests * DEST + splitters * SPLITTER + (rev >= 5 ? ALIGN(dests * 4, 0x10) : 0);
+    }
+    n += (effects + voices * 4) * POOL + (rev >= 9 ? effects * RESULT : 0) + 0x50;
+    n = ALIGN(n, 0x40);
+    n += (sinks + subs) * UPSAMPLER + effects * EFFECT + ALIGN(voices * VSTATE, 0x40) + sinks * SINK +
+         (rev >= 9 ? effects * RESULT : 0);
+    if (perf) n += ALIGN((0x30 + (voices + effects + sinks + subs + 1) * 0x18 + 100 * 0x18) * (perf + 1) + 0xc0, 0x100);
+    if (rev >= 5)
+        n += effects * EFFECT + voices * (splitters * CMD + VOICE_CMDS) + CMD + 24 * 24 * CMD + CMD + 24 * CMD +
+             dests * 24 * CMD + sinks * 0x80 + (effects + voices + sinks + subs + 1 + 100) * CMD + 0x7e;
+    else
+        n += 0x18000 + 0x7e;
+    return ALIGN(n, 0x1000);
+}
+
 static void am_work_buffer_size(SvcObj *o, IpcReq *r) {
-    u32 count = in_u32(r, 4), buffers = in_u32(r, 8), voices = in_u32(r, 16), effects = in_u32(r, 24);
-    u64 size = 0x10000 + (u64)voices * 0x800 + (u64)effects * 0x2000 + (u64)buffers * count * 4 * 6;
-    out_u64(r, (size + 0xfff) & ~0xfffull);
+    u64 n = renderer_work_size(r->in);
+    hlog(1, "audren: work buffer of %llx bytes", n);
+    out_u64(r, n);
 }
 
 static void am_open(SvcObj *o, IpcReq *r) {
