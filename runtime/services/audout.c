@@ -1,7 +1,9 @@
 /* audout: the simple audio output (a queue of PCM buffers; newer games' sound engines, e.g. Wwise, use it instead
  * of the renderer). Each IAudioOut is an SDL stream on the default device (SDL mixes it with the renderer's); a
- * buffer is copied to the stream when appended and released, with the buffer event, once the device has played
- * past its end. Without a device, buffers are released at the rate they would play.
+ * buffer is copied to the stream when appended and released, with the buffer event, once a playback clock has
+ * passed its end. The clock runs at the sample rate while data is queued (and waits when the queue runs dry), as
+ * the hardware plays: SDL takes data from the stream in large chunks, and releasing on that (all of Wwise's four
+ * buffers at once) left Violet's sound thread waiting for a release forever.
  * Command ids are from the SDK proxies (IAudioOutManager, IAudioOut). */
 #include "../ipc.h"
 #include <SDL3/SDL.h>
@@ -18,7 +20,7 @@ typedef struct AudioOut {
     u32 rate, channels, format, state;  /* state: 0 started, 1 stopped */
     float volume;
     u64 pushed, played;                 /* bytes */
-    u64 start_tick;                     /* without a device: when playing started (QPC) */
+    u64 tick;                           /* when the clock last advanced (QPC) */
     struct { u64 tag, end; } pending[MAX_PENDING];
     int npending;
     u64 released[MAX_PENDING];
@@ -37,13 +39,11 @@ static u32 frame_bytes(AudioOut *a) { return a->channels * (a->format == 5 ? 4 :
 /* with the lock held: how far the device has played; release what it has finished */
 static void update(AudioOut *a) {
     if (a->state != 0) return;
-    if (a->stream) {
-        int q = SDL_GetAudioStreamQueued(a->stream);
-        if (q >= 0) a->played = a->pushed - (u64)q;
-    } else {
-        u64 t = (qpc() - a->start_tick) * a->rate / qpf() * frame_bytes(a);
-        a->played = t < a->pushed ? t : a->pushed;
-    }
+    u64 now = qpc(), frames = (now - a->tick) * a->rate / qpf();
+    if (!frames) return;
+    a->tick += frames * qpf() / a->rate;
+    u64 t = a->played + frames * frame_bytes(a);
+    a->played = t < a->pushed ? t : a->pushed;
     int done = 0;
     while (done < a->npending && a->pending[done].end <= a->played) done++;
     if (!done) return;
@@ -67,6 +67,16 @@ static unsigned __stdcall release_thread(void *p) {
     }
 }
 
+/* --dump-after: each output's state */
+void audout_dump(void) {
+    AcquireSRWLockShared(&outs_lock);
+    for (AudioOut *a = outs; a; a = a->next)
+        hlog(0, "audout: %u Hz x%u, %s, pushed %llu played %llu, SDL queue %d, %d pending, %d released", a->rate,
+             a->channels, a->state ? "stopped" : "started", a->pushed, a->played,
+             a->stream ? SDL_GetAudioStreamQueued(a->stream) : -1, a->npending, a->nreleased);
+    ReleaseSRWLockShared(&outs_lock);
+}
+
 /* ---------------------------------------------------------------------------------------------- IAudioOut */
 #define AO(o) ((AudioOut *)(o)->data)
 
@@ -76,7 +86,7 @@ static void ao_start(SvcObj *o, IpcReq *r) {
     AcquireSRWLockExclusive(&a->lock);
     if (a->state != 0) {
         a->state = 0;
-        a->start_tick = qpc() - a->played / frame_bytes(a) * qpf() / a->rate;
+        a->tick = qpc();
         if (a->stream) SDL_ResumeAudioStreamDevice(a->stream);
     }
     ReleaseSRWLockExclusive(&a->lock);
@@ -127,6 +137,9 @@ static void released(SvcObj *o, IpcReq *r, const IpcBuf *b) {
         ST64(b->addr + 8 * n, a->released[n]);
         n++;
     }
+    /* the rest of the array is zeroed, as the service writes it: the SDK's GetReleasedAudioOutBuffer returns the
+     * first entry without looking at the count (a stale tag there kept Wwise draining "released" buffers forever) */
+    for (u32 k = n; b && (k + 1) * 8 <= b->size; k++) ST64(b->addr + 8 * k, 0);
     memmove(a->released, a->released + n, (size_t)(a->nreleased - (int)n) * 8);
     a->nreleased -= (int)n;
     if (!a->nreleased) event_clear(a->event);

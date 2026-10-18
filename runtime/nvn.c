@@ -767,9 +767,20 @@ static void set_shaders(Ctx *c, u32 stride) {
         }
         ShaderCode *s = shader_intern(data, ctl);
         set.stage[s->stage] = s;
-        set.mask |= 1u << s->stage;
     }
-    for (int i = 0; i < ST_COUNT; i++) set.key = set.key * 31 + (set.stage[i] ? set.stage[i]->hash : 0);
+    p->shaders = shaders_intern(set.stage);
+    RET(1);
+}
+
+/* one Shaders object per combination of stages (pipelines are keyed by it) */
+Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]) {
+    Shaders set;
+    memset(&set, 0, sizeof set);
+    for (int i = 0; i < ST_COUNT; i++) {
+        set.stage[i] = stage[i];
+        if (stage[i]) set.mask |= 1u << i;
+        set.key = set.key * 31 + (stage[i] ? stage[i]->hash : 0);
+    }
     AcquireSRWLockExclusive(&codes.lock);
     Shaders *found = NULL;
     for (u32 i = 0; i < sets.count && !found; i++)
@@ -781,8 +792,7 @@ static void set_shaders(Ctx *c, u32 stride) {
         sets.items[sets.count++] = found;
     }
     ReleaseSRWLockExclusive(&codes.lock);
-    p->shaders = found;
-    RET(1);
+    return found;
 }
 static void program_set_shaders(Ctx *c) { set_shaders(c, 16); }
 static void program_set_shaders_ext(Ctx *c) { set_shaders(c, 24); }
@@ -2009,5 +2019,6 @@ void nvn_init(void) {
         u64 a = sym_lookup(ov[i].sym);
         if (a) dispatch_override(a, ov[i].fn);
     }
+    dispatch_trace_init();
     gpu_init();
 }

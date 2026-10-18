@@ -188,16 +188,21 @@ static SvcObj *storage_new(const void *data, u64 size) {
 
 /* ---------------------------------------------------------------------------------------------- library applets
  * No applet runs: each one finishes as soon as it is started, as if the user cancelled it, and hands back an
- * output storage whose first word is 1 (the "cancelled" result of the Mii editor, keyboard and selectors). */
-typedef struct LibApplet { u32 id, mode; bool started, done; KEvent *state, *popout; bool popped; } LibApplet;
+ * output storage whose first word is 1 (the "cancelled" result of the Mii editor and selectors). The software
+ * keyboard (0x11) instead returns Enter and an ASCII name (NX_PLAYER_NAME, else the account's nickname), since games
+ * ask again when their name prompt is cancelled. Nothing ever arrives on the interactive channel. */
+typedef struct LibApplet { u32 id, mode; bool started, done; KEvent *state, *popout, *interactive; bool popped; } LibApplet;
 
 static void la_destroy(SvcObj *o) { free(o->data); }
 static void la_state_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->state); }
 static void la_popout_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->popout); }
+static void la_interactive_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->interactive); }
+static void la_no_data(SvcObj *o, IpcReq *r) { (void)o; r->result = 0x680; }    /* am: no data */
 static void la_is_completed(SvcObj *o, IpcReq *r) { out_u8(r, ((LibApplet *)o->data)->done); }
 static void la_start(SvcObj *o, IpcReq *r) {
     LibApplet *a = o->data;
-    hlog(1, "am: library applet %#x (mode %u) started: finishes at once, cancelled", a->id, a->mode);
+    hlog(1, "am: library applet %#x (mode %u) started: finishes at once, %s", a->id, a->mode,
+         a->id == 0x11 ? "with Enter" : "cancelled");
     a->started = a->done = true;
     event_signal(a->popout);
     event_signal(a->state);
@@ -211,10 +216,19 @@ static void la_pop_out(SvcObj *o, IpcReq *r) {
     a->popped = true;
     /* the web applets (web, shop, offline web, login, wifi auth, my page) return exactly a 0x1010-byte
      * ReturnValue {u64 exit reason, last URL[0x1000], u64 URL size}: exit reason 1 = back button */
-    bool web = a->id == 0x10 || a->id == 0x11 || (a->id >= 0x17 && a->id <= 0x1a);
+    bool web = a->id == 0x13 || a->id == 0x14 || (a->id >= 0x17 && a->id <= 0x1a);
     u8 out[0x1010] = {0};
     u32 cancelled = 1;
     memcpy(out, &cancelled, 4);
+    if (a->id == 0x11) {
+        /* keyboard: {u32 close result (0 Enter, 1 cancel), UTF-16 text}, 0x7d8 bytes */
+        const char *name = getenv("NX_PLAYER_NAME");
+        if (!name || !*name) name = "Player";
+        memset(out, 0, 4);
+        for (u32 i = 0; name[i] && i < 0x3e0; i++) { out[4 + 2 * i] = (u8)name[i]; out[5 + 2 * i] = 0; }
+        out_object(r, storage_new(out, 0x7d8));
+        return;
+    }
     out_object(r, storage_new(out, web ? 0x1010 : 0x100));
 }
 static void la_false(SvcObj *o, IpcReq *r) { out_u8(r, 0); }
@@ -228,9 +242,9 @@ static const Iface iface_la = {"ILibraryAppletAccessor", (const IpcCmd[]){
     {100, la_push_in, "PushInData"},
     {101, la_pop_out, "PopOutData"},
     {103, la_push_in, "PushInteractiveInData"},
-    {104, la_pop_out, "PopInteractiveOutData"},
+    {104, la_no_data, "PopInteractiveOutData"},
     {105, la_popout_event, "GetPopOutDataEvent"},
-    {106, la_popout_event, "GetPopInteractiveOutDataEvent"},
+    {106, la_interactive_event, "GetPopInteractiveOutDataEvent"},
     {110, la_false, "NeedsToExitProcess"},
     {150, la_result, "RequestForAppletToGetForeground"},
     IPC_END}, la_destroy};
@@ -241,6 +255,7 @@ static void lac_create(SvcObj *o, IpcReq *r) {
     a->mode = in_u32(r, 4);
     a->state = event_create();
     a->popout = event_create();
+    a->interactive = event_create();
     out_object(r, svcobj_new(&iface_la, a, NULL));
 }
 static void lac_create_storage(SvcObj *o, IpcReq *r) {

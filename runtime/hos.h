@@ -206,10 +206,11 @@ const char *sym_name(u64 addr, u64 *offset);        /* nearest symbol at or belo
 /* ---------------------------------------------------------------------------------------------- dispatch */
 void dispatch_init(void);
 void diag_init(void);
-void host_where(void *thread, char *buf, size_t n);
+void host_stack(void *thread);                          /* log a host thread's native stack */
 u64 hostcall_register(const char *name, GuestFn fn);  /* returns the guest address that calls fn */
 GuestFn guest_fn(u64 addr);                            /* lifted function or host call at addr, or NULL */
 void dispatch_override(u64 addr, GuestFn fn);          /* calls through pointers to addr go to fn */
+void dispatch_trace_init(void);                         /* NX_TRACE_CALLS */
 void nvn_init(void);
 void guest_call(Ctx *c, u64 addr);                      /* call_ind without the guest's LR */
 void host_thread_init(Ctx *c);                         /* per host thread: FP state */

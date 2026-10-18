@@ -819,6 +819,34 @@ class Translator:
         self.indent -= 1
         self.emit('}')
 
+    def op_ICMP(self, w, form, pc):
+        """Rd = (Rc cmp 0) ? Ra : Rb"""
+        if form == 'R':
+            b, c = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            b, c = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            b, c = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            b, c = self.op_b_u(w, 'I'), self.R(bits(w, 39, 8))
+        cmp = self.icmp(bits(w, 49, 3), c, '0u', bits(w, 48, 1))
+        self.set_r(bits(w, 0, 8), '(%s ? %s : %s)' % (cmp.replace('int(0u)', '0'), self.R(bits(w, 8, 8)), b))
+
+    def op_R2P(self, w, form, pc):
+        """predicates P0-P6 from the bits of one byte of Ra, where the mask (operand B) has ones"""
+        if bits(w, 40, 1):
+            raise Unsupported('R2P.CC')
+        if form != 'I':
+            raise Unsupported('R2P with a register mask')
+        mask, sh = bits(w, 20, 7), bits(w, 41, 2) * 8
+        self.emit('{ uint v_ = %s;' % self.R(bits(w, 8, 8)))
+        self.indent += 1
+        for p in range(7):
+            if mask >> p & 1:
+                self.set_p(p, '((v_ >> %du) & 1u) != 0u' % (sh + p))
+        self.indent -= 1
+        self.emit('}')
+
     def op_POPC(self, w, form, pc):
         b = self.op_b_u(w, form)
         self.set_r(bits(w, 0, 8), 'uint(bitCount(%s))' % ('~%s' % b if bits(w, 40, 1) else b))
@@ -1067,7 +1095,7 @@ class Translator:
 
     def op_LDG(self, w, form, pc):
         d, size = bits(w, 0, 8), bits(w, 48, 3)
-        n = {4: 1, 5: 2, 6: 4}.get(size)
+        n = {4: 1, 5: 2, 6: 4, 7: 4}.get(size)     # 7: 128 bits, not assumed 16-byte aligned
         if n is None:
             raise Unsupported('LDG size %d' % size)
         self.emit('{ uint64_t ga_ = %s;' % self.global_addr(w))

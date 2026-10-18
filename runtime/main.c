@@ -17,12 +17,28 @@
 #include <process.h>
 
 static char game_dir[1024], image_dir[1024], save_dir[1024];
+void audout_dump(void);
 static int dump_after;                                  /* seconds; then print every thread's state and exit */
 
 static unsigned __stdcall dump_thread(void *p) {
     Sleep((DWORD)dump_after * 1000);
     hlog(0, "--dump-after %d: thread states", dump_after);
     kernel_dump_threads();
+    audout_dump();
+    /* NX_DUMP_MEM=addr:len,...: hex dumps of guest memory (16 bytes a line); *addr dumps where the pointer at addr
+     * points */
+    for (const char *e = getenv("NX_DUMP_MEM"); e && *e;) {
+        char *end;
+        bool deref = *e == '*';
+        u64 a = strtoull(e + deref, &end, 16), n = *end == ':' ? strtoull(end + 1, &end, 16) : 0x40;
+        if (deref) a = mem_is_free(a, 8) ? 0 : *(const u64 *)(uintptr_t)a;
+        hlog(0, "mem dump at %llx:", a);
+        for (u64 o = 0; o < n && !mem_is_free(a + o, 16); o += 16) {
+            const u32 *w = (const u32 *)(uintptr_t)(a + o);
+            hlog(0, "mem %llx: %08x %08x %08x %08x", a + o, w[0], w[1], w[2], w[3]);
+        }
+        e = *end == ',' ? end + 1 : end + strlen(end);
+    }
     fatal("stopped after %d seconds", dump_after);
 }
 

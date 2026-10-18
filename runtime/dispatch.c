@@ -67,6 +67,42 @@ void dispatch_override(u64 addr, GuestFn fn) {
     }
 }
 
+/* NX_TRACE_CALLS=addr,...: calls through pointers to those guest addresses are logged (x0-x3, the caller; then the
+ * result), the first 40 of each. Direct calls (BL) are not seen. */
+static struct { u64 addr; GuestFn orig; volatile long n; } traced[16];
+static int ntraced;
+static void trace_call(Ctx *c) {
+    u64 a = c->pc;
+    int i = 0;
+    while (i < ntraced && traced[i].addr != a) i++;
+    if (i == ntraced) guest_trap(c, "traced call to an unknown address", a);
+    long n = InterlockedIncrement(&traced[i].n);
+    char b[160], l[160];
+    if (n <= 40)
+        hlog(1, "call %s (x0 %llx x1 %llx x2 %llx x3 %llx) from %s", describe_addr(a, b, sizeof b), c->x[0], c->x[1],
+             c->x[2], c->x[3], describe_addr(c->x[30], l, sizeof l));
+    u64 x1 = c->x[1];
+    traced[i].orig(c);
+    if (n <= 40)                                        /* and the word at x1, often an output */
+        hlog(1, "  %s -> %llx; [x1] %08x", describe_addr(a, b, sizeof b), c->x[0],
+             mem_is_free(x1 & ~3ull, 4) ? 0 : *(const u32 *)(uintptr_t)(x1 & ~3ull));
+}
+void dispatch_trace_init(void) {
+    for (const char *e = getenv("NX_TRACE_CALLS"); e && *e && ntraced < 16;) {
+        char *end;
+        u64 a = strtoull(e, &end, 16);
+        GuestFn f = guest_fn(a);
+        if (f) {
+            traced[ntraced].addr = a;
+            traced[ntraced++].orig = f;
+            dispatch_override(a, trace_call);
+        } else {
+            hlog(0, "NX_TRACE_CALLS: no lifted function at %llx", a);
+        }
+        e = *end == ',' ? end + 1 : end + strlen(end);
+    }
+}
+
 void call_ind(Ctx *c, u64 addr) {
     GuestFn f = guest_fn(addr);
     c->pc = addr;                      /* host calls shared by several addresses tell them apart by it */
@@ -283,29 +319,37 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     fatal("crashed");
 }
 
-/* the lifted function a host thread is executing (suspends it briefly) */
-void host_where(void *thread, char *buf, size_t n) {
+/* a host thread's whole native stack (suspends it, unwinds with the x64 unwind tables): where a thread blocked in
+ * host code (a service, a lock) is waiting */
+void host_stack(void *thread) {
     HANDLE h = (HANDLE)thread;
     CONTEXT ctx = {0};
-    ctx.ContextFlags = CONTEXT_CONTROL;
-    snprintf(buf, n, "?");
+    ctx.ContextFlags = CONTEXT_FULL;
     if (SuspendThread(h) == (DWORD)-1) return;
     if (GetThreadContext(h, &ctx)) {
         char sb[sizeof(SYMBOL_INFO) + 256];
         SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
-        memset(sb, 0, sizeof sb);
-        si->SizeOfStruct = sizeof(SYMBOL_INFO);
-        si->MaxNameLen = 255;
-        DWORD64 disp = 0;
-        u64 gpc = guest_pc_of(ctx.Rip);
-        char b[160];
-        if (gpc) {
-            snprintf(buf, n, "%s", describe_addr(gpc, b, sizeof b));
-        } else if (SymFromAddr(GetCurrentProcess(), ctx.Rip, &disp, si)) {
-            if (!strncmp(si->Name, "f_", 2) || !strncmp(si->Name, "b_", 2))
-                snprintf(buf, n, "%s", describe_addr(strtoull(si->Name + 2, NULL, 16), b, sizeof b));
-            else
-                snprintf(buf, n, "%s+%llx", si->Name, (unsigned long long)disp);
+        for (int i = 0; i < 32 && ctx.Rip; i++) {
+            memset(sb, 0, sizeof sb);
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            u64 gpc = guest_pc_of(ctx.Rip);
+            char b[160];
+            if (gpc) hlog(0, "  host %2d: guest %s", i, describe_addr(gpc, b, sizeof b));
+            else if (SymFromAddr(GetCurrentProcess(), ctx.Rip, &disp, si))
+                hlog(0, "  host %2d: %s+%llx", i, si->Name, (unsigned long long)disp);
+            else hlog(0, "  host %2d: %llx", i, (unsigned long long)ctx.Rip);
+            DWORD64 base = 0;
+            RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+            if (!rf) {                                  /* a leaf function: the return address is at rsp */
+                ctx.Rip = *(DWORD64 *)ctx.Rsp;
+                ctx.Rsp += 8;
+                continue;
+            }
+            void *hd = NULL;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &frame, NULL);
         }
     }
     ResumeThread(h);

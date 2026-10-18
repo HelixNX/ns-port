@@ -414,8 +414,10 @@ u32 condvar_wait(u64 mutex, u64 key, u32 tag, s64 timeout_ns) {
     if (mutex & 3) return R_INVALID_ADDRESS;
     KThread *t = cur_thread;
     klock();
-    mutex_release(mutex);
+    /* the key's "has waiters" flag first: the SDK's Signal skips the SVC while the key is 0, and the mutex, once
+     * released, can be taken in user mode (no kernel lock) by a signaller that would then miss this waiter */
     st_user(key, 1);
+    mutex_release(mutex);
     if (timeout_ns == 0) {
         kunlock();
         return R_TIMED_OUT;
@@ -669,6 +671,9 @@ void event_clear(KEvent *e) {
 void kernel_dump_threads(void) {
     static const char *const kinds[] = {"running", "WaitSynchronization", "mutex", "condition variable",
                                         "address arbiter", "sleep"};
+    void *run[16];
+    const char *run_names[16];
+    int nrun = 0;
     AcquireSRWLockShared(&klk);
     for (KThread *t = threads; t; t = t->next) {
         if (t->exited) continue;
@@ -677,17 +682,27 @@ void kernel_dump_threads(void) {
              t->cur_core, t->affinity, t->started ? "" : "not started, ",
              t->ready ? "waiting for a core" : t->preempted ? "preempted" : kinds[t->wait < 6 ? t->wait : 0],
              t->wait_addr, t->cv_key, describe_addr(t->ctx->x[30], b, sizeof b));
-        if (t->host && t->wait == W_NONE && !t->ready && !t->preempted) {                  /* running: where it is now, five samples */
-            char where[5][128];
-            for (int k = 0; k < 5; k++) {
-                host_where(t->host, where[k], sizeof where[k]);
-                Sleep(20);
-            }
-            hlog(0, "  now in %s | %s | %s | %s | %s", where[0], where[1], where[2], where[3], where[4]);
+        if (t->wait == W_MUTEX && t->wait_addr) {           /* the owner, from the handle in the mutex word */
+            u32 owner = ld_user(t->wait_addr) & ~WAIT_MASK;
+            KObj *o = handle_get(owner, KO_THREAD);
+            KThread *ot = o ? (KThread *)((char *)o - offsetof(KThread, obj)) : NULL;
+            hlog(0, "  mutex word %08x: owner %s", ld_user(t->wait_addr), ot ? ot->name : "(no such thread)");
+            if (o) kobj_unref(o);
+        }
+        if (t->host && t->wait == W_NONE && !t->ready && !t->preempted && nrun < 16) {
+            run_names[nrun] = t->name;
+            run[nrun++] = t->host;
         }
         dump_ctx(t->ctx);
     }
     ReleaseSRWLockShared(&klk);
+    /* the running threads, sampled without the kernel lock (holding it would stop each at its next SVC) */
+    for (int i = 0; i < nrun; i++)
+        for (int k = 0; k < 4; k++) {
+            hlog(0, "%s running, sample %d:", run_names[i], k);
+            host_stack(run[i]);
+            Sleep(37);
+        }
 }
 
 void kernel_init(void) {}

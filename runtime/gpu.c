@@ -739,7 +739,8 @@ typedef struct State {
     u32 nattribs;
     VertexStreamState streams[32];
     u32 nstreams;
-    Shaders *program;
+    Shaders *program;                   /* the graphics shaders bound for each stage, as one interned set */
+    ShaderCode *bound[ST_COUNT];        /* by stage; compute is bound independently of the graphics stages */
     BufferRange vbuf[32];
     BufferRange ubo[ST_COUNT][18], ssbo[ST_COUNT][16];
     u64 tex[ST_COUNT][32], img[ST_COUNT][8];
@@ -1551,12 +1552,14 @@ static bool trace_frame(void) {
     return lo >= 0 && f >= lo && f <= hi;
 }
 
+/* skipped draws by reason (the reasons are string literals), reported with the statistics every 600 frames */
+static const char *skip_why[16];
+static u64 skip_count[16];
+static int nskip_why;
 static void skip_draw(const char *why) {
     draws_skipped++;
-    static const char *seen[16];
-    static int n;
-    for (int i = 0; i < n; i++) if (seen[i] == why) return;
-    if (n < 16) seen[n++] = why;
+    for (int i = 0; i < nskip_why; i++) if (skip_why[i] == why) { skip_count[i]++; return; }
+    if (nskip_why < 16) { skip_count[nskip_why] = 1; skip_why[nskip_why++] = why; }
     hlog(1, "gpu: draw skipped: %s", why);
 }
 
@@ -1904,7 +1907,7 @@ static void draw(u32 op, const void *payload) {
 }
 
 /* ---- compute */
-static u64 pr_hash(void) { return st.program && st.program->stage[ST_COMPUTE] ? st.program->stage[ST_COMPUTE]->hash : 0; }
+static u64 pr_hash(void) { return st.bound[ST_COMPUTE] ? st.bound[ST_COMPUTE]->hash : 0; }
 typedef struct CPipe { VkShaderModule m; VkPipeline pipe; struct CPipe *next; } CPipe;
 static CPipe *cpipes;
 
@@ -1919,9 +1922,9 @@ static void dispatch(u32 op, const u8 *pay) {
             if (st.ssbo[ST_COMPUTE][i].addr) o += snprintf(b + o, sizeof b - o, " s%u:%llx+%llx", i, st.ssbo[ST_COMPUTE][i].addr, st.ssbo[ST_COMPUTE][i].size);
         hlog(0, "dispatch %llu: cs %016llx%s", dispatches, pr_hash(), b);
     }
-    Shaders *pr = st.program;
-    if (!pr || !pr->stage[ST_COMPUTE]) { skip_draw("dispatch without a compute shader"); return; }
-    VkShaderModule m = shader_module(pr->stage[ST_COMPUTE]);
+    ShaderCode *cs = st.bound[ST_COMPUTE];
+    if (!cs) { skip_draw("dispatch without a compute shader"); return; }
+    VkShaderModule m = shader_module(cs);
     if (!m) { skip_draw("shader not translated"); return; }
     CPipe *cp;
     for (cp = cpipes; cp && cp->m != m; cp = cp->next) {}
@@ -1932,7 +1935,7 @@ static void dispatch(u32 op, const u8 *pay) {
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                       .module = m, .pName = "main"}, .layout = layout_gfx};
         if (vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, &cp->pipe) != VK_SUCCESS)
-            hlog(0, "gpu: compute pipeline for %016llx failed", pr->stage[ST_COMPUTE]->hash);
+            hlog(0, "gpu: compute pipeline for %016llx failed", cs->hash);
         cp->next = cpipes;
         cpipes = cp;
     }
@@ -1946,7 +1949,7 @@ static void dispatch(u32 op, const u8 *pay) {
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     VkWriteDescriptorSet w[16];
     VkDescriptorBufferInfo bi[16];
-    int nw = stage_ubos(ST_COMPUTE, 0, pr->stage[ST_COMPUTE], w, bi);
+    int nw = stage_ubos(ST_COMPUTE, 0, cs, w, bi);
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 0, nw, w);
     VkDescriptorSet sets[2] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 1, 2, sets, 0, NULL);
@@ -1997,10 +2000,20 @@ static void run(u64 at, int depth) {
             memcpy(st.streams, pay + 4, 8 * st.nstreams);
             break;
         }
-        case OP_PROGRAM: {
+        case OP_PROGRAM: {              /* binds the program's shaders for the given stages only */
             u64 s;
+            u32 stages;
             memcpy(&s, pay, 8);
-            st.program = (Shaders *)(uintptr_t)s;
+            memcpy(&stages, pay + 8, 4);
+            const Shaders *pr = (const Shaders *)(uintptr_t)s;
+            for (int i = 0; i < ST_COUNT; i++)
+                if (stages >> i & 1) st.bound[i] = pr ? pr->stage[i] : NULL;
+            if (!(stages & 0x1f)) break;
+            ShaderCode *gfx[ST_COUNT];
+            memcpy(gfx, st.bound, sizeof gfx);
+            gfx[ST_COMPUTE] = NULL;
+            /* usually exactly the program's own stages end up bound: its set needs no lookup */
+            st.program = pr && !memcmp(pr->stage, gfx, sizeof gfx) ? (Shaders *)pr : shaders_intern(gfx);
             break;
         }
         case OP_VERTEX_BUFFERS: case OP_UNIFORM_BUFFERS: case OP_STORAGE_BUFFERS: {
@@ -2476,6 +2489,7 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     u64 frames = ++frame_no;
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
+    for (int i = 0; frames % 600 == 0 && i < nskip_why; i++) hlog(1, "gpu:   %llu skipped: %s", skip_count[i], skip_why[i]);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */

@@ -141,6 +141,7 @@ typedef struct ShaderCode {
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
 enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2 };
 typedef struct Shaders { ShaderCode *stage[ST_COUNT]; u32 mask; u64 key; } Shaders;
+Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]);   /* the one Shaders object for these stages */
 
 /* ---------------------------------------------------------------------------------------------- windows, syncs */
 typedef struct Window {
