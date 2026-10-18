@@ -180,6 +180,8 @@ void services_init(const char *game_dir, const char *save_dir) {
     bcat_register();
     system_register();
     audout_register();
+    hwopus_register();
+    offline_register();
     fs_register(game_dir, save_dir);
 }
 
@@ -192,6 +194,11 @@ static void dispatch(SvcObj *o, IpcReq *r) {
         }
     if (o->iface != &iface_stub) hlog(0, "%s: command %u is not implemented", o->name, r->cmd);
     ipc_stub(o, r);
+    /* the command may open a sub-interface: answer with a stub object, which a caller that expects none ignores
+     * (an extra domain id or moved handle); without it, the caller's proxy would use a null object */
+    char name[48];
+    snprintf(name, sizeof name, "%.36s#%u", o->name, r->cmd);
+    out_object(r, svcobj_new(&iface_stub, NULL, name));
 }
 
 /* ---------------------------------------------------------------------------------------------- HIPC */

@@ -1,5 +1,6 @@
-/* pctl: parental controls, never restricting. aoc:u: add-on content, none installed. */
+/* pctl: parental controls, never restricting. aoc:u: add-on content: the indices game.json lists as owned. */
 #include "../ipc.h"
+#include "game_config.h"
 
 static KEvent *sync_event, *play_timer_event, *aoc_event;
 
@@ -40,20 +41,32 @@ static const Iface iface_pctl = {"pctl", (const IpcCmd[]){
 static SvcObj *open_pctl(const char *name) { return svcobj_new(&iface_pctl, NULL, name); }
 
 /* ---------------------------------------------------------------------------------------------- aoc:u */
-static void aoc_count(SvcObj *o, IpcReq *r) { out_u32(r, 0); }
-static void aoc_base_id(SvcObj *o, IpcReq *r) { out_u64(r, 0x0100152000023000ull); }   /* program id + 0x1000 */
+static const u32 dlc[] = NX_DLC_INDICES;
+static void aoc_count(SvcObj *o, IpcReq *r) { out_u32(r, NX_DLC_COUNT); }
+/* List(u32 offset, u32 count[, pid]) -> B: u32 indices; replies how many were written */
+static void aoc_list(SvcObj *o, IpcReq *r) {
+    u32 off = in_u32(r, 0), max = in_u32(r, 4), n = 0;
+    const IpcBuf *b = buf_out(r, 0);
+    for (u32 i = off; b && i < NX_DLC_COUNT && n < max && (n + 1) * 4 <= b->size; i++, n++) ST32(b->addr + 4 * n, dlc[i]);
+    out_u32(r, n);
+}
+static void aoc_base_id(SvcObj *o, IpcReq *r) { out_u64(r, (NX_TITLE_ID & ~0xfffull) + 0x1000); }  /* program id + 0x1000 */
 static void aoc_event_cmd(SvcObj *o, IpcReq *r) { out_event(r, aoc_event); }
 
 static const Iface iface_aoc = {"aoc:u", (const IpcCmd[]){
     {0, aoc_count, "CountAddOnContentByApplicationId"},
-    {1, aoc_count, "ListAddOnContentByApplicationId"},
+    {1, aoc_list, "ListAddOnContentByApplicationId"},
     {2, aoc_count, "CountAddOnContent"},
-    {3, aoc_count, "ListAddOnContent"},
+    {3, aoc_list, "ListAddOnContent"},
     {4, aoc_base_id, "GetAddOnContentBaseIdByApplicationId"},
     {5, aoc_base_id, "GetAddOnContentBaseId"},
     {6, ipc_noop, "PrepareAddOnContentByApplicationId"},
     {7, ipc_noop, "PrepareAddOnContent"},
     {8, aoc_event_cmd, "GetAddOnContentListChangedEvent"},
+    {10, aoc_event_cmd, "GetAddOnContentListChangedEventWithProcessId"},
+    {11, ipc_noop, "NotifyMountAddOnContent"},
+    {12, ipc_noop, "NotifyUnmountAddOnContent"},
+    {50, ipc_noop, "CheckAddOnContentMountStatus"},
     IPC_END}, NULL};
 
 static SvcObj *open_aoc(const char *name) { return svcobj_new(&iface_aoc, NULL, name); }

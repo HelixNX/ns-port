@@ -110,6 +110,8 @@ void ldn_register(void);
 void bcat_register(void);
 void system_register(void);
 void audout_register(void);
+void hwopus_register(void);
+void offline_register(void);
 void fs_register(const char *game_dir, const char *save_dir);
 
 #endif

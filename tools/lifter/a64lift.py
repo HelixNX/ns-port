@@ -22,6 +22,7 @@ import collections
 import io
 import json
 import os
+import pickle
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,10 +51,28 @@ class Mod:
 
     def __init__(self, name, elf=None, ida=None):
         self.name = name
-        self.m = Module(elf or os.path.join(gamecfg.ELF, name + '.elf'))
-        ida = json.load(open(ida or os.path.join(gamecfg.ANALYSIS, name + '_ida.json')))
+        elf = elf or os.path.join(gamecfg.ELF, name + '.elf')
+        ida = ida or os.path.join(gamecfg.ANALYSIS, name + '_ida.json')
+        self.m = Module(elf)
         self.base = BASES[name]
         self.text = self.m.text
+        # the analysis below takes minutes for a large module: cached, keyed by its inputs and this source
+        key = repr([(p, os.path.getsize(p), os.path.getmtime(p)) for p in (elf, ida, __file__)])
+        cache = os.path.join(gamecfg.BUILD, 'modcache', name + '.pickle')
+        try:
+            with open(cache, 'rb') as f:
+                k, state = pickle.load(f)
+            if k == key:
+                self.__dict__.update(state)
+                return
+        except (OSError, EOFError, pickle.UnpicklingError, ValueError):
+            pass
+        self.analyse(json.load(open(ida)))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, 'wb') as f:
+            pickle.dump((key, {k: v for k, v in self.__dict__.items() if k != 'm'}), f, pickle.HIGHEST_PROTOCOL)
+
+    def analyse(self, ida):
         data = set()
         for s, e in ida['text_data']:
             data.update(range(s & ~3, e, 4))

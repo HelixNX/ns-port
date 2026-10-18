@@ -78,6 +78,8 @@ static const Iface iface_acc = {"acc:u0", (const IpcCmd[]){
     {101, acc_manager, "GetBaasAccountManagerForApplication"},
     {110, ipc_noop, "StoreSaveDataThumbnail"},
     {111, ipc_noop, "ClearSaveDataThumbnail"},
+    {150, acc_false, "IsUserAccountSwitchLocked"},
+    {160, ipc_noop, "InitializeApplicationInfoV2"},
     IPC_END}, NULL};
 
 static SvcObj *open_acc(const char *name) { return svcobj_new(&iface_acc, NULL, name); }

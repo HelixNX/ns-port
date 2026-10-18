@@ -18,7 +18,7 @@ set(NX_RUNTIME_SOURCES
     main.c loader.c dispatch.c mem.c kernel.c kmem.c svc.c ipc.c
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
-    services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/fs.c romfs.c
+    services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
     nvn.c gpu.c tex.c vk.c astc.c input.c movie.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
@@ -33,6 +33,19 @@ function(nx_game)
     string(JSON title_id GET "${json}" title_id)
     string(JSON dump GET "${json}" dump)
     string(JSON build GET "${json}" build)
+    # owned add-on content (DLC) indices, e.g. "dlc": [1]
+    set(NX_DLC "")
+    string(JSON ndlc ERROR_VARIABLE no_dlc LENGTH "${json}" dlc)
+    if(NOT no_dlc AND ndlc GREATER 0)
+        math(EXPR last "${ndlc} - 1")
+        foreach(i RANGE ${last})
+            string(JSON d GET "${json}" dlc ${i})
+            list(APPEND NX_DLC "${d}")
+        endforeach()
+    endif()
+    list(LENGTH NX_DLC NX_DLC_COUNT)
+    list(APPEND NX_DLC 0)                               # a C array may not be empty
+    list(JOIN NX_DLC ", " NX_DLC)
     get_filename_component(dump "${dump}" ABSOLUTE BASE_DIR "${game_dir}")
     get_filename_component(build "${build}" ABSOLUTE BASE_DIR "${game_dir}")
     # the executable finds the dump relative to itself, as the image and save folders
@@ -45,6 +58,8 @@ function(nx_game)
 #define NX_TITLE "@NX_TITLE@"
 #define NX_TITLE_ID @NX_TITLE_ID@
 #define NX_GAME_DIR "@NX_GAME_DIR@"
+#define NX_DLC_COUNT @NX_DLC_COUNT@
+#define NX_DLC_INDICES {@NX_DLC@}
 ]] @ONLY)
 
     set(LIFTED_DIR "${build}/lifted" CACHE PATH "C sources written by tools/lifter/a64lift.py")

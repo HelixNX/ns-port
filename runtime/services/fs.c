@@ -19,7 +19,7 @@ bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size);
 #define R_FS_TARGET_NOT_FOUND  FS_RES(1002)
 #define R_FS_INVALID_ARGUMENT  FS_RES(6001)
 
-static char save_root[1024], sysdata_root[1024];
+static char save_root[1024], sysdata_root[1024], aoc_root[1024];
 static RomFs *game_romfs;
 
 /* ---------------------------------------------------------------------------------------------- IStorage (RomFS) */
@@ -307,8 +307,14 @@ static RomFs *open_sysdata(u64 id) {
     for (int i = 0; i < nsysdata; i++)
         if (sysdata_ids[i] == id) return sysdata[i];
     char dir[1100];
-    snprintf(dir, sizeof dir, "%s/%016llx", sysdata_root, id);
-    RomFs *fs = romfs_open(dir);
+    /* add-on content: the DLC's data extracted to <dump>/aoc/<data id>/ */
+    snprintf(dir, sizeof dir, "%s/%016llx", aoc_root, id);
+    RomFs *fs = GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES ? romfs_open(dir) : NULL;
+    if (fs) hlog(1, "fs: add-on content %016llx from %s", id, dir);
+    if (!fs) {
+        snprintf(dir, sizeof dir, "%s/%016llx", sysdata_root, id);
+        fs = romfs_open(dir);
+    }
     if (!fs) {
         bool made = false;
         for (size_t i = 0; i < sizeof placeholders / sizeof *placeholders; i++) {
@@ -373,6 +379,7 @@ void fs_register(const char *game_dir, const char *save_dir) {
     snprintf(romfs_dir, sizeof romfs_dir, "%s/romfs", game_dir);
     snprintf(save_root, sizeof save_root, "%s", save_dir);
     snprintf(sysdata_root, sizeof sysdata_root, "%s/../sysdata", save_dir);
+    snprintf(aoc_root, sizeof aoc_root, "%s/aoc", game_dir);
     game_romfs = romfs_open(romfs_dir);
     if (!game_romfs) hlog(0, "fs: no RomFS at %s", romfs_dir);
     service_register("fsp-srv", open_fsp);
