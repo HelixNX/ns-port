@@ -678,6 +678,50 @@ void event_clear(KEvent *e) {
 }
 
 /* every guest thread: what it waits for, and its backtrace as of its last call or SVC */
+/* every 600 frames: frames per second, and the share of one host core each busy guest thread used since the last
+ * report (a thread near 100% is what holds the frame rate) */
+void kernel_report_cpu(u64 frames) {
+    static LARGE_INTEGER last_t;
+    static u64 last_frames;
+    static struct { KThread *t; u64 cpu; } prev[128];
+    static int nprev;
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    double wall = last_t.QuadPart ? (double)(now.QuadPart - last_t.QuadPart) / (double)f.QuadPart : 0;
+    char line[1024];
+    int n = 0;
+    struct { const char *name; double pct; } busy[128];
+    int nb = 0;
+    AcquireSRWLockShared(&klk);
+    for (KThread *t = threads; t; t = t->next) {
+        FILETIME c0, e0, k, u;
+        if (!t->host || !GetThreadTimes(t->host, &c0, &e0, &k, &u)) continue;
+        u64 cpu = ((u64)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((u64)u.dwHighDateTime << 32 | u.dwLowDateTime);
+        int i = 0;
+        while (i < nprev && prev[i].t != t) i++;
+        if (i == nprev && nprev < 128) prev[nprev++] = (typeof(prev[0])){t, cpu};
+        else if (i < nprev) {
+            double pct = wall > 0 ? (double)(cpu - prev[i].cpu) / 1e7 / wall * 100 : 0;
+            prev[i].cpu = cpu;
+            if (pct >= 5 && nb < 128) busy[nb++] = (typeof(busy[0])){t->name, pct};
+        }
+    }
+    const char *pn = getenv("NX_PROFILE");                /* NX_PROFILE: dispatch.c */
+    for (KThread *t = threads; pn && t; t = t->next)
+        if (!strcmp(t->name, pn) && t->host) profile_start(t->host);
+    ReleaseSRWLockShared(&klk);
+    profile_report();
+    if (wall > 0) {
+        n += snprintf(line + n, sizeof line - n, "cpu: %.1f fps; threads", (double)(frames - last_frames) / wall);
+        for (int i = 0; i < nb && n < (int)sizeof line - 40; i++)
+            n += snprintf(line + n, sizeof line - n, " %s %.0f%%", busy[i].name, busy[i].pct);
+        hlog(0, "%s", line);
+    }
+    last_t = now;
+    last_frames = frames;
+}
+
 void kernel_dump_threads(void) {
     static const char *const kinds[] = {"running", "WaitSynchronization", "mutex", "condition variable",
                                         "address arbiter", "sleep"};

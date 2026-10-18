@@ -145,6 +145,9 @@ typedef struct KThread {
 extern __declspec(thread) KThread *cur_thread;
 void kernel_init(void);
 void kernel_dump_threads(void);
+void kernel_report_cpu(u64 frames);                    /* fps and busy threads */
+void profile_start(void *host);                         /* dispatch.c: NX_PROFILE */
+void profile_report(void);
 void dump_mem_env(void);                               /* main.c: NX_DUMP_MEM */
 void klock(void);
 void kunlock(void);

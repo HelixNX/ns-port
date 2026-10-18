@@ -592,6 +592,17 @@ static VkImageViewType view_type(u32 target) {
     }
 }
 
+/* the layers a view covers (none given: all from its first). A 3D image drawn into is seen as a 2D array of its
+ * depth slices from the view's first: a shader that writes no layer draws into that slice, one that writes
+ * gl_Layer picks among them (color grading LUTs drawn one slice per instance) */
+static u32 view_layers(const Image *im, const ViewInfo *v, u32 kind, u32 *base) {
+    bool slices = kind == VIEW_ATTACHMENT && im->info.target == TEX_3D;
+    u32 n = slices ? tex_depth(&im->info) >> v->base_level : im->layers;
+    if (!n) n = 1;
+    *base = v->min_layer < n ? v->min_layer : 0;
+    return v->num_layers && *base + v->num_layers <= n && !slices ? v->num_layers : n - *base;
+}
+
 static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     for (int i = 0; i < im->nviews; i++)
         if (im->views[i].kind == kind && !memcmp(&im->views[i].v, v, sizeof *v)) return im->views[i].view;
@@ -600,11 +611,7 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .format = fmt};
     u32 base_level = v->base_level < im->levels ? v->base_level : im->levels - 1;
     u32 nlevels = v->num_levels && base_level + v->num_levels <= im->levels ? v->num_levels : im->levels - base_level;
-    /* a 3D image drawn into is seen as a 2D array of its depth slices (the view's layers pick slices) */
-    u32 nl_img = kind == VIEW_ATTACHMENT && im->info.target == TEX_3D ? tex_depth(&im->info) >> v->base_level : im->layers;
-    if (!nl_img) nl_img = 1;
-    u32 base_layer = v->min_layer < nl_img ? v->min_layer : 0;
-    u32 nlayers = v->num_layers && base_layer + v->num_layers <= nl_img ? v->num_layers : nl_img - base_layer;
+    u32 base_layer, nlayers = view_layers(im, v, kind, &base_layer);
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     if (kind == VIEW_ATTACHMENT) {
         bool is3d = im->info.target == TEX_3D;
@@ -778,6 +785,10 @@ typedef struct State {
     VkRect2D area;
     VkFormat rt_format[8], depth_format, stencil_format;     /* of the rendering in progress */
     u32 samples;
+    BufferRange xfb[4];                 /* transform feedback buffers, the bytes captured into each since bound */
+    u64 xfb_written[4];
+    bool xfb_active;                    /* between Begin (or Resume) and End (or Pause) */
+    bool xfb_captured;                  /* a draw captured since the last barrier */
 } State;
 
 static State st;                        /* the GPU's state carries over between command buffers, as on NVN */
@@ -816,13 +827,16 @@ static void watch(const char *what, const TexRef *r) {
          r->t.height, r->t.depth, r->v.format, r->t.target, r->v.base_level, r->v.min_layer, r->v.num_layers);
 }
 
-static VkImageView rt_view(const TexRef *r, Image **out, u32 *level) {
+/* a render target's view, its image, level and layer count (layered rendering: gl_Layer picks among them) */
+static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *layers) {
     watch("render target", r);
     ViewInfo v;
     Image *im = image_ref(r, &v);
     if (out) *out = im;
     if (level) *level = v.base_level;
     if (!im) return NULL;
+    u32 base;
+    if (layers) *layers = view_layers(im, &v, VIEW_ATTACHMENT, &base);
     return image_view(im, &v, VIEW_ATTACHMENT);
 }
 
@@ -837,8 +851,8 @@ static bool begin_rendering(void) {
     for (u32 i = 0; i < st.nrt; i++) {
         color[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         Image *im;
-        u32 l;
-        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l) : NULL;
+        u32 l, nl;
+        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &nl) : NULL;
         if (!v) continue;
         color[i].imageView = v;
         st.rt_format[i] = usable_format(st.rt[i].v.format) != VK_FORMAT_UNDEFINED ? usable_format(st.rt[i].v.format) : im->format;
@@ -849,7 +863,6 @@ static bool begin_rendering(void) {
         u32 iw = im->info.width >> l, ih = tex_height(&im->info) >> l;
         if (iw < w) w = iw ? iw : 1;
         if (ih < h) h = ih ? ih : 1;
-        u32 nl = st.rt[i].v.num_layers ? st.rt[i].v.num_layers : 1;
         if (nl < layers) layers = nl;
         im->valid = true;
         im->rt_frame = frame_no + 1;
@@ -859,8 +872,8 @@ static bool begin_rendering(void) {
     bool has_d = false, has_s = false;
     if (st.has_depth) {
         Image *im;
-        u32 l;
-        VkImageView v = rt_view(&st.depth, &im, &l);
+        u32 l, nl;
+        VkImageView v = rt_view(&st.depth, &im, &l, &nl);
         if (v) {
             depth.imageView = v;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -874,7 +887,6 @@ static bool begin_rendering(void) {
             u32 iw = im->info.width >> l, ih = tex_height(&im->info) >> l;
             if (iw < w) w = iw ? iw : 1;
             if (ih < h) h = ih ? ih : 1;
-            u32 nl = st.depth.v.num_layers ? st.depth.v.num_layers : 1;
             if (nl < layers) layers = nl;
             im->valid = true;
             im->rt_frame = frame_no + 1;
@@ -1444,6 +1456,7 @@ static VkShaderModule shader_module(ShaderCode *s) {
     for (long i = 5; i < n / 4;) {      /* what the shader touches: PhysicalStorageBufferAddresses, sampled images */
         u32 op = code[i] & 0xffff, wc = code[i] >> 16;
         if (op == 17 && wc == 2 && code[i + 1] == 5347) s->caps |= SHC_GLOBAL;
+        if (op == 17 && wc == 2 && code[i + 1] == 53) s->caps |= SHC_XFB;         /* TransformFeedback */
         if (op == 27) s->caps |= SHC_TEXTURE;
         if (op == 25 && wc >= 9 && code[i + 7] == 2) s->caps |= SHC_IMAGE;     /* OpTypeImage, Sampled = 2: storage */
         i += wc ? wc : 1;
@@ -1786,7 +1799,72 @@ static bool quad_indices(const CmdDraw *d, bool indexed, VkBuffer *buf, u64 *off
     return true;
 }
 
+/* Transform feedback (GPU skinning: point draws whose vertex outputs become later draws' vertex buffers). Captures
+ * begin and end around each draw, since pipelines cannot change while one is active; each buffer continues from the
+ * bytes captured so far, counted here from the draw (indirect draws are not counted). */
+static bool xfb_capturing;
+
+static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
+    const ShaderCode *vs = st.program ? st.program->stage[ST_VERTEX] : NULL;
+    if (!st.xfb_active || !vs || !(vs->caps & SHC_XFB)) return;     /* the translation carries the layout */
+    VkBuffer bufs[4];
+    VkDeviceSize offs[4], sizes[4];
+    u32 n = 0, used = 4;
+    for (u32 b = 0; b < 4; b++) {
+        u64 off;
+        bufs[b] = NULL, offs[b] = 0, sizes[b] = 0;
+        if (!vs->xfb_stride[b]) continue;
+        if (!st.xfb[b].addr || !gpu_buffer(st.xfb[b].addr, &bufs[b], &off)) return;
+        u64 w = st.xfb_written[b] < st.xfb[b].size ? st.xfb_written[b] : st.xfb[b].size;
+        offs[b] = off + w;
+        sizes[b] = st.xfb[b].size - w;
+        n = b + 1;
+        if (used == 4) used = b;
+    }
+    if (!n) return;
+    for (u32 b = 0; b < n; b++)          /* a buffer the shader skips: any valid one, with nothing to write */
+        if (!bufs[b]) bufs[b] = bufs[used], offs[b] = offs[used], sizes[b] = 0;
+    vkCmdBindTransformFeedbackBuffersEXT(c, 0, n, bufs, offs, sizes);
+    vkCmdBeginTransformFeedbackEXT(c, 0, 0, NULL, NULL);
+    xfb_capturing = true;
+    /* vertices captured: whole primitives, as lists */
+    u64 v = 0;
+    if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
+        const CmdDraw *d = payload;
+        u64 k = d->count;
+        switch (d->mode) {
+        case 0: v = k; break;                                   /* points */
+        case 1: v = k / 2 * 2; break;                           /* lines */
+        case 3: v = k >= 2 ? (k - 1) * 2 : 0; break;            /* line strip */
+        case 4: v = k / 3 * 3; break;                           /* triangles */
+        case 5: case 6: v = k >= 3 ? (k - 2) * 3 : 0; break;    /* strip, fan */
+        default: v = k; break;
+        }
+        v *= d->instances ? d->instances : 1;
+    } else {
+        static bool logged;
+        if (!logged) { logged = true; hlog(0, "gpu: transform feedback in an indirect draw: its bytes are not counted"); }
+    }
+    for (u32 b = 0; b < 4; b++) st.xfb_written[b] += v * vs->xfb_stride[b];
+}
+
+static void draw_one(u32 op, const void *payload);
+
 static void draw(u32 op, const void *payload) {
+    if (st.xfb_captured) {              /* what was captured is read as vertices (or captured into) next */
+        end_rendering();
+        barrier();
+        st.xfb_captured = false;
+    }
+    draw_one(op, payload);
+    if (xfb_capturing) {
+        vkCmdEndTransformFeedbackEXT(cmd(), 0, 0, NULL, NULL);
+        xfb_capturing = false;
+        st.xfb_captured = true;
+    }
+}
+
+static void draw_one(u32 op, const void *payload) {
     draws++;
     Shaders *pr = st.program;
     if (!st.render_enable) return;
@@ -1831,8 +1909,8 @@ static void draw(u32 op, const void *payload) {
         static char tb[8192];
         int tn = 0;
 #define TP(...) (tn += snprintf(tb + tn, tn < (int)sizeof tb ? sizeof tb - tn : 0, __VA_ARGS__))
-        TP("draw %llu: op %u mode %u count %u inst %u idx %u@%llx | vs %016llx fs %016llx | rt0 %ux%u f%u @%llx n%u ds %s | vp %g %g %g %g dr %g %g sc %d %d %d %d | ds %x df %u cull %u ff %u",
-             draws, op, d->mode, d->count, d->instances, d->index_type, d->index_addr, pr->stage[ST_VERTEX]->hash,
+        TP("draw %llu: op %u mode %u count %u inst %u first %u base %d/%u idx %u@%llx | vs %016llx fs %016llx | rt0 %ux%u f%u @%llx n%u ds %s | vp %g %g %g %g dr %g %g sc %d %d %d %d | ds %x df %u cull %u ff %u",
+             draws, op, d->mode, d->count, d->instances, d->first, d->base_vertex, d->base_instance, d->index_type, d->index_addr, pr->stage[ST_VERTEX]->hash,
              pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0, st.rt[0].t.width, st.rt[0].t.height,
              st.rt[0].t.format, st.rt[0].t.addr, st.nrt, st.has_depth ? "yes" : "no", st.viewport[0][0], st.viewport[0][1],
              st.viewport[0][2], st.viewport[0][3], st.depth_range[0][0], st.depth_range[0][1], st.scissor[0][0],
@@ -1918,6 +1996,7 @@ static void draw(u32 op, const void *payload) {
     struct { u32 func; float ref, point_size; u32 pad; } pc = {st.color.alpha_test, st.alpha_ref, st.point_size, 0};
     vkCmdPushConstants(c, layout_gfx, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
     set_vertex_input(c);
+    xfb_begin(c, op, payload);
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
         const CmdDraw *d = payload;
         bool indexed = op == OP_DRAW_ELEMENTS;
@@ -2094,7 +2173,16 @@ static void run(u64 at, int depth) {
             }
             break;
         }
-        case OP_XFB_BUFFERS: break;
+        case OP_XFB_BUFFERS: {
+            CmdBind b;
+            memcpy(&b, pay, sizeof b);
+            const BufferRange *r = (const BufferRange *)(pay + sizeof b);
+            for (u32 i = 0; i < b.count && b.first + i < 4; i++) {
+                st.xfb[b.first + i] = r[i];
+                st.xfb_written[b.first + i] = 0;
+            }
+            break;
+        }
         case OP_UPDATE_UBO: {
             CmdUpdateUbo u;
             memcpy(&u, pay, sizeof u);
@@ -2225,7 +2313,13 @@ static void run(u64 at, int depth) {
         case OP_REPORT_VALUE: { PL(CmdReport); if (p->addr) gpu_write(p->addr, &p->value, 4); break; }
         case OP_TEXTURE_POOL: { PL(CmdPool); st.texpool = *p; break; }
         case OP_SAMPLER_POOL: { PL(CmdPool); st.smppool = *p; break; }
-        case OP_XFB: break;
+        case OP_XFB: {                  /* Begin starts the buffers over; Pause and Resume keep their offsets */
+            u32 kind;
+            memcpy(&kind, pay, 4);
+            if (kind == 0) memset(st.xfb_written, 0, sizeof st.xfb_written);
+            st.xfb_active = kind == 0 || kind == 3;
+            break;
+        }
         default:
             hlog(0, "gpu: unknown command %u (length %u) at %llx", op, len, at);
             return;
@@ -2396,6 +2490,12 @@ static bool decode_pixel(VkFormat f, const u8 *p, u8 out[3]) {
         memcpy(&v, p, 4);
         out[0] = to8(uf11(v & 2047, 6)); out[1] = to8(uf11(v >> 11 & 2047, 6)); out[2] = to8(uf11(v >> 22, 5));
         return true;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: {
+        float c[3];
+        memcpy(c, p, 12);
+        for (int i = 0; i < 3; i++) out[i] = to8(c[i]);
+        return true;
+    }
     case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT: {
         float d;
         memcpy(&d, p, 4);
@@ -2435,7 +2535,12 @@ static void dump_image(Image *im, const char *name) {
     if (slash) *slash = 0;
     snprintf(path, sizeof path, "%s\\..\\frames", exe);
     CreateDirectoryA(path, NULL);
-    if (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+    if (im->format == VK_FORMAT_R32G32B32A32_SFLOAT && w * h <= 4) {       /* tiny float targets (exposure): logged */
+        const float *v = (const float *)b.a.map;
+        for (u32 i = 0; i < w * h; i++) hlog(0, "gpu: %s texel %u = %g %g %g %g", name, i, v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
+    }
+    if (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+        im->format == VK_FORMAT_R32G32B32A32_SFLOAT) {
         snprintf(path, sizeof path, "%s\\..\\frames\\%s.raw", exe, name);  /* float targets: exact values too */
         FILE *rf = fopen(path, "wb");
         if (rf) { fwrite(b.a.map, 1, (size_t)w * h * bpp, rf); fclose(rf); }
@@ -2486,24 +2591,55 @@ static void dump_frame(Image *win, u64 frame) {
 }
 
 /* textures the CPU rewrote since the last frame (write watch over the GPU-visible pools): upload them again */
+typedef struct { u64 lo, hi; } Range;
+static int range_cmp(const void *a, const void *b) {
+    u64 x = ((const Range *)a)->lo, y = ((const Range *)b)->lo;
+    return x < y ? -1 : x > y;
+}
+
+/* Only the textures uploaded from guest memory can go stale, so only their pages are asked about (asking over
+ * whole pools, hundreds of MB, took most of the render thread's time): their ranges, sorted and merged */
 static void refresh_cpu_textures(void) {
     static u64 *pages;
     static size_t cap;
-    size_t n = 0;
-    for (int i = 0; i < npools; i++) {
+    static Range *rs;
+    static int caprs;
+    int nr = 0;
+    static int whole = -1;                              /* NX_REFRESH_POOLS: ask over whole pools (the old way) */
+    if (whole < 0) whole = getenv("NX_REFRESH_POOLS") != NULL;
+    for (int i = 0; whole && i < npools; i++) {
         if (!pools[i].cpu || !pools[i].hb) continue;
+        if (nr == caprs) rs = realloc(rs, (caprs = caprs * 2 + 1024) * sizeof *rs);
+        rs[nr++] = (Range){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
+    }
+    for (int b = 0; b < IMAGE_BUCKETS && !whole; b++)
+        for (Image *im = buckets[b]; im; im = im->next) {
+            if (!im->valid || im->gpu_written || !im->size || im->info.addr < AS_BASE) continue;
+            if (nr == caprs) rs = realloc(rs, (caprs = caprs * 2 + 1024) * sizeof *rs);
+            rs[nr++] = (Range){im->info.addr & ~0xfffull, (im->info.addr + im->size + 0xfff) & ~0xfffull};
+        }
+    if (!nr) return;
+    qsort(rs, nr, sizeof *rs, range_cmp);
+    int m = 0;
+    for (int i = 1; i < nr; i++) {
+        if (rs[i].lo <= rs[m].hi + 0x10000) { if (rs[i].hi > rs[m].hi) rs[m].hi = rs[i].hi; }
+        else rs[++m] = rs[i];
+    }
+    nr = m + 1;
+    size_t n = 0;
+    for (int i = 0; i < nr; i++) {
         for (;;) {
             if (cap - n < 4096) pages = realloc(pages, (cap = cap * 2 + 65536) * sizeof *pages);
             ULONG_PTR count = cap - n;
             ULONG gran;
-            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)pools[i].cpu, pools[i].end - pools[i].gpu,
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)rs[i].lo, rs[i].hi - rs[i].lo,
                               (void **)(pages + n), &count, &gran) != 0) break;
             n += count;
             if (count < cap - n + count) break;     /* all of them */
         }
     }
     if (!n) return;
-    /* pages come sorted per pool and pools are sorted: one sorted list */
+    /* pages come sorted per range and the ranges are sorted: one sorted list */
     int refreshed = 0;
     for (int b = 0; b < IMAGE_BUCKETS; b++)
         for (Image *im = buckets[b]; im; im = im->next) {

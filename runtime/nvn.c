@@ -742,6 +742,8 @@ static ShaderCode *shader_intern(u64 data, u64 control) {
     s->stage = shader_stage(code);
     s->const_addr = csize ? data + coff : 0;
     s->const_size = csize;
+    if (s->stage == ST_VERTEX)          /* GLSLC: transform feedback strides, u16 per buffer at 0x6dc */
+        for (int b = 0; b < 4; b++) s->xfb_stride[b] = LD16(control + 0x6dc + 2 * b);
     if (codes.count == codes.cap) codes.items = realloc(codes.items, (codes.cap = codes.cap * 2 + 64) * sizeof *codes.items);
     codes.items[codes.count++] = s;
     ReleaseSRWLockExclusive(&codes.lock);
@@ -1445,7 +1447,10 @@ static void queue_present(Ctx *c) {
     w->last = now.QuadPart;
     static u64 frames;
     if (++frames == 1) hlog(1, "nvn: first frame presented");
-    if (frames % 600 == 0) hlog(1, "nvn: %llu frames presented", frames);
+    if (frames % 600 == 0) {
+        hlog(1, "nvn: %llu frames presented", frames);
+        kernel_report_cpu(frames);
+    }
 }
 static void win_get_native(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->native : 0); }
 static void win_get_interval(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->interval : 0); }

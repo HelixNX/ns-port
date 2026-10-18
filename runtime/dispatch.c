@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <dbghelp.h>
+#include <psapi.h>
 #include <intrin.h>
 #include <process.h>
 
@@ -117,8 +118,11 @@ void jump_ind(Ctx *c) {
     MUSTTAIL return f(c);
 }
 
-/* setjmp/longjmp (a64rt.h): the host jump buffers of each thread's latest setjmp calls, by guest jmp_buf */
-#define HOST_JMPS 16
+/* setjmp/longjmp (a64rt.h): the host jump buffers of each thread's setjmp calls, by guest jmp_buf. A buffer on the
+ * guest stack below the stack pointer belongs to a frame that has returned, so its slot is free again: Lua runs
+ * many short protected calls at varying depths, and evicting the oldest slot lost the outer pcall's buffer that a
+ * later error unwound to */
+#define HOST_JMPS 64
 typedef struct { u64 guest; jmp_buf buf; } HostJmp;
 static __declspec(thread) HostJmp host_jmps[HOST_JMPS];
 static __declspec(thread) unsigned host_jmp_next;
@@ -132,7 +136,12 @@ static HostJmp *host_jmp_find(u64 guest_buf) {
 jmp_buf *guest_jmp_slot(u64 guest_buf) {
     HostJmp *j = host_jmp_find(guest_buf);
     if (!j) {
-        j = &host_jmps[host_jmp_next++ % HOST_JMPS];
+        u64 sp = cur_thread ? cur_thread->ctx->x[31] : 0;     /* (saved before the call into setjmp) */
+        for (int i = 0; i < HOST_JMPS && !j; i++) {
+            u64 g = host_jmps[i].guest;
+            if (!g || (g < sp && sp - g < 0x1000000)) j = &host_jmps[i];
+        }
+        if (!j) j = &host_jmps[host_jmp_next++ % HOST_JMPS];
         j->guest = guest_buf;
     }
     return &j->buf;
@@ -386,6 +395,120 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     }
     dump_mem_env();
     fatal("crashed");
+}
+
+/* NX_PROFILE=<thread name, e.g. "thread 5c">: samples that thread about every millisecond and reports, with the CPU
+ * statistics every 600 frames, where its time went: lifted guest code, our runtime or other modules (the driver),
+ * the hottest functions, and for time outside our code the runtime function that called out */
+#define PROF_MAX 262144
+static HANDLE prof_thread;
+static u64 prof_top[PROF_MAX], prof_rt[PROF_MAX];
+static volatile long prof_n;
+static u64 exe_lo, exe_hi;
+
+static unsigned __stdcall prof_loop(void *p) {
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER due;
+    due.QuadPart = -10000;
+    SetWaitableTimer(timer, &due, 1, NULL, NULL, FALSE);
+    for (;;) {
+        WaitForSingleObject(timer, INFINITE);
+        CONTEXT ctx = {0};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (SuspendThread(prof_thread) == (DWORD)-1) continue;
+        if (GetThreadContext(prof_thread, &ctx) && prof_n < PROF_MAX) {
+            u64 top = ctx.Rip, rt = 0;
+            for (int i = 0; i < 24 && ctx.Rip; i++) {
+                if (ctx.Rip >= exe_lo && ctx.Rip < exe_hi && !(ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi)) { rt = ctx.Rip; break; }
+                if (ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi) break;     /* in lifted code: no runtime caller */
+                DWORD64 base = 0;
+                RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                if (!rf) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
+                void *hd = NULL;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &frame, NULL);
+            }
+            long i = prof_n;
+            prof_top[i] = top;
+            prof_rt[i] = rt;
+            prof_n = i + 1;
+        }
+        ResumeThread(prof_thread);
+    }
+    return 0;
+}
+
+void profile_start(void *host) {
+    if (prof_thread || !host) return;
+    MODULEINFO mi;
+    GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(NULL), &mi, sizeof mi);
+    exe_lo = (u64)(uintptr_t)mi.lpBaseOfDll;
+    exe_hi = exe_lo + mi.SizeOfImage;
+    DuplicateHandle(GetCurrentProcess(), (HANDLE)host, GetCurrentProcess(), &prof_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    _beginthreadex(NULL, 0, prof_loop, NULL, 0, NULL);
+}
+
+typedef struct { char name[96]; long n; } ProfEnt;
+static int prof_cmp(const void *a, const void *b) { return ((const ProfEnt *)b)->n - ((const ProfEnt *)a)->n; }
+
+static void prof_name(u64 rip, char *out, size_t n) {
+    char sb[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+    memset(sb, 0, sizeof sb);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    DWORD64 d = 0;
+    if (rip >= lifted_lo && rip < lifted_hi) {           /* lifted: the guest function */
+        u64 g = guest_pc_of(rip);
+        char b[160];
+        if (SymFromAddr(GetCurrentProcess(), rip, &d, si)) snprintf(out, n, "%s", si->Name);
+        else snprintf(out, n, "%s", g ? describe_addr(g, b, sizeof b) : "lifted ?");
+        return;
+    }
+    if (SymFromAddr(GetCurrentProcess(), rip, &d, si)) { snprintf(out, n, "%s", si->Name); return; }
+    HMODULE m = NULL;
+    char mod[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(uintptr_t)rip, &m)) {
+        GetModuleFileNameA(m, mod, sizeof mod);
+    }
+    const char *slash = strrchr(mod, '\\');
+    snprintf(out, n, "[%s]", slash ? slash + 1 : mod);
+}
+
+static void prof_table(const char *title, const u64 *rips, long n, int show) {
+    ProfEnt *e = calloc(4096, sizeof *e);
+    int ne = 0;
+    for (long i = 0; i < n; i++) {
+        if (!rips[i]) continue;
+        char nm[96];
+        prof_name(rips[i], nm, sizeof nm);
+        int k = 0;
+        while (k < ne && strcmp(e[k].name, nm)) k++;
+        if (k == ne && ne < 4096) { snprintf(e[ne].name, sizeof e[ne].name, "%s", nm); ne++; }
+        if (k < ne) e[k].n++;
+    }
+    qsort(e, ne, sizeof *e, prof_cmp);
+    hlog(0, "profile: %s", title);
+    for (int k = 0; k < ne && k < show; k++) hlog(0, "profile:   %5.1f%%  %s", 100.0 * e[k].n / n, e[k].name);
+    free(e);
+}
+
+void profile_report(void) {
+    long n = prof_n;
+    if (!prof_thread || n < 100) return;
+    long lifted = 0, runtime = 0, other = 0;
+    for (long i = 0; i < n; i++) {
+        u64 r = prof_top[i];
+        if (r >= lifted_lo && r < lifted_hi) lifted++;
+        else if (r >= exe_lo && r < exe_hi) runtime++;
+        else other++;
+    }
+    hlog(0, "profile: %ld samples: lifted guest code %.1f%%, runtime %.1f%%, other modules %.1f%%", n,
+         100.0 * lifted / n, 100.0 * runtime / n, 100.0 * other / n);
+    prof_table("innermost function", prof_top, n, 25);
+    prof_table("runtime function calling outside code (driver, CRT, OS)", prof_rt, n, 15);
+    prof_n = 0;
 }
 
 /* a host thread's whole native stack (suspends it, unwinds with the x64 unwind tables): where a thread blocked in

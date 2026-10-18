@@ -47,7 +47,8 @@
     X(vkCmdSetLogicOpEXT) X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) \
     X(vkCmdSetColorWriteMaskEXT) X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetDepthClipEnableEXT) \
     X(vkCmdSetPatchControlPointsEXT) X(vkCmdWriteTimestamp2) X(vkCmdBeginQuery) X(vkCmdEndQuery) \
-    X(vkCmdCopyQueryPoolResults) X(vkCmdResetQueryPool) X(vkCmdPushDescriptorSetKHR)
+    X(vkCmdCopyQueryPoolResults) X(vkCmdResetQueryPool) X(vkCmdPushDescriptorSetKHR) \
+    X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT)
 
 #define VK_DECLARE(f) extern PFN_##f f;
 VK_GLOBAL_FNS(VK_DECLARE)

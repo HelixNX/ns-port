@@ -136,10 +136,11 @@ typedef struct ShaderCode {
     u32 const_size;
     void *module;                       /* gpu.c: the translated shader, or NULL */
     u32 caps;                           /* gpu.c: SHC_* found in the translation */
+    u32 xfb_stride[4];                  /* transform feedback: bytes per vertex in each buffer (0: not captured) */
     bool missing;
 } ShaderCode;
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
-enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4 };
+enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8 };
 typedef struct Shaders { ShaderCode *stage[ST_COUNT]; u32 mask; u64 key; } Shaders;
 Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]);   /* the one Shaders object for these stages */
 

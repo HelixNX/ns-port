@@ -1,10 +1,11 @@
 /* Input: the keyboard and the first gamepad (SDL3) as player 1's Pro Controller (services/hid.c).
  *
- * Keyboard: arrows = left stick and D-pad, Z = A, X = B, C = X, V = Y, Q = L, E = R, 1 = ZL, 3 = ZR,
- * Enter = +, Backspace = -, IJKL = right stick. Gamepads map by label (an Xbox pad's bottom button is A).
+ * Keyboard: ESDF = left stick, IJKL = right stick, arrows = D-pad (games give the D-pad its own actions, e.g.
+ * Violet's emotes, so it is not also a stick), Z = A, X = B, C = X, V = Y, Q = L, R = R, 1 = ZL, 3 = ZR,
+ * Enter = +, Backspace = -. Gamepads map by label (an Xbox pad's bottom button is A).
  * NX_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
  * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
- * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN. */
+ * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks). */
 #include "hos.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
@@ -47,7 +48,9 @@ static u64 scripted(u64 frame) {
     if (!script) return 0;
     static const struct { const char *n; u64 bit; } names[] = {
         {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"L", B_L}, {"R", B_R}, {"ZL", B_ZL}, {"ZR", B_ZR},
-        {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN}};
+        {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
+        {"LSLEFT", B_LS_LEFT}, {"LSUP", B_LS_UP}, {"LSRIGHT", B_LS_RIGHT}, {"LSDOWN", B_LS_DOWN},
+        {"RSLEFT", B_RS_LEFT}, {"RSUP", B_RS_UP}, {"RSRIGHT", B_RS_RIGHT}, {"RSDOWN", B_RS_DOWN}};
     u64 b = 0;
     const char *p = script;
     while (*p) {
@@ -75,16 +78,16 @@ void input_poll(void) {
     s32 lx = 0, ly = 0, rx = 0, ry = 0;
     static const struct { SDL_Scancode sc; u64 bit; } keys[] = {
         {SDL_SCANCODE_Z, B_A}, {SDL_SCANCODE_X, B_B}, {SDL_SCANCODE_C, B_X}, {SDL_SCANCODE_V, B_Y},
-        {SDL_SCANCODE_Q, B_L}, {SDL_SCANCODE_E, B_R}, {SDL_SCANCODE_1, B_ZL}, {SDL_SCANCODE_3, B_ZR},
+        {SDL_SCANCODE_Q, B_L}, {SDL_SCANCODE_R, B_R}, {SDL_SCANCODE_1, B_ZL}, {SDL_SCANCODE_3, B_ZR},
         {SDL_SCANCODE_RETURN, B_PLUS}, {SDL_SCANCODE_BACKSPACE, B_MINUS},
         {SDL_SCANCODE_LEFT, B_LEFT}, {SDL_SCANCODE_UP, B_UP}, {SDL_SCANCODE_RIGHT, B_RIGHT}, {SDL_SCANCODE_DOWN, B_DOWN},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
         if (k[keys[i].sc]) b |= keys[i].bit;
-    if (k[SDL_SCANCODE_LEFT]) lx -= 32767;
-    if (k[SDL_SCANCODE_RIGHT]) lx += 32767;
-    if (k[SDL_SCANCODE_UP]) ly += 32767;
-    if (k[SDL_SCANCODE_DOWN]) ly -= 32767;
+    if (k[SDL_SCANCODE_S]) lx -= 32767;                /* the left stick on ESDF, apart from the D-pad */
+    if (k[SDL_SCANCODE_F]) lx += 32767;
+    if (k[SDL_SCANCODE_E]) ly += 32767;
+    if (k[SDL_SCANCODE_D]) ly -= 32767;
     if (k[SDL_SCANCODE_J]) rx -= 32767;
     if (k[SDL_SCANCODE_L]) rx += 32767;
     if (k[SDL_SCANCODE_I]) ry += 32767;
@@ -108,7 +111,16 @@ void input_poll(void) {
         if (ax * ax + ay * ay > 6000 * 6000) { lx = axis(ax); ly = axis(-ay); }      /* SDL's y points down */
         if (bx * bx + by * by > 6000 * 6000) { rx = axis(bx); ry = axis(-by); }
     }
-    b |= scripted(gpu_frames());
+    u64 sb = scripted(gpu_frames());                    /* scripted stick directions move the sticks fully */
+    if (sb & B_LS_LEFT) lx = -32767;
+    if (sb & B_LS_RIGHT) lx = 32767;
+    if (sb & B_LS_UP) ly = 32767;
+    if (sb & B_LS_DOWN) ly = -32767;
+    if (sb & B_RS_LEFT) rx = -32767;
+    if (sb & B_RS_RIGHT) rx = 32767;
+    if (sb & B_RS_UP) ry = 32767;
+    if (sb & B_RS_DOWN) ry = -32767;
+    b |= sb;
     /* stick directions as buttons, as the console reports them */
     if (lx < -16000) b |= B_LS_LEFT;
     if (lx > 16000) b |= B_LS_RIGHT;

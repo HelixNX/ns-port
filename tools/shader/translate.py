@@ -17,6 +17,8 @@ Model:
   - Textures are bindless: the 32-bit NVN handle (texture id | sampler id << 20) indexes the texture pool's
     descriptor array (set 1) and the sampler pool's (set 2).
   - Global memory (LDG/STG) uses 64-bit device addresses, which c[0] holds instead of guest addresses.
+  - Transform feedback (the GLSLC layout in the control section): each captured varying is copied at exit into an
+    output of its own with xfb_buffer / xfb_offset / xfb_stride, at the locations from 31 down.
   - Vertex attributes are vec4 inputs at location = attribute index; the runtime may define A<k>_INT / A<k>_UINT
     for integer formats (see the attribute macros in the preamble).
 """
@@ -67,6 +69,7 @@ class Translator:
         self.uses = set()           # features: 'global', 'lmem', 'fragdepth', 'vertexid', ...
         self.indent = 1
         self.lmem_words = 0
+        self.xfb = self.xfb_layout()
         sph = sh.sph
         if sph:
             self.sph_words = struct.unpack('<20I', sph)
@@ -1575,7 +1578,39 @@ class Translator:
             self.emit('if (%s) discard;' % t)
 
     # ------------------------------------------------------------------ outputs
+    def xfb_layout(self):
+        """GLSLC's transform feedback layout: per buffer b a stride (u16 at 0x6dc + 2b) and up to 32 varyings as
+        arrays at 0xdc (output slot + 0x20), 0x2dc (first component) and 0x4dc (component count), 0x80 bytes per
+        buffer. Returns [(buffer, stride, [(slot, first, count, offset)])], the varyings packed in order."""
+        if self.stage != 'vertex' or len(self.sh.control) < 0x6e4:
+            return []
+        c = self.sh.control
+        layout = []
+        for b in range(4):
+            stride = struct.unpack_from('<H', c, 0x6dc + 2 * b)[0]
+            vs, off = [], 0
+            for i in range(32):
+                a, first, n = (struct.unpack_from('<I', c, base + 0x80 * b + 4 * i)[0] for base in (0xdc, 0x2dc, 0x4dc))
+                if not n:
+                    break
+                if not 0x20 <= a < 0x40 or first + n > 4:
+                    raise Unsupported('transform feedback varying %#x components %d+%d' % (a, first, n))
+                vs.append((a - 0x20, first, n, off))
+                off += 4 * n
+            if vs:
+                if off > stride:
+                    raise Unsupported('transform feedback buffer %d: %d bytes in a stride of %d' % (b, off, stride))
+                layout.append((b, stride, vs))
+        return layout
+
     def exit_outputs(self):
+        if self.stage == 'vertex':
+            # transform feedback: the captured components, copied into outputs that carry the buffer layout
+            for b, stride, vs in self.xfb:
+                for i, (slot, first, n, off) in enumerate(vs):
+                    self.out_attrs.add(slot)
+                    self.emit('xfb%d_%d = out_a%d.%s;' % (b, i, slot, 'xyzw'[first:first + n]))
+            return
         if self.stage != 'fragment':
             return
         if self.omap_target & 0xf:
@@ -1851,6 +1886,14 @@ class Translator:
                 out.append('layout(location = %d) in vec4 in_a%d;' % (k, k))
             for k in sorted(self.out_attrs):
                 out.append('layout(location = %d) out vec4 out_a%d;' % (k, k))
+            loc = 31        # capture outputs take the locations from the top, which the game's varyings leave free
+            for b, stride, vs in self.xfb:
+                for i, (slot, first, n, off) in enumerate(vs):
+                    if loc in self.out_attrs:
+                        raise Unsupported('transform feedback output location %d is taken' % loc)
+                    out.append('layout(location = %d, xfb_buffer = %d, xfb_offset = %d, xfb_stride = %d) out %s xfb%d_%d;'
+                               % (loc, b, off, stride, 'float' if n == 1 else 'vec%d' % n, b, i))
+                    loc -= 1
             if 'clip' in self.uses:
                 out.append('out float gl_ClipDistance[8];')
             out.append('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; } pc;')

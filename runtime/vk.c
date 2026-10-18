@@ -119,7 +119,7 @@ static const char *const device_exts[] = {
     VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-    VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME,
+    VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
 };
 
 static VkPhysicalDevice pick_device(void) {
@@ -174,8 +174,10 @@ void vk_init(void) {
     if (vk.family == ~0u) fatal("no graphics queue that can present");
 
     /* features: everything the NVN state maps to is dynamic state, so pipelines depend on shaders and formats */
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, .transformFeedback = 1};
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR u8i = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR,
-                                                     .indexTypeUint8 = 1};
+                                                     &xfb, .indexTypeUint8 = 1};
     VkPhysicalDeviceDepthClipControlFeaturesEXT clipc = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &u8i, .depthClipControl = 1};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT clip = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
@@ -366,7 +368,8 @@ static const VkBufferUsageFlags ALL_BUFFER_USAGE =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-    VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+    VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+    VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
 
 bool vk_import_host(u64 ptr, u64 size, HostBuffer *out) {
     memset(out, 0, sizeof *out);
