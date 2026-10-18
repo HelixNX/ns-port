@@ -3,7 +3,8 @@
 A dumped shader (runtime/nvn.c, build/shaders/<hash>.bin):
     "MKSH", u32 control size (0x7d0), u32 code size, u32 stage; the GLSLC control section; the code.
 The code: for graphics stages a 0x30-byte NVN header (magic 0x12345678), the 0x50-byte SPH (shader program
-header) and the instructions from 0x80; compute code starts at 0 (no header, no SPH). Instructions come in groups of four 64-bit words:
+header) and the instructions from 0x80; compute code has no header and no SPH (see the program offset below).
+Instructions come in groups of four 64-bit words:
 one scheduling word, then three instructions. Embedded constants (GLSLC's own constant buffer) follow the code
 at the offset the control section gives.
 
@@ -163,9 +164,12 @@ class Shader:
         self.code_size, self.const_size, self.const_off, self.end = struct.unpack_from('<4I', c, 0x6f8)
         self.num_gprs = struct.unpack_from('<I', c, 0x70c)[0]
         self.graphics = struct.unpack_from('<I', self.code, 0)[0] == 0x12345678
-        self.start = 0x80 if self.graphics else 0          # compute: no NVN header, no SPH
-        self.sph = self.code[0x30:0x80] if self.graphics else None
-        n = ((0x30 if self.graphics else 0) + self.code_size - self.start) // 8
+        # the program's offset (0x708; the code size counts from it): graphics 0x30, after the NVN header, then the
+        # SPH; compute has no SPH and starts at 0 or after padding (0x100 in an SDK 13 shader)
+        base = struct.unpack_from('<I', c, 0x708)[0]
+        self.start = base + 0x50 if self.graphics else base
+        self.sph = self.code[base:base + 0x50] if self.graphics else None
+        n = (base + self.code_size - self.start) // 8
         self.words = list(struct.unpack_from('<%dQ' % n, self.code, self.start))
         self.consts = self.code[self.const_off:self.const_off + self.const_size] if self.const_size else b''
 

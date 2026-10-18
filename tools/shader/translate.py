@@ -212,7 +212,7 @@ class Translator:
         if self.stage == 'fragment':
             m = {0x70: 'U(gl_FragCoord.x)', 0x74: 'U(gl_FragCoord.y)', 0x78: 'U(gl_FragCoord.z)',
                  0x7c: 'U(gl_FragCoord.w)', 0x3fc: '(gl_FrontFacing ? 0xffffffffu : 0u)',
-                 0x2e0: 'U(gl_PointCoord.x)', 0x2e4: 'U(gl_PointCoord.y)'}
+                 0x2e0: 'U(gl_PointCoord.x)', 0x2e4: 'U(gl_PointCoord.y)', 0x64: 'uint(gl_Layer)'}
             if off in m:
                 return m[off], False
         if self.stage == 'vertex':
@@ -241,6 +241,8 @@ class Translator:
             self.uses.add('clip')
             self.emit('gl_ClipDistance[%d] = F(%s);' % ((off - 0x2c0) >> 2, val))
             return
+        if off in (0x64, 0x68) and self.stage == 'vertex':
+            self.uses.add('layer')
         if off == 0x64:
             self.emit('gl_Layer = int(%s);' % val)
             return
@@ -465,6 +467,106 @@ class Translator:
         self.indent -= 1
         self.emit('}')
 
+    def op_FCMP(self, w, form, pc):
+        """Rd = (Rc cmp 0) ? Ra : Rb, as bit patterns"""
+        if form == 'R':
+            b, c = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            b, c = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            b, c = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            b, c = '0x%08xu' % (bits(w, 20, 19) << 12 | bits(w, 56, 1) << 31), self.R(bits(w, 39, 8))
+        self.emit('{ float c_ = F(%s), z_ = 0.0;' % c)
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), '%s ? %s : %s' % (self.fcmp(bits(w, 48, 4), 'c_', 'z_'), self.R(bits(w, 8, 8)), b))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_FSWZADD(self, w, form, pc):
+        """per quad lane, from two bits of the swizzle: a + b, b - a, a - b or b (hand-written derivatives)"""
+        if bits(w, 47, 1):
+            raise Unsupported('FSWZADD.CC')
+        self.uses.add('subgroup')
+        self.emit('{ float a_ = %s, b_ = %s; uint m_ = (%du >> ((gl_SubgroupInvocationID & 3u) * 2u)) & 3u;'
+                  % (self.Rf(bits(w, 8, 8)), self.Rf(bits(w, 20, 8)), bits(w, 28, 8)))
+        self.indent += 1
+        self.set_rf(bits(w, 0, 8), 'm_ == 0u ? a_ + b_ : m_ == 1u ? b_ - a_ : m_ == 2u ? a_ - b_ : b_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_SHFL(self, w, form, pc):
+        """warp shuffle; c = clamp | segment mask << 8. The quad butterflies (derivatives) become quad swaps"""
+        d, a, mode = bits(w, 0, 8), self.R(bits(w, 8, 8)), bits(w, 30, 2)
+        bimm, cimm = bits(w, 28, 1), bits(w, 29, 1)
+        b = '%du' % bits(w, 20, 5) if bimm else self.R(bits(w, 20, 8))
+        c = '%du' % bits(w, 34, 13) if cimm else self.R(bits(w, 39, 8))
+        dp = bits(w, 48, 3)
+        self.uses.add('subgroup')
+        if mode == 3 and bimm and cimm and bits(w, 34, 13) == 0x1c03 and bits(w, 20, 5) in (1, 2):
+            self.uses.add('quad')
+            self.set_r(d, 'subgroupQuadSwap%s(%s)' % ('Horizontal' if bits(w, 20, 5) == 1 else 'Vertical', a))
+            self.set_p(dp, 'true')
+            return
+        self.uses.add('shuffle')
+        src = {0: '(b_ & ~sm_) | mn_', 1: 'l_ - b_', 2: 'l_ + b_', 3: 'l_ ^ b_'}[mode]
+        ok = 'int(s_) >= int(mn_)' if mode == 1 else 's_ <= mx_'
+        self.emit('{ uint l_ = gl_SubgroupInvocationID, b_ = %s, c_ = %s; uint sm_ = (c_ >> 8) & 31u; uint mn_ = l_ & sm_;'
+                  % (b, c))
+        self.indent += 1
+        self.emit('uint mx_ = mn_ | (c_ & 31u & ~sm_); uint s_ = %s; bool ok_ = %s;' % (src, ok))
+        self.emit('uint v_ = subgroupShuffle(%s, ok_ ? s_ : l_);' % a)
+        self.set_r(d, 'v_')
+        self.set_p(dp, 'ok_')
+        self.indent -= 1
+        self.emit('}')
+
+    # --- half precision pairs (computed in fp32, rounded to fp16 when packed)
+    def half_operand(self, x, swz, neg, ab):
+        v = {0: 'unpackHalf2x16(%s)', 1: 'vec2(F(%s))', 2: 'unpackHalf2x16(%s).xx', 3: 'unpackHalf2x16(%s).yy'}[swz] % x
+        return self.fmod(v, neg, ab)
+
+    def half_operand_b(self, w, form):
+        if form == 'R':
+            return self.half_operand(self.R(bits(w, 20, 8)), bits(w, 28, 2), bits(w, 31, 1), bits(w, 30, 1))
+        if form == 'I':
+            imm = bits(w, 20, 9) << 6 | bits(w, 29, 1) << 15 | bits(w, 30, 9) << 22 | bits(w, 56, 1) << 31
+            return 'unpackHalf2x16(0x%08xu)' % imm
+        raise Unsupported('half operand form %s' % form)
+
+    def op_HADD2(self, w, form, pc):
+        d = bits(w, 0, 8)
+        sat = bits(w, 32, 1) if form == 'R' else bits(w, 52, 1)
+        a = self.half_operand(self.R(bits(w, 8, 8)), bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1))
+        self.emit('{ vec2 v_ = %s;' % self.sat('(%s + %s)' % (a, self.half_operand_b(w, form)), sat))
+        self.indent += 1
+        merge = bits(w, 49, 2)
+        if merge == 0:
+            self.set_r(d, 'packHalf2x16(v_)')
+        elif merge == 1:
+            self.set_rf(d, 'v_.x')
+        elif merge == 2:
+            self.set_r(d, '(%s & 0xffff0000u) | (packHalf2x16(v_) & 0xffffu)' % self.R(d))
+        else:
+            self.set_r(d, '(%s & 0xffffu) | (packHalf2x16(v_) & 0xffff0000u)' % self.R(d))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_HSETP2(self, w, form, pc):
+        a = self.half_operand(self.R(bits(w, 8, 8)), bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1))
+        self.emit('{ vec2 a_ = %s, b_ = %s;' % (a, self.half_operand_b(w, form)))
+        self.indent += 1
+        op, bp, bo = bits(w, 35, 4), self.P(bits(w, 39, 3), bits(w, 42, 1)), bits(w, 45, 2)
+        self.emit('bool c0_ = %s, c1_ = %s;' % (self.fcmp(op, 'a_.x', 'b_.x'), self.fcmp(op, 'a_.y', 'b_.y')))
+        if bits(w, 49, 1):      # H_AND: one result for both halves
+            self.set_p(bits(w, 3, 3), self.bop(bo, '(c0_ && c1_)', bp))
+            self.set_p(bits(w, 0, 3), self.bop(bo, '!(c0_ && c1_)', bp))
+        else:
+            self.set_p(bits(w, 3, 3), self.bop(bo, 'c0_', bp))
+            self.set_p(bits(w, 0, 3), self.bop(bo, 'c1_', bp))
+        self.indent -= 1
+        self.emit('}')
+
     def op_F2F(self, w, form, pc):
         d = bits(w, 0, 8)
         dst, src = bits(w, 8, 2), bits(w, 10, 2)
@@ -629,17 +731,24 @@ class Translator:
     def op_ISCADD(self, w, form, pc):
         d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
         if form == '32I':
-            scale, na, nb = bits(w, 53, 5), 0, 0
+            scale, na, nb, cc = bits(w, 53, 5), 0, 0, bits(w, 52, 1)
         else:
-            scale, na, nb = bits(w, 39, 5), bits(w, 49, 1), bits(w, 48, 1)
-            if bits(w, 47, 1):
-                raise Unsupported('ISCADD.CC')
+            scale, na, nb, cc = bits(w, 39, 5), bits(w, 49, 1), bits(w, 48, 1), bits(w, 47, 1)
         b = self.op_b_u(w, form)
         if na:
             a = '(-%s)' % a
         if nb:
             b = '(-%s)' % b
-        self.set_r(d, '(%s << %d) + %s' % (a, scale, b))
+        if not cc:
+            self.set_r(d, '(%s << %d) + %s' % (a, scale, b))
+            return
+        # .CC: the low half of a 64-bit address (an IADD.X follows)
+        self.emit('{ uint a_ = %s << %d, b_ = %s; uint v_ = a_ + b_;' % (a, scale, b))
+        self.indent += 1
+        self.cc_add('a_', 'b_', 'v_')
+        self.set_r(d, 'v_')
+        self.indent -= 1
+        self.emit('}')
 
     def op_XMAD(self, w, form, pc):
         d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
@@ -681,7 +790,51 @@ class Translator:
         self.emit('}')
 
     def op_IMNMX(self, w, form, pc):
-        raise Unsupported('IMNMX')
+        if bits(w, 43, 2) or bits(w, 47, 1):
+            raise Unsupported('IMNMX.XLO/XHI/CC')
+        a, b = self.R(bits(w, 8, 8)), self.op_b_u(w, form)
+        if bits(w, 48, 1):
+            a, b = 'int(%s)' % a, 'int(%s)' % b
+        p = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        mn, mx = 'min(%s, %s)' % (a, b), 'max(%s, %s)' % (a, b)
+        e = mn if p == 'true' else mx if p == 'false' else '(%s ? %s : %s)' % (p, mn, mx)
+        self.set_r(bits(w, 0, 8), 'uint(%s)' % e if bits(w, 48, 1) else e)
+
+    def op_BFI(self, w, form, pc):
+        """Rd = Rc (base) with Ra inserted at the offset / count packed in operand B"""
+        if bits(w, 47, 1):
+            raise Unsupported('BFI.CC')
+        if form == 'R':
+            packed, base = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            packed, base = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            packed, base = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            packed, base = self.op_b_u(w, 'I'), self.R(bits(w, 39, 8))
+        self.emit('{ uint p_ = %s, c_ = %s; uint o_ = min(p_ & 0xffu, 32u), n_ = min((p_ >> 8) & 0xffu, 32u - o_);'
+                  % (packed, base))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'n_ == 0u ? c_ : bitfieldInsert(c_, %s, int(o_), int(n_))' % self.R(bits(w, 8, 8)))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_POPC(self, w, form, pc):
+        b = self.op_b_u(w, form)
+        self.set_r(bits(w, 0, 8), 'uint(bitCount(%s))' % ('~%s' % b if bits(w, 40, 1) else b))
+
+    def op_FLO(self, w, form, pc):
+        """find leading one: its bit index (with .SH the count of leading zeros), 0xffffffff if there is none"""
+        if bits(w, 47, 1):
+            raise Unsupported('FLO.CC')
+        b = self.op_b_u(w, form)
+        if bits(w, 40, 1):
+            b = '~%s' % b
+        self.emit('{ int m_ = findMSB(%s);' % ('int(%s)' % b if bits(w, 48, 1) else b))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'm_ < 0 ? 0xffffffffu : %s' % ('uint(31 - m_)' if bits(w, 41, 1) else 'uint(m_)'))
+        self.indent -= 1
+        self.emit('}')
 
     def op_ISETP(self, w, form, pc):
         if bits(w, 43, 1):
@@ -698,13 +851,23 @@ class Translator:
         self.emit('}')
 
     def op_ISET(self, w, form, pc):
-        if bits(w, 43, 1) or bits(w, 47, 1):
-            raise Unsupported('ISET.X/CC')
+        if bits(w, 43, 1):
+            raise Unsupported('ISET.X')
         a, b = self.R(bits(w, 8, 8)), self.op_b_u(w, form)
         cmp = self.icmp(bits(w, 49, 3), a, b, bits(w, 48, 1))
         bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
         t = '0x3f800000u' if bits(w, 44, 1) else '0xffffffffu'
-        self.set_r(bits(w, 0, 8), '(%s ? %s : 0u)' % (self.bop(bits(w, 45, 2), cmp, bp), t))
+        v = '(%s ? %s : 0u)' % (self.bop(bits(w, 45, 2), cmp, bp), t)
+        if not bits(w, 47, 1):
+            self.set_r(bits(w, 0, 8), v)
+            return
+        self.uses.add('cc')
+        self.emit('{ uint v_ = %s;' % v)
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'v_')
+        self.emit('cc_z = v_ == 0u; cc_s = (v_ >> 31) != 0u; cc_c = false; cc_o = false;')
+        self.indent -= 1
+        self.emit('}')
 
     def logic(self, a, b, op):
         if op == 3:
@@ -851,10 +1014,16 @@ class Translator:
     def op_S2R(self, w, form, pc):
         sr = bits(w, 20, 8)
         e = {33: 'gl_LocalInvocationID.x', 34: 'gl_LocalInvocationID.y', 35: 'gl_LocalInvocationID.z',
-             37: 'gl_WorkGroupID.x', 38: 'gl_WorkGroupID.y', 39: 'gl_WorkGroupID.z', 0: '0u',
-             32: '(gl_LocalInvocationID.x | gl_LocalInvocationID.y << 16 | gl_LocalInvocationID.z << 26)'}.get(sr)
+             37: 'gl_WorkGroupID.x', 38: 'gl_WorkGroupID.y', 39: 'gl_WorkGroupID.z', 0: 'gl_SubgroupInvocationID',
+             32: '(gl_LocalInvocationID.x | gl_LocalInvocationID.y << 16 | gl_LocalInvocationID.z << 26)',
+             18: '0x3f800000u',     # Y direction +1.0: render targets hold rows as on the console
+             57: 'gl_SubgroupLtMask.x'}.get(sr)
         if e is None:
             raise Unsupported('S2R %d' % sr)
+        if sr in (0, 57):
+            self.uses.add('subgroup')
+            if sr == 57:
+                self.uses.add('ballot')
         self.set_r(bits(w, 0, 8), e)
 
     # --- memory
@@ -1033,6 +1202,11 @@ class Translator:
             e = self.sample('CUBE', 'h_', 'vec3(%s, %s, %s)' % (fa(0), fa(1), fb(0)), lod=fb(1))
         else:
             raise Unsupported('TEXS encoding %d' % enc)
+        self.scalar_tex_store(w, h, e, dref)
+
+    def scalar_tex_store(self, w, h, e, dref):
+        """TEXS / TLDS results: the swizzle picks components into Rd0 (Rd0+1) and Rd1 (Rd1+1), or packs halves"""
+        da, db, sw, f32 = bits(w, 0, 8), bits(w, 28, 8), bits(w, 50, 3), bits(w, 59, 1)
         masks = [1, 2, 4, 8, 3, 9, 10, 12] if db == RZ else [7, 11, 13, 14, 15]
         if sw >= len(masks):
             raise Unsupported('TEXS swizzle')
@@ -1056,6 +1230,37 @@ class Translator:
                 self.set_r(db, pack(vals[2], vals[3] if len(vals) > 3 else '0.0'))
         self.indent -= 1
         self.emit('}')
+
+    def fetch(self, kind, handle, coords, lod, offset=None):
+        """texelFetch of a texture pool entry (samplerless); offsets just move the integer coordinates"""
+        arr = {'1D': 't1d', '2D': 't2d', '3D': 't3d', '2DARRAY': 't2da', '1DARRAY': 't1da'}[kind]
+        self.uses.add('tex_' + arr)
+        if offset:
+            coords = '(%s + %s)' % (coords, offset)
+        return 'texelFetch(%s[nonuniformEXT(min(%s & 0xfffffu, 65535u))], %s, %s)' % (arr, handle, coords, lod)
+
+    def op_TLDS(self, w, form, pc):
+        a, b, enc = bits(w, 8, 8), bits(w, 20, 8), bits(w, 53, 4)
+        ia = lambda i: 'int(%s)' % self.R(a + i if a != RZ else RZ)
+        ib = lambda i: 'int(%s)' % self.R(b + i if b != RZ else RZ)
+        if enc == 0:        # 1D.LZ
+            e = self.fetch('1D', 'h_', ia(0), '0')
+        elif enc == 1:      # 1D.LL
+            e = self.fetch('1D', 'h_', ia(0), ib(0))
+        elif enc == 2:      # 2D.LZ
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ib(0)), '0')
+        elif enc == 4:      # 2D.LZ.AOFFI
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), '0', self.tex_offsets('2D', b))
+        elif enc == 5:      # 2D.LL
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0))
+        elif enc == 8:      # 3D.LZ
+            e = self.fetch('3D', 'h_', 'ivec3(%s, %s, %s)' % (ia(0), ia(1), ib(0)), '0')
+        elif enc == 12:     # 2D.LL.AOFFI
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0),
+                           self.tex_offsets('2D', b + 1 if b != RZ else RZ))
+        else:
+            raise Unsupported('TLDS encoding %d' % enc)
+        self.scalar_tex_store(w, self.tex_handle(bits(w, 36, 13)), e, None)
 
     def op_TEX(self, w, form, pc):
         if form == 'B':
@@ -1222,81 +1427,168 @@ class Translator:
             self.emit('gl_FragDepth = %s;' % self.Rf(r + 1))
 
     # ------------------------------------------------------------------ control flow
+    @staticmethod
+    def branch_target(pc, w):
+        t = pc + sext(bits(w, 20, 24), 24) + 8
+        return t + 8 if t % 32 == 0 else t      # a scheduling word: the group's first instruction
+
+    def jump_table(self, ins, i):
+        """BRX targets as computed (pcs; one on a scheduling word means the next instruction). GLSLC's switch: Ry = IMNMX(x, N); Rx = SHL Ry, 2; Ra = LDC c[1][Rx + base];
+        BRX Ra + imm, with the table in the shader's embedded constants (c[1])"""
+        pc, w = ins[i]
+        ra = bits(w, 8, 8)
+
+        def find(reg, before, ops):
+            for j in range(before - 1, max(-1, before - 24), -1):
+                o = opcode(ins[j][1])
+                if o in ('BRA', 'BRX', 'EXIT', 'SYNC', 'BRK'):
+                    return None, None
+                if bits(ins[j][1], 0, 8) == reg and o not in ('ST', 'STG', 'STL', 'STS', 'AST', 'RED', 'SUST'):
+                    return (j, ins[j][1]) if o in ops else (None, None)
+            return None, None
+        j, ldc = find(ra, i, ('LDC',))
+        if ldc is None or bits(ldc, 36, 5) != 1 or bits(ldc, 44, 2) or bits(ldc, 48, 3) != 4:
+            raise Unsupported('BRX without a jump table')
+        base = sext(bits(ldc, 20, 16), 16)
+        j, shl = find(bits(ldc, 8, 8), j, ('SHL_I',))
+        if shl is None or bits(shl, 20, 19) != 2:
+            raise Unsupported('BRX index not scaled by 4')
+        j, mn = find(bits(shl, 8, 8), j, ('IMNMX_I',))
+        if mn is None or bits(mn, 39, 3) != PT or bits(mn, 42, 1):
+            raise Unsupported('BRX index without a bound')
+        count = sext(bits(mn, 20, 19) | bits(mn, 56, 1) << 19, 20) + 1
+        if count <= 0 or base < 0 or base + 4 * count > len(self.sh.consts):
+            raise Unsupported('BRX table outside the constants')
+        return [(struct.unpack_from('<I', self.sh.consts, base + 4 * k)[0] + pc + 8 + sext(bits(w, 20, 24), 24))
+                & 0xffffffff for k in range(count)]
+
     def translate(self):
         ins = list(self.sh.instructions())
         n = len(ins)
         idx_of = {pc: i for i, (pc, w) in enumerate(ins)}
-        # leaders and the end (the trailing `BRA self` / zero padding is cut off)
+        # the end (the trailing `BRA self` / zero padding is cut off)
         end = n
         for i, (pc, w) in enumerate(ins):
-            o = opcode(w)
-            if o == 'BRA':
-                t = pc + sext(bits(w, 20, 24), 24) + 8
-                if t % 32 == 0:
-                    t += 8
-                if t >= pc - 8 and t <= pc and bits(w, 16, 4) == PT:     # `BRA self`: the end
+            if opcode(w) == 'BRA':
+                t = self.branch_target(pc, w)
+                if pc - 8 <= t <= pc and bits(w, 16, 4) == PT:     # `BRA self`
                     end = min(end, i)
+                    break
+
+        def index(t):
+            if t not in idx_of or idx_of[t] >= end:
+                raise Unsupported('branch target %#x outside the code' % t)
+            return idx_of[t]
         leaders = {0}
-        targets = {}
+        targets = {}            # instruction index -> target index (BRA, SSY, PBK) or list (BRX)
         for i in range(end):
             pc, w = ins[i]
             o = opcode(w)
-            if o in ('BRA', 'SSY'):
-                t = pc + sext(bits(w, 20, 24), 24) + 8
-                if t % 32 == 0:
-                    t += 8                  # a scheduling word: the group's first instruction
-                if t not in idx_of:
-                    raise Unsupported('branch target %#x outside the code' % t)
-                ti = idx_of[t]
-                if ti <= i and o == 'BRA':
-                    raise Unsupported('backward branch (loop)')
-                targets[i] = ti
+            if o in ('BRA', 'SSY', 'PBK'):
+                targets[i] = index(self.branch_target(pc, w))
+                leaders.add(targets[i])
                 if o == 'BRA':
-                    leaders.add(ti)
                     leaders.add(i + 1)
-                else:
-                    leaders.add(ti)
-            elif o in ('EXIT', 'SYNC'):
+            elif o == 'BRX':
+                targets[i] = [index(t + 8 if t % 32 == 0 else t) for t in self.jump_table(ins, i)]
+                leaders.update(targets[i])
                 leaders.add(i + 1)
-            elif o in ('BRK', 'CONT', 'PBK', 'PCNT', 'CAL', 'RET', 'JMP', 'BRX', 'JMX'):
+            elif o in ('EXIT', 'SYNC', 'BRK'):
+                leaders.add(i + 1)
+            elif o in ('CONT', 'PCNT', 'CAL', 'RET', 'JMP', 'JMX'):
                 raise Unsupported(o)
         leaders = sorted(l for l in leaders if l < end)
         blocks = [(leaders[k], leaders[k + 1] if k + 1 < len(leaders) else end) for k in range(len(leaders))]
         bid = {s: k for k, (s, e) in enumerate(blocks)}
-        # reconvergence stacks (SSY targets) at each block's entry
-        stacks = {0: ()}
-        reach_needed = set()
-        body = []
-        self.lines = body
+
+        # each block's terminator and its successors as functions of the CRS stack at its entry. The stack holds
+        # ('S', block) for SSY and ('B', block) for PBK; it is resolved statically (the same on every path into a
+        # block, or reconverging, where the shorter one is kept)
+        def cond_of(w, o):
+            cond = self.P(bits(w, 16, 3), bits(w, 19, 1))
+            if bits(w, 0, 5) != 15:
+                t = self.flow(bits(w, 0, 5))
+                if t != 'true':
+                    cond = t if cond == 'true' else '(%s && %s)' % (cond, t)
+            return cond
+        info = []
         for k, (s, e) in enumerate(blocks):
-            if k not in stacks:
-                continue            # unreachable
-            stack = list(stacks[k])
-            if k:
-                self.emit('if (b%d) {' % k)
-                reach_needed.add(k)
-                self.indent += 1
-            term = None
+            pushes, term = [], None
             for i in range(s, e):
                 pc, w = ins[i]
                 o = opcode(w)
-                pi, pn = bits(w, 16, 3), bits(w, 19, 1)
-                cond = self.P(pi, pn)
-                if cond == 'false':
+                if self.P(bits(w, 16, 3), bits(w, 19, 1)) == 'false':
                     continue
-                if o == 'SSY':
-                    stack.append(targets[i])
-                    continue
-                if o in ('BRA', 'SYNC', 'EXIT'):
-                    if o == 'BRA':
-                        t = self.flow(bits(w, 0, 5))
-                        if t != 'true':
-                            cond = t if cond == 'true' else '(%s && %s)' % (cond, t)
-                    elif o == 'EXIT' and bits(w, 0, 5) != 15:
-                        t = self.flow(bits(w, 0, 5))
-                        cond = t if cond == 'true' else '(%s && %s)' % (cond, t)
-                    term = (o, cond, i)
+                if o in ('SSY', 'PBK'):         # their predicate field is not a condition
+                    pushes.append(('S' if o == 'SSY' else 'B', bid[targets[i]]))
+                elif o in ('BRA', 'SYNC', 'EXIT', 'BRK', 'BRX'):
+                    term = (o, cond_of(w, o), i)
                     break
+            info.append((pushes, term))
+
+        def successors(k, entry):
+            """[(block, condition, stack)] in emission order"""
+            pushes, term = info[k]
+            st = tuple(entry) + tuple(pushes)
+            nxt = k + 1 if blocks[k][1] < end else None
+            if term is None:
+                return [(nxt, 'true', st)] if nxt is not None else []
+            o, cond, i = term
+            out = []
+            if o == 'BRA':
+                out.append((bid[targets[i]], cond, st))
+            elif o == 'BRX':
+                if cond != 'true':
+                    raise Unsupported('conditional BRX')
+                out += [(bid[t], None, st) for t in targets[i]]
+            elif o == 'SYNC':
+                if not st or st[-1][0] != 'S':
+                    raise Unsupported('SYNC without SSY')
+                out.append((st[-1][1], cond, st[:-1]))
+            elif o == 'BRK':
+                p = max((j for j, x in enumerate(st) if x[0] == 'B'), default=None)
+                if p is None:
+                    raise Unsupported('BRK without PBK')
+                out.append((st[p][1], cond, st[:p]))
+            if cond != 'true' and nxt is not None:
+                out.append((nxt, '!(%s)' % cond if o != 'EXIT' else 'true', st))
+            return out
+        stacks = {0: ()}
+        work = [0]
+        while work:
+            k = work.pop()
+            for t, c, st in successors(k, stacks[k]):
+                if t not in stacks or (stacks[t] != st and len(st) < len(stacks[t])):
+                    stacks[t] = st
+                    work.append(t)
+        loop = any(t <= k for k in stacks for t, c, st in successors(k, stacks[k]))
+
+        reach_needed = set()
+        body = []
+        self.lines = body
+        if loop:
+            # a back edge: run the blocks in address order again until no back edge was taken (one invocation
+            # follows one path, so exactly one block is pending at a time)
+            self.emit('bool again_ = true;')
+            self.emit('while (again_) {')
+            self.indent += 1
+            self.emit('again_ = false;')
+        for k, (s, e) in enumerate(blocks):
+            if k not in stacks:
+                continue            # unreachable
+            if k or loop:
+                self.emit('if (b%d) {' % k)
+                reach_needed.add(k)
+                self.indent += 1
+                if loop:
+                    self.emit('b%d = false;' % k)
+            pushes, term = info[k]
+            for i in range(s, term[2] if term else e):
+                pc, w = ins[i]
+                o = opcode(w)
+                cond = self.P(bits(w, 16, 3), bits(w, 19, 1))
+                if cond == 'false' or o in ('SSY', 'PBK'):
+                    continue
                 if cond != 'true':
                     self.emit('if (%s) {' % cond)
                     self.indent += 1
@@ -1304,63 +1596,53 @@ class Translator:
                 if cond != 'true':
                     self.indent -= 1
                     self.emit('}')
-            # successors
-            succ = []
-            nxt = k + 1 if e < end else None
-            if term is None:
-                if nxt is not None:
-                    succ.append((nxt, 'true', tuple(stack)))
-            else:
-                o, cond, i = term
-                if o == 'BRA':
-                    succ.append((bid[targets[i]], cond, tuple(stack)))
-                    if cond != 'true' and nxt is not None:
-                        succ.append((nxt, '!(%s)' % cond, tuple(stack)))
-                elif o == 'SYNC':
-                    if not stack:
-                        raise Unsupported('SYNC without SSY')
-                    t = stack[-1]
-                    if t not in bid:
-                        raise Unsupported('SYNC target is not a block')
-                    succ.append((bid[t], cond, tuple(stack[:-1])))
-                    if cond != 'true' and nxt is not None:
-                        succ.append((nxt, '!(%s)' % cond, tuple(stack)))
-                else:   # EXIT
-                    if cond != 'true':
-                        self.emit('if (%s) {' % cond)
-                        self.indent += 1
-                    self.exit_outputs()
-                    self.emit('return;')
-                    if cond != 'true':
-                        self.indent -= 1
-                        self.emit('}')
-                        if nxt is not None:
-                            succ.append((nxt, 'true', tuple(stack)))
-            for t, c, st in succ:
-                if t <= k:
-                    raise Unsupported('backward edge')
-                if t in stacks and stacks[t] != st:
-                    # SSY targets popped on one path only: keep the shorter stack (they reconverge there)
-                    if len(st) < len(stacks[t]):
-                        stacks[t] = st
-                else:
-                    stacks.setdefault(t, st)
-                self.emit(('b%d = true;' % t) if c == 'true' else 'if (%s) b%d = true;' % (c, t))
-            if k:
+            if term and term[0] == 'EXIT':
+                cond = term[1]
+                if cond != 'true':
+                    self.emit('if (%s) {' % cond)
+                    self.indent += 1
+                self.exit_outputs()
+                self.emit('return;')
+                if cond != 'true':
+                    self.indent -= 1
+                    self.emit('}')
+            succ = successors(k, stacks[k])
+            if term and term[0] == 'BRX':
+                pc, w = ins[term[2]]
+                imm = (pc + 8 + sext(bits(w, 20, 24), 24)) & 0xffffffff
+                self.emit('{ uint t_ = %s + %du;' % (self.R(bits(w, 8, 8)), imm))
+                self.indent += 1
+                for (t, c, st), raw in zip(succ, self.jump_table(ins, term[2])):
+                    self.emit('if (t_ == %du) %s' % (raw, ('{ b%d = true; again_ = true; }' if t <= k else 'b%d = true;') % t))
                 self.indent -= 1
                 self.emit('}')
+            else:
+                for t, c, st in succ:
+                    set_ = ('{ b%d = true; again_ = true; }' if t <= k else 'b%d = true;') % t
+                    self.emit(set_ if c == 'true' else 'if (%s) %s' % (c, set_))
+            if k or loop:
+                self.indent -= 1
+                self.emit('}')
+        if loop:
+            self.indent -= 1
+            self.emit('}')
         self.exit_outputs()
-        return body, sorted(reach_needed)
+        return body, sorted(reach_needed), loop
 
     # ------------------------------------------------------------------ the whole shader
     def generate(self):
-        body, flags = self.translate()
+        body, flags, loop = self.translate()
         out = ['#version 460',
                '#extension GL_EXT_nonuniform_qualifier : require',
                '#extension GL_EXT_samplerless_texture_functions : require']
         if 'global' in self.uses:
             out += ['#extension GL_EXT_buffer_reference : require',
                     '#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require']
+        for u, ext in (('subgroup', 'basic'), ('quad', 'quad'), ('shuffle', 'shuffle'), ('ballot', 'ballot')):
+            if u in self.uses:
+                out.append('#extension GL_KHR_shader_subgroup_%s : require' % ext)
+        if 'layer' in self.uses:
+            out.append('#extension GL_ARB_shader_viewport_layer_array : require')
         out.append('// translated from Maxwell shader %s (%s)' % (os.path.basename(self.sh.path), self.stage))
         if self.stage == 'compute':
             lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
@@ -1427,7 +1709,7 @@ class Translator:
         if 'cc' in self.uses:
             out.append('    bool cc_z = false, cc_s = false, cc_c = false, cc_o = false;')
         for i in range(0, len(flags), 16):
-            out.append('    bool ' + ', '.join('b%d = false' % f for f in flags[i:i + 16]) + ';')
+            out.append('    bool ' + ', '.join('b%d = %s' % (f, 'true' if f == 0 else 'false') for f in flags[i:i + 16]) + ';')
         if self.stage == 'vertex':
             out.append('    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);')
             out.append('    gl_PointSize = pc.point_size;')     # NVN's point size, unless the shader writes one

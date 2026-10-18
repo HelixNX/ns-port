@@ -206,6 +206,7 @@ void vk_init(void) {
         .descriptorBindingUpdateUnusedWhilePending = 1, .shaderSampledImageArrayNonUniformIndexing = 1,
         .scalarBlockLayout = 1, .hostQueryReset = 1, .shaderFloat16 = 0, .samplerFilterMinmax = 1,
         .samplerMirrorClampToEdge = 1, .descriptorBindingVariableDescriptorCount = 1,
+        .shaderOutputLayer = 1, .shaderOutputViewportIndex = 1,
         .descriptorBindingUniformBufferUpdateAfterBind = 0, .descriptorBindingStorageBufferUpdateAfterBind = 0};
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12,
         .shaderDrawParameters = 1};
