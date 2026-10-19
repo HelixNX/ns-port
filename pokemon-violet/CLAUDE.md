@@ -203,7 +203,7 @@ of work; online code paths must fail as on a console with no internet, not crash
     brings back the whole-pool refresh to rule out the frame-rate change. Unattended runs from the save need A at
     the title screen first: `NX_INPUT='300-900/60:A;1000-1600/90:B;1800-2400:LSDOWN'`.
   - Next: fix the character movement above, then the first steps in the overworld (leave the bedroom). Also find
-    what c0[0x640..] holds on the console.
+    what c0[0x640..] holds on the console (0x640 / 0x644: base vertex / instance, solved 2026-10-19).
 - **Portability pass (2026-10-18, AMD RX 7800 XT; committed: nxrecomp `e705520`..`234d70d`, violetrecomp
   `e999f18`, workspace `7ab7c28`).** The overworld is playable on AMD. Every bug below relied on what NVIDIA does
   with undefined behaviour; the rule now is spec-correct SPIR-V and Vulkan use, checked with NX_VK_VALIDATION.
@@ -227,14 +227,23 @@ of work; online code paths must fail as on a console with no internet, not crash
   - Build: no machine paths. tools/vcenv.bat (vswhere, clang-cl), nxrecomp.cmake (deps/ or Vulkan SDK + vcpkg),
     GHIDRA_HOME for ghidra_export.ps1. FPS overlay (F3; NX_FPS=0). NX_DUMP_SSBO=<hash>, NX_DUMP_DRAWS=<target>
     with F12 (render target after every draw), NX_PROFILE='thread 5c'.
-  - **Open: objects near the camera are hidden (trees you can bump into).** Culling compute `b4b95eb6…` reads a
-    full-screen depth-stencil texture through a stencil view and keeps `& 7`: the game marks a region in stencil
-    and hides objects there. Shaders declare every texture float; a stencil view returns integers (undefined on
-    AMD). Fix: texture numeric types known to the shader (integer views for stencil and R8_UINT-style textures),
-    or a stencil copy into an R32_UINT image read through a same-bits float view.
+  - Objects near the camera were invisible (trees, the Gimmighoul rock; collision present): solved 2026-10-19.
+    GPU-culled objects are indirect draws with large base instances (257,199...), and vertex shaders add the base
+    instance from NVN's driver data, c0[0x644] (base vertex at c0[0x640]): Maxwell's instance / vertex ids leave
+    them out. We left c0 past 0x600 unbound (0), so every such object took instance 0's transform. translate.py
+    now reads c0[0x640] / c0[0x644] in vertex shaders as gl_BaseVertex / gl_BaseInstance, and the vertex id as
+    gl_VertexIndex - gl_BaseVertex. Found with F12's per-draw occlusion queries: depth pre-pass draws with 1-2
+    instances and 0 samples. (Not the culling compute `b4b95eb6…`: it never culls, it writes a fade value; its
+    stencil read now goes through integer views, HANDLE_INT.) Debugging added: NX_NO_DISCARD (discards off in
+    depth-writing draws), per-draw sample counts and indirect arguments in traced frames.
   - **Open: the Let's Go glow is far too bright** (green haze, a hexagon flare). Bloom is fine (this engine's
     "bright pass" is a clamped downsample by design); the composite `acbcacd1…` adds it from the half-res effects
     layer (960x540 f41 `12f4f6a000`). Suspect NVN blend factor / equation mappings (MK8 notes call them guesses).
+  - **Open: huge coloured glows from the `?` / `!` markers over wild Pokémon** (2026-10-19, frame 10268: red,
+    green, blue, white and pink blobs up to a quarter of the screen, near the camera). The user thinks it is
+    lighting / reflections rather than bloom. Perhaps the same cause as the Let's Go glow above. Next: F12 with
+    `NX_DUMP_DRAWS` on the lit scene buffer (12f5ee2000) and on the effects layer (12f4f6a000) to find the draw
+    that adds them.
   - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
     the `?` icon is fixed.
 - **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
