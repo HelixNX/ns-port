@@ -302,6 +302,17 @@ of work; online code paths must fail as on a console with no internet, not crash
     translating / presenting / waiting for the GPU), `cpu:` per thread (running, waiting for a core, asleep).
     `NX_GPU_PROF=1` adds GPU time per pass and what ended each pass, but its timestamps slow the GPU and make
     frame times uneven: leave it off for play.
+  - Second pass (2026-10-19): render thread 6.2 -> 3-5 ms a frame translating. shaders_intern / shader_intern
+    looked up through hash maps (were linear scans, 6%); stage_ubos reuses the last draw's c[0]/c[2] staging when
+    the stage's storage buffers, texture and image handles are unchanged (whole-stage caching hit only 15%:
+    uniform buffers or the shader change on most draws). The runtime now has line tables, so NX_PROFILE names
+    static functions (before, `run`, `draw`, `stage_ubos` all showed as `gpu_init`).
+  - Measured, not worth doing: deferring NVN barriers (almost all are 0x12 right before new render targets: ~7
+    passes a frame saved of ~165) and compute skinning (skipping the skinning shader `44f2ec77…` entirely changed
+    no frame time; NX_GPU_PROF's 1.9 ms for it is the drain after the barrier before each capture).
+  - Uncapped runs crashed in h_fps_speed_base (the frame duration's page set back to read-only raced another
+    thread's write); the page now stays writable. Sticks are clamped to the unit circle (WASD diagonals were 1.41x).
+  - Next: the CPU side (render thread ~60% of a core, main and 5a 40-50%): `NX_PROFILE='main'`.
 - **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
   instead of IDA:
   - `tools/ghidra/` (`ghidra_export.ps1`, `GhidraExport.java`, `GhidraOptions.java`): writes the same
