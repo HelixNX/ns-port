@@ -124,7 +124,8 @@ function(nx_game)
     # the game: the runtime (kernel, SVCs, services) around the lifted code
     add_executable(${NX_NAME} ${NX_RUNTIME_SOURCES} ${G_SOURCES})
     target_compile_options(${NX_NAME} PRIVATE /clang:-O2 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter
-                                              /clang:-Wno-bitwise-op-parentheses /clang:-fno-strict-aliasing)
+                                              /clang:-Wno-bitwise-op-parentheses /clang:-fno-strict-aliasing
+                                              /clang:-gline-tables-only /clang:-gcodeview)   # static functions named in profiles
     target_compile_definitions(${NX_NAME} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
     target_include_directories(${NX_NAME} PRIVATE "${NX_ROOT}/runtime" "${CMAKE_BINARY_DIR}"
                                "${NX_VULKAN_INCLUDE}" "${NX_SDL3_INCLUDE}")

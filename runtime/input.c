@@ -11,6 +11,7 @@
  * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks)
  * NX_INPUT_LOG logs every change of the input; NX_INPUT_REPLAY=<log file> plays such a log back by frame (a run
  * recorded by hand, replayed unattended), on top of live input. */
+#include <math.h>
 #include "hos.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
@@ -59,6 +60,12 @@ void input_event(const SDL_Event *e) {
 }
 
 static s32 axis(s32 v) { return v < -32767 ? -32767 : v; }
+/* a stick's travel is round: keys pressed together (W and A) or a pad reporting a square would go past full tilt
+ * on diagonals (by up to 1.41: the player moved that much faster) */
+static void round_stick(s32 *x, s32 *y) {
+    double m = sqrt((double)*x * *x + (double)*y * *y);
+    if (m > 32767) { *x = (s32)(*x * 32767 / m); *y = (s32)(*y * 32767 / m); }
+}
 
 /* NX_INPUT */
 static u64 scripted(u64 frame) {
@@ -188,6 +195,8 @@ void input_poll(void) {
         }
     }
     u64 pb;
+    round_stick(&lx, &ly);                              /* before replays: logs made before keep their values */
+    round_stick(&rx, &ry);
     s32 plx, ply, prx, pry;
     if (replayed(gpu_frames(), &pb, &plx, &ply, &prx, &pry)) {
         b |= pb;

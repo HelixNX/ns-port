@@ -690,8 +690,34 @@ static void smppool_register_builder(Ctx *c) {
 
 /* ---------------------------------------------------------------------------------------------- programs */
 typedef struct Program { Shaders *shaders; } Program;
-static struct { ShaderCode **items; u32 count, cap; SRWLOCK lock; } codes = {NULL, 0, 0, SRWLOCK_INIT};
-static struct { Shaders **items; u32 count, cap; } sets;
+/* u64 key -> pointer, open addressing (keys may repeat: match tells entries with one key apart) */
+typedef struct { u64 *keys; void **vals; u32 count, cap; } PtrMap;
+static u32 map_home(u64 key, u32 cap) { return (u32)((key * 0x9e3779b97f4a7c15ull) >> 32) & (cap - 1); }
+static void *map_find(const PtrMap *m, u64 key, bool (*match)(const void *v, const void *arg), const void *arg) {
+    if (!m->cap) return NULL;
+    for (u32 i = map_home(key, m->cap); m->vals[i]; i = (i + 1) & (m->cap - 1))
+        if (m->keys[i] == key && (!match || match(m->vals[i], arg))) return m->vals[i];
+    return NULL;
+}
+static void map_add(PtrMap *m, u64 key, void *v) {
+    if (2 * (m->count + 1) > m->cap) {
+        PtrMap n = {NULL, NULL, 0, m->cap ? 2 * m->cap : 256};
+        n.keys = calloc(n.cap, sizeof *n.keys);
+        n.vals = calloc(n.cap, sizeof *n.vals);
+        for (u32 i = 0; i < m->cap; i++) if (m->vals[i]) map_add(&n, m->keys[i], m->vals[i]);
+        free(m->keys);
+        free(m->vals);
+        *m = n;
+    }
+    u32 i = map_home(key, m->cap);
+    while (m->vals[i]) i = (i + 1) & (m->cap - 1);
+    m->keys[i] = key;
+    m->vals[i] = v;
+    m->count++;
+}
+
+static struct { PtrMap map; SRWLOCK lock; } codes = {{0}, SRWLOCK_INIT};    /* the lock also guards sets */
+static PtrMap sets;
 static char shader_dir[MAX_PATH];
 
 static void shader_dump(const ShaderCode *s, const void *control) {
@@ -740,9 +766,9 @@ static ShaderCode *shader_intern(u64 data, u64 control) {
     if (end < 0x80 || end > 0x100000) end = 0x30 + LD32(control + 0x6f8);
     u64 h = fnv64(PTR(code), end);
     AcquireSRWLockExclusive(&codes.lock);
-    for (u32 i = 0; i < codes.count; i++)
-        if (codes.items[i]->hash == h) { ReleaseSRWLockExclusive(&codes.lock); return codes.items[i]; }
-    ShaderCode *s = calloc(1, sizeof *s);
+    ShaderCode *s = map_find(&codes.map, h, NULL, NULL);
+    if (s) { ReleaseSRWLockExclusive(&codes.lock); return s; }
+    s = calloc(1, sizeof *s);
     s->hash = h;
     s->code = code;
     s->size = end;
@@ -751,8 +777,7 @@ static ShaderCode *shader_intern(u64 data, u64 control) {
     s->const_size = csize;
     if (s->stage == ST_VERTEX)          /* GLSLC: transform feedback strides, u16 per buffer at 0x6dc */
         for (int b = 0; b < 4; b++) s->xfb_stride[b] = LD16(control + 0x6dc + 2 * b);
-    if (codes.count == codes.cap) codes.items = realloc(codes.items, (codes.cap = codes.cap * 2 + 64) * sizeof *codes.items);
-    codes.items[codes.count++] = s;
+    map_add(&codes.map, h, s);
     ReleaseSRWLockExclusive(&codes.lock);
     shader_dump(s, PTR(control));
     gpu_shader_created(s);
@@ -782,6 +807,10 @@ static void set_shaders(Ctx *c, u32 stride) {
     RET(1);
 }
 
+static bool same_stages(const void *v, const void *arg) {
+    return !memcmp(((const Shaders *)v)->stage, ((const Shaders *)arg)->stage, sizeof ((const Shaders *)v)->stage);
+}
+
 /* one Shaders object per combination of stages (pipelines are keyed by it) */
 Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]) {
     Shaders set;
@@ -791,15 +820,16 @@ Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]) {
         if (stage[i]) set.mask |= 1u << i;
         set.key = set.key * 31 + (stage[i] ? stage[i]->hash : 0);
     }
+    AcquireSRWLockShared(&codes.lock);
+    Shaders *found = map_find(&sets, set.key, same_stages, &set);
+    ReleaseSRWLockShared(&codes.lock);
+    if (found) return found;
     AcquireSRWLockExclusive(&codes.lock);
-    Shaders *found = NULL;
-    for (u32 i = 0; i < sets.count && !found; i++)
-        if (sets.items[i]->key == set.key && !memcmp(sets.items[i]->stage, set.stage, sizeof set.stage)) found = sets.items[i];
+    found = map_find(&sets, set.key, same_stages, &set);
     if (!found) {
         found = malloc(sizeof *found);
         *found = set;
-        if (sets.count == sets.cap) sets.items = realloc(sets.items, (sets.cap = sets.cap * 2 + 64) * sizeof *sets.items);
-        sets.items[sets.count++] = found;
+        map_add(&sets, set.key, found);
     }
     ReleaseSRWLockExclusive(&codes.lock);
     return found;

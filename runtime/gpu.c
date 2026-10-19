@@ -37,6 +37,7 @@ typedef struct Slot {
 } Slot;
 static Slot slots[SLOTS];
 static int cur = -1;                    /* the slot being recorded, or -1 */
+static u64 slot_serial;                 /* bumped with each slot opened (staging from older ones is gone) */
 static u64 submitted;                   /* last timeline value submitted */
 static u32 work_unflushed;              /* draws and dispatches recorded since the last submission */
 static VkSemaphore timeline;
@@ -219,6 +220,7 @@ static void slot_open(void) {
     if (prof_on) prof_mark_in(next, "outside passes (copies, clears, barriers)");
     cur = next;
     next = (next + 1) % SLOTS;
+    slot_serial++;
 }
 
 static VkCommandBuffer cmd(void) {
@@ -290,6 +292,7 @@ static void flush(void) {
 typedef struct PoolEnt { u64 gpu, end, cpu; u32 flags; HostBuffer *hb; } PoolEnt;
 static PoolEnt *pools;
 static int npools, cappools;
+static u64 pools_gen;                   /* bumped when pools come or go (cached device addresses) */
 
 static PoolEnt *pool_find(u64 addr) {
     int lo = 0, hi = npools - 1;
@@ -338,6 +341,7 @@ void gpu_pool_created(Pool *p) {
     while (i > 0 && pools[i - 1].gpu > p->gpu) { pools[i] = pools[i - 1]; i--; }
     pools[i] = (PoolEnt){p->gpu, p->gpu + p->size, p->flags & POOL_VIRTUAL ? 0 : p->storage, p->flags, hb};
     npools++;
+    pools_gen++;
     images_drop_range(p->gpu, p->gpu + p->size);
     LeaveCriticalSection(&gpu_cs);
 }
@@ -350,6 +354,7 @@ void gpu_pool_destroyed(Pool *p) {
             if (pools[i].hb) bury(DEAD_HOSTBUF, pools[i].hb, NULL);
             memmove(&pools[i], &pools[i + 1], (npools - i - 1) * sizeof *pools);
             npools--;
+            pools_gen++;
             break;
         }
     images_drop_range(p->gpu, p->gpu + p->size);
@@ -2237,50 +2242,73 @@ static void skip_draw(const char *why) {
     hlog(1, "gpu: draw skipped: %s", why);
 }
 
+/* c[0] / c[2] (driver data) depend on the storage buffers, texture and image handles (and compute's uniform
+ * buffers), which most draws leave as the last draw had them: then its staging copy is used again */
+typedef struct {
+    u64 serial, pools_gen;
+    BufferRange ssbo[16], ubo[18];
+    u32 tex[32], img[8];
+    VkBuffer sbuf;
+    u64 soff;
+} DrvCache;
+
 /* the uniform buffers of one stage (push descriptors at binding base + slot; the shader says which c[i] each slot
  * holds: c[i] in slot i, c[16] in one the shader leaves free) */
 static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescriptorSet *w, VkDescriptorBufferInfo *bi) {
-    VkBuffer sbuf;
-    u64 soff;
-    u8 *drv = staging(0x800, &sbuf, &soff);    /* c[0] at 0, c[2] at 0x600 */
-    memset(drv, 0, 0x800);
-    /* c[0]: buffer tables with device addresses {lo, hi, size}. Graphics: storage buffers at 0x110.
-     * Compute (no cbuf slots for the game's uniform buffers there): uniform buffers at 0x220, storage at 0x310 */
-    u32 ssbo_at = stage == ST_COMPUTE ? 0x310 : 0x110;
-    for (u32 k = 0; k < 16 + 14; k++) {
-        const BufferRange *r = k < 16 ? &st.ssbo[stage][k] : &st.ubo[stage][k - 16];
-        if (k >= 16 && stage != ST_COMPUTE) break;
-        PoolEnt *p = r->addr ? pool_find(r->addr) : NULL;
-        if (r->addr && (!p || !p->hb)) {
-            static u64 warned[64];
-            u64 key = (sc ? sc->hash : 0) ^ k;
-            int seen = 0;
-            for (int j = 0; j < 64 && warned[j] && !seen; j++) seen = warned[j] == key;
-            for (int j = 0; j < 64 && !seen; j++) if (!warned[j]) { warned[j] = key; break; }
-            if (!seen)
-                hlog(0, "gpu: shader %016llx %s %u at %llx (size %llx) is in no host-mapped pool: left 0",
-                     sc ? sc->hash : 0, k < 16 ? "ssbo" : "ubo", k < 16 ? k : k - 16, r->addr, (u64)r->size);
-        }
-        if (!p || !p->hb) continue;
-        u64 dev = p->hb->addr + (r->addr - p->gpu);
-        static int ssbo_log = -1;
-        if (ssbo_log < 0) ssbo_log = getenv("NX_SSBO_LOG") != NULL;
-        if (ssbo_log && sc && stage == ST_COMPUTE)
-            hlog(0, "gpu: cs %016llx %s %u: %llx size %llx -> dev %llx", sc->hash, k < 16 ? "ssbo" : "ubo",
-                 k < 16 ? k : k - 16, r->addr, (u64)r->size, dev);
-        u32 v[4] = {(u32)dev, (u32)(dev >> 32), (u32)r->size, 0};
-        memcpy(drv + (k < 16 ? ssbo_at + 16 * k : 0x220 + 16 * (k - 16)), v, 16);
-    }
+    static DrvCache cache[ST_COUNT];
+    static int ssbo_log = -1;
+    if (ssbo_log < 0) ssbo_log = getenv("NX_SSBO_LOG") != NULL;
+    DrvCache key;
+    memset(&key, 0, sizeof key);        /* compared with memcmp: padding included */
+    cmd();
+    key.serial = slot_serial;
+    key.pools_gen = pools_gen;
+    memcpy(key.ssbo, st.ssbo[stage], sizeof key.ssbo);
+    if (stage == ST_COMPUTE) memcpy(key.ubo, st.ubo[stage], sizeof key.ubo);
     DescSet *ts = descset_get(&st.texpool, DS_TEX);
     for (u32 k = 0; k < 32; k++) {
         u32 h = (u32)st.tex[stage][k], id = h & 0xfffff;
         if (ts && id < ts->count && ts->intv[id]) h |= HANDLE_INT;
-        memcpy(drv + 0x600 + 0x20 + 8 * k, &h, 4);
+        key.tex[k] = h;
     }
-    for (u32 k = 0; k < 8; k++) {      /* image handles at 0x120 */
-        u32 h = (u32)st.img[stage][k];
-        memcpy(drv + 0x600 + 0x120 + 8 * k, &h, 4);
+    for (u32 k = 0; k < 8; k++) key.img[k] = (u32)st.img[stage][k];
+    DrvCache *cc = &cache[stage % ST_COUNT];
+    if (ssbo_log || memcmp(cc, &key, offsetof(DrvCache, sbuf))) {
+        key.sbuf = NULL;
+        key.soff = 0;
+        u8 *drv = staging(0x800, &key.sbuf, &key.soff);    /* c[0] at 0, c[2] at 0x600 */
+        memset(drv, 0, 0x800);
+        /* c[0]: buffer tables with device addresses {lo, hi, size}. Graphics: storage buffers at 0x110.
+         * Compute (no cbuf slots for the game's uniform buffers there): uniform buffers at 0x220, storage at 0x310 */
+        u32 ssbo_at = stage == ST_COMPUTE ? 0x310 : 0x110;
+        for (u32 k = 0; k < 16 + 14; k++) {
+            const BufferRange *r = k < 16 ? &st.ssbo[stage][k] : &st.ubo[stage][k - 16];
+            if (k >= 16 && stage != ST_COMPUTE) break;
+            PoolEnt *p = r->addr ? pool_find(r->addr) : NULL;
+            if (r->addr && (!p || !p->hb)) {
+                static u64 warned[64];
+                u64 wkey = (sc ? sc->hash : 0) ^ k;
+                int seen = 0;
+                for (int j = 0; j < 64 && warned[j] && !seen; j++) seen = warned[j] == wkey;
+                for (int j = 0; j < 64 && !seen; j++) if (!warned[j]) { warned[j] = wkey; break; }
+                if (!seen)
+                    hlog(0, "gpu: shader %016llx %s %u at %llx (size %llx) is in no host-mapped pool: left 0",
+                         sc ? sc->hash : 0, k < 16 ? "ssbo" : "ubo", k < 16 ? k : k - 16, r->addr, (u64)r->size);
+            }
+            if (!p || !p->hb) continue;
+            u64 dev = p->hb->addr + (r->addr - p->gpu);
+            if (ssbo_log && sc && stage == ST_COMPUTE)
+                hlog(0, "gpu: cs %016llx %s %u: %llx size %llx -> dev %llx", sc->hash, k < 16 ? "ssbo" : "ubo",
+                     k < 16 ? k : k - 16, r->addr, (u64)r->size, dev);
+            u32 v[4] = {(u32)dev, (u32)(dev >> 32), (u32)r->size, 0};
+            memcpy(drv + (k < 16 ? ssbo_at + 16 * k : 0x220 + 16 * (k - 16)), v, 16);
+        }
+        for (u32 k = 0; k < 32; k++) memcpy(drv + 0x600 + 0x20 + 8 * k, &key.tex[k], 4);
+        for (u32 k = 0; k < 8; k++) memcpy(drv + 0x600 + 0x120 + 8 * k, &key.img[k], 4);   /* image handles at 0x120 */
+        *cc = key;
     }
+    VkBuffer sbuf = cc->sbuf;
+    u64 soff = cc->soff;
     for (u32 slot = 0; slot < 16; slot++) {
         u32 i = sc ? sc->cb_of_slot[slot] : slot;
         VkDescriptorBufferInfo *b = &bi[slot];
