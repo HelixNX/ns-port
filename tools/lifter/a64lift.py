@@ -356,6 +356,7 @@ class Program:
     def __init__(self, names=MODULES, overrides=None):
         self.mods = {n: Mod(n) for n in names}
         self.overrides = overrides or set()       # symbols replaced by host code: calls become h_<symbol>(c)
+        self.patches = load_patches(self.mods)    # absolute address -> (was, kind, arg), see load_patches
         self.sym_addr = {}                        # symbol -> absolute address of its definition
         for n in MODULES:
             if n in self.mods:
@@ -650,7 +651,8 @@ def lift_function(env, owner, secondary=(), stats=None):
             fn.labels.add(pc)
         w = mod.word(pc - mod.base)
         try:
-            stmt = lift_insn(fn, w, pc)
+            patch = env.prog.patches.get(pc)
+            stmt = lift_patched(fn, w, pc, patch) if patch else lift_insn(fn, w, pc)
             if stats is not None:
                 stats['ok'] += 1
         except Unimpl as e:
@@ -667,6 +669,24 @@ def lift_function(env, owner, secondary=(), stats=None):
         lines.append((None, fn.jump(nxt) if (nxt in fn.addrs or env_is_entry(env, nxt))
                       else 'guest_trap(c, "ran past the end of a function", 0x%xull); return;' % nxt))
     return emit(fn, lines, entries)
+
+
+def lift_patched(fn, w, pc, patch):
+    """The instruction at pc with a patch from patches.txt (see load_patches)."""
+    was, kind, arg = patch
+    if w != was:
+        raise SystemExit('patches.txt: %x holds %08x, not %08x (another version of the game?)' % (pc, w, was))
+    if kind == 'if':
+        name, new = arg
+        fk = fn.fk
+        s_new = lift_insn(fn, new, pc)
+        fn.fk = fk
+        s_old = lift_insn(fn, w, pc)
+        fn.fk = None
+        return '{ extern volatile u8 nx_flag_%s; if (nx_flag_%s) { %s } else { %s } }' % (name, name, s_new, s_old)
+    call = '{ extern void h_%s(Ctx *); SAVE; h_%s(c); LOAD; }' % (arg, arg)
+    fn.fk = None
+    return call if kind == 'call' else lift_insn(fn, w, pc) + ' ' + call
 
 
 def env_is_entry(env, addr):
@@ -855,6 +875,35 @@ class Out(io.StringIO):
         if exc[0] is None:
             write_if_changed(self.path, self.getvalue())
         return super().__exit__(*exc)
+
+
+def load_patches(mods):
+    """The game's instruction patches (patches.txt next to game.json), one per line:
+        <module>+<offset> was <word> if <flag> <word>   both lifted: the second while nx_flag_<flag> (a u8 the game's
+                                                        host code defines) is nonzero, else the original
+        <module>+<offset> was <word> call <name>        h_<name>(c) runs in place of the instruction
+        <module>+<offset> was <word> after <name>       h_<name>(c) runs after it
+    `was` is the original instruction: a mismatch (another build of the game) stops the lift. The replacement words
+    and patched instructions must not branch."""
+    out = {}
+    path = os.path.join(gamecfg.DIR, 'patches.txt')
+    if not os.path.exists(path):
+        return out
+    for ln in open(path):
+        t = ln.split('#')[0].split()
+        if not t:
+            continue
+        m, off = t[0].split('+')
+        if m not in mods or t[1] != 'was' or t[3] not in ('if', 'call', 'after'):
+            raise SystemExit('patches.txt: bad line: ' + ln.strip())
+        addr = mods[m].base + int(off, 16)
+        was = int(t[2], 16)
+        arg = (t[4], int(t[5], 16)) if t[3] == 'if' else t[4]
+        for wd in (was, arg[1]) if t[3] == 'if' else (was,):
+            if branch_targets(wd, addr) or (wd & 0x7c000000) == 0x14000000 or (wd & 0xfe000000) == 0xd6000000:
+                raise SystemExit('patches.txt: %x: %08x branches' % (addr, wd))
+        out[addr] = (was, t[3], arg)
+    return out
 
 
 def load_overrides():

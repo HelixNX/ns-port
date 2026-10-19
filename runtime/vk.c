@@ -1,5 +1,6 @@
 /* Vulkan: instance and device (the discrete GPU), the SDL window and its swapchain, device memory. See vk.h. */
 #include "vk.h"
+#include "framerate.h"
 #include "game_config.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -45,6 +46,7 @@ void window_loop(void *guest_main_thread) {
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F5 && !e.key.repeat) nx_framerate_cycle();
             } while (SDL_PollEvent(&e));
         }
         input_poll();
@@ -481,6 +483,12 @@ static struct {
     u32 frame;
 } sw;
 
+static volatile LONG unthrottled;
+
+void vk_set_unthrottled(bool on) {
+    if (InterlockedExchange(&unthrottled, on) != (LONG)on) InterlockedExchange(&resized, 1);   /* a new swapchain */
+}
+
 static void swapchain_create(void) {
     VkSurfaceCapabilitiesKHR caps;
     VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps));
@@ -501,11 +509,12 @@ static void swapchain_create(void) {
     VkPresentModeKHR modes[16];
     if (nm > 16) nm = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &nm, modes);
-    /* NX_NOPACE (uncapped): not even the display's pace; IMMEDIATE tears, so only then */
-    bool nopace = getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE"));
+    /* uncapped or above 60 fps (vk_set_unthrottled): not held to the display's refresh; IMMEDIATE tears, so only
+     * then and only without MAILBOX */
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (u32 i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
-    for (u32 i = 0; nopace && i < nm; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
+    bool mailbox = false;
+    for (u32 i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i], mailbox = true;
+    for (u32 i = 0; unthrottled && !mailbox && i < nm; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
     static const char *const mode_names[] = {"immediate", "mailbox", "FIFO", "relaxed FIFO"};
     hlog(1, "vk: present mode %s", mode < 4 ? mode_names[mode] : "other");
     VkExtent2D ext = caps.currentExtent;
@@ -567,14 +576,16 @@ static void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, 
  * image. On unless NX_FPS=0; F3 toggles it. */
 #define OV_FRAMES 1024
 #define OV_W 200
-#define OV_H 80
+#define OV_H 134
+#define OV_LINES 7
 #define OV_SCALE 2
 static volatile LONG overlay_on = -1;
 static struct {
     double times[OV_FRAMES];                /* ms */
+    double steps[OV_FRAMES];                /* the game time each frame stood for, ms */
     u32 n, next;
     LARGE_INTEGER last, freq, shown;
-    char lines[4][24];
+    char lines[OV_LINES][24];
     VkBuf buf[PRESENT_FRAMES];
 } ov;
 
@@ -590,7 +601,12 @@ static const struct { char c; u8 rows[7]; } glyphs[] = {
     {'M', {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}}, {'O', {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
     {'P', {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}}, {'S', {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}},
     {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}}, {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}},
-    {'X', {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11}},
+    {'X', {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11}}, {'T', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'I', {0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e}}, {'C', {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}}, {'H', {0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}},
+    {'Z', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f}}, {'E', {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}},
+    {'D', {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}}, {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
+    {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}}, {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
 };
 
 void overlay_toggle(void) {
@@ -617,6 +633,16 @@ static void overlay_stats(void) {
     snprintf(ov.lines[1], sizeof ov.lines[1], "5%% LOW %.1f", 1000.0 * n5 / s5);
     snprintf(ov.lines[2], sizeof ov.lines[2], "1%% LOW %.1f", 1000.0 * n1 / s1);
     snprintf(ov.lines[3], sizeof ov.lines[3], "MS %.1f MAX %.0f", last, sorted[0]);
+    /* the frame rate set, the game's tick rate (game time a second in 30 Hz ticks, the game's own rate: each frame
+     * steps the game by the time it stands for, so 30 at normal speed whatever the frame rate) and its speed */
+    s32 r = nx_framerate();
+    if (r == FRAMERATE_GAME) snprintf(ov.lines[4], sizeof ov.lines[4], "CAP GAME");
+    else if (r == FRAMERATE_UNCAPPED) snprintf(ov.lines[4], sizeof ov.lines[4], "CAP NONE");
+    else snprintf(ov.lines[4], sizeof ov.lines[4], "CAP %d", r);
+    double steps = 0;
+    for (u32 i = 0; i < n; i++) steps += ov.steps[i];
+    snprintf(ov.lines[5], sizeof ov.lines[5], "TICK %.1f HZ", 30.0 * steps / sum);
+    snprintf(ov.lines[6], sizeof ov.lines[6], "SPEED %.0f%%", 100.0 * steps / sum);
 }
 
 /* draw the overlay for present frame f; false when it is off or the swapchain format is not 8-bit BGRA/RGBA */
@@ -633,6 +659,7 @@ static bool overlay_draw(u32 f) {
         return false;
     }
     ov.times[ov.next] = 1000.0 * (double)(now.QuadPart - ov.last.QuadPart) / (double)ov.freq.QuadPart;
+    ov.steps[ov.next] = nx_frame_step_ns() / 1e6;
     ov.next = (ov.next + 1) % OV_FRAMES;
     if (ov.n < OV_FRAMES) ov.n++;
     ov.last = now;
@@ -651,7 +678,7 @@ static bool overlay_draw(u32 f) {
     if (!px) return false;
     u32 bg = 0xff181818, fg = 0xff40ff40;      /* green on dark grey, the same in BGRA and RGBA */
     for (u32 i = 0; i < OV_W * OV_H; i++) px[i] = bg;
-    for (int l = 0; l < 4; l++) {
+    for (int l = 0; l < OV_LINES; l++) {
         int x0 = 8, y0 = 6 + l * 18;
         for (const char *s = ov.lines[l]; *s; s++, x0 += 6 * OV_SCALE) {
             const u8 *rows = NULL;

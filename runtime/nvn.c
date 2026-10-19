@@ -13,6 +13,8 @@
  * Enum values follow the NVN headers' numbering as we know it; the first use of each state setter is logged at
  * level 2 so that a wrong guess shows. */
 #include "nvn.h"
+#include "framerate.h"
+#include "vk.h"
 #include <stdlib.h>
 #include <windows.h>
 
@@ -1437,7 +1439,45 @@ static void queue_acquire(Ctx *c) {
     w->next = (w->next + 1) % w->count;
     RET(0);
 }
-/* present, then keep the pace of the display (60 Hz / interval) */
+/* frame rate (framerate.h): NX_FRAMERATE=<fps>, 0 uncapped (as NX_NOPACE=1), unset the game's own */
+static volatile LONG framerate = -2;    /* -2 not read yet */
+static double frame_ns_smooth;          /* measured frame time, smoothed */
+
+s32 nx_framerate(void) {
+    if (framerate == -2) {
+        const char *e = getenv("NX_FRAMERATE");
+        LONG r = e ? atoi(e) : getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE")) ? FRAMERATE_UNCAPPED : FRAMERATE_GAME;
+        InterlockedCompareExchange(&framerate, r, -2);
+        vk_set_unthrottled(framerate == FRAMERATE_UNCAPPED || framerate > 60);
+    }
+    return framerate;
+}
+
+void nx_framerate_cycle(void) {
+    s32 r = nx_framerate();
+    r = r == FRAMERATE_GAME ? 60 : r == 60 ? 120 : r == 120 ? FRAMERATE_UNCAPPED : FRAMERATE_GAME;
+    InterlockedExchange(&framerate, r);
+    vk_set_unthrottled(r == FRAMERATE_UNCAPPED || r > 60);
+    if (r == FRAMERATE_GAME) hlog(0, "frame rate: the game's own");
+    else if (r == FRAMERATE_UNCAPPED) hlog(0, "frame rate: uncapped");
+    else hlog(0, "frame rate: %d fps", r);
+}
+
+static double game_step_ns = 1e9 / 30;  /* at the game's own rate: its present interval's */
+
+double nx_frame_step_ns(void) {
+    s32 r = nx_framerate();
+    return r == FRAMERATE_GAME ? game_step_ns : r == 30 ? 1e9 / 30 : nx_frame_ns();
+}
+
+double nx_frame_ns(void) {
+    s32 r = nx_framerate();
+    double target = r > 0 ? 1e9 / r : 1e9 / 1000;
+    double ns = frame_ns_smooth > target ? frame_ns_smooth : target;
+    return ns < 1e9 / 15 ? ns : 1e9 / 15;   /* below 15 fps the game slows down rather than taking huge steps */
+}
+
+/* present, then keep the pace: the display's (60 Hz / the game's interval) or the frame rate set */
 static void queue_present(Ctx *c) {
     Window *w = obj_get(A(1), T_WINDOW);
     if (!w) return;
@@ -1450,10 +1490,10 @@ static void queue_present(Ctx *c) {
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&now);
-    s64 period = f.QuadPart / 60 * (w->interval ? w->interval : 1);
-    static int nopace = -1;                     /* NX_NOPACE=1: as fast as it goes (unattended runs) */
-    if (nopace < 0) nopace = getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE"));
-    if (w->last && !nopace) {
+    s32 rate = nx_framerate();
+    game_step_ns = 1e9 / 60 * (w->interval ? w->interval : 1);
+    s64 period = rate > 0 ? f.QuadPart / rate : f.QuadPart / 60 * (w->interval ? w->interval : 1);
+    if (w->last && rate != FRAMERATE_UNCAPPED) {
         s64 due = w->last + period - now.QuadPart;
         if (due > 0) thread_sleep(due * 1000000000 / f.QuadPart);
         if (due > -period) now.QuadPart = w->last + period;
@@ -1466,7 +1506,11 @@ static void queue_present(Ctx *c) {
     static s64 prev;
     LARGE_INTEGER real;
     QueryPerformanceCounter(&real);
-    if (prev && nft < 600) ft[nft++] = (double)(real.QuadPart - prev) * 1000.0 / (double)f.QuadPart;
+    if (prev) {
+        double ms = (double)(real.QuadPart - prev) * 1000.0 / (double)f.QuadPart;
+        if (nft < 600) ft[nft++] = ms;
+        frame_ns_smooth = frame_ns_smooth ? frame_ns_smooth * 0.85 + ms * 1e6 * 0.15 : ms * 1e6;
+    }
     prev = real.QuadPart;
     w->last = now.QuadPart;
     static u64 frames;
@@ -1499,7 +1543,12 @@ static void queue_present(Ctx *c) {
 }
 static void win_get_native(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->native : 0); }
 static void win_get_interval(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->interval : 0); }
-static void win_set_interval(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w) w->interval = (u32)A(1); }
+static void win_set_interval(Ctx *c) {
+    Window *w = obj_get(A(0), T_WINDOW);
+    if (!w) return;
+    if (w->interval != (u32)A(1)) hlog(1, "nvn: present interval %u", (u32)A(1));
+    w->interval = (u32)A(1);
+}
 static void win_set_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w) for (int i = 0; i < 4; i++) w->crop[i] = (s32)A(1 + i); }
 static void win_get_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w && A(1)) memcpy(P(void, 1), w->crop, 16); }
 
