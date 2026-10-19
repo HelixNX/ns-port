@@ -285,10 +285,15 @@ static void queue_initialize(Ctx *c) {
 }
 static void queue_finalize(Ctx *c) { gpu_finish(A(0)); obj_free(A(0)); }
 static void queue_get_error(Ctx *c) { if (A(1)) memset(P(void, 1), 0, 0x18); RET(0); }
-/* nvnQueueSubmitCommands(queue, int count, const NVNcommandHandle *) */
+/* nvnQueueSubmitCommands(queue, int count, const NVNcommandHandle *). Translating the commands is the console GPU's
+ * work, not the CPU core's: the thread gives up its core meanwhile (else the threads sharing that core waited
+ * for it, the main thread 60% of the time in Mesagoza) */
 static void queue_submit(Ctx *c) {
     u32 n = (u32)A(1);
-    if (n) gpu_submit(A(0), n, P(u64, 2));
+    if (!n) return;
+    core_leave();
+    gpu_submit(A(0), n, P(u64, 2));
+    core_enter();
 }
 static void queue_flush(Ctx *c) { gpu_flush(A(0)); }
 static void queue_finish(Ctx *c) { gpu_finish(A(0)); }
@@ -1437,7 +1442,11 @@ static void queue_present(Ctx *c) {
     Window *w = obj_get(A(1), T_WINDOW);
     if (!w) return;
     u32 index = (u32)A(2);
-    if (index < w->count) gpu_present(A(0), w, index);
+    if (index < w->count) {
+        core_leave();                           /* as for queue_submit */
+        gpu_present(A(0), w, index);
+        core_enter();
+    }
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&now);
@@ -1450,11 +1459,41 @@ static void queue_present(Ctx *c) {
         if (due > -period) now.QuadPart = w->last + period;
         else QueryPerformanceCounter(&now);
     }
+    /* frame times (present to present, after pacing, as measured: `now` is the ideal time while on pace) for the
+     * report every 600 frames */
+    static double ft[600];
+    static u32 nft;
+    static s64 prev;
+    LARGE_INTEGER real;
+    QueryPerformanceCounter(&real);
+    if (prev && nft < 600) ft[nft++] = (double)(real.QuadPart - prev) * 1000.0 / (double)f.QuadPart;
+    prev = real.QuadPart;
     w->last = now.QuadPart;
     static u64 frames;
     if (++frames == 1) hlog(1, "nvn: first frame presented");
     if (frames % 600 == 0) {
         hlog(1, "nvn: %llu frames presented", frames);
+        if (nft) {
+            double sum = 0, worst = 0, target = 1000.0 / 60 * (w->interval ? w->interval : 1);
+            u32 slow = 0;
+            for (u32 i = 0; i < nft; i++) {
+                sum += ft[i];
+                if (ft[i] > worst) worst = ft[i];
+                if (ft[i] > target * 1.5) slow++;
+            }
+            /* 1% low: the average of the slowest 1% of frames */
+            static double sorted[600];
+            memcpy(sorted, ft, nft * sizeof *ft);
+            for (u32 i = 1; i < nft; i++)
+                for (u32 j = i; j && sorted[j - 1] < sorted[j]; j--) { double t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t; }
+            u32 k = nft / 100 ? nft / 100 : 1;
+            double low = 0;
+            for (u32 i = 0; i < k; i++) low += sorted[i];
+            low /= k;
+            hlog(1, "nvn: frame time %.2f ms average (%.1f fps), 1%% low %.2f ms, worst %.2f ms, %u over %.1f ms",
+                 sum / nft, 1000.0 * nft / sum, low, worst, slow, target * 1.5);
+        }
+        nft = 0;
         kernel_report_cpu(frames);
     }
 }

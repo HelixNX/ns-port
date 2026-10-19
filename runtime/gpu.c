@@ -23,7 +23,7 @@ static u64 frame_no;                    /* frames presented so far */
 static bool gpu_ready;
 
 /* ---------------------------------------------------------------------------------------------- submissions */
-#define SLOTS 6
+#define SLOTS 12
 #define STAGING_SIZE (32ull << 20)
 typedef struct Slot {
     VkCommandPool pool;
@@ -38,6 +38,7 @@ typedef struct Slot {
 static Slot slots[SLOTS];
 static int cur = -1;                    /* the slot being recorded, or -1 */
 static u64 submitted;                   /* last timeline value submitted */
+static u32 work_unflushed;              /* draws and dispatches recorded since the last submission */
 static VkSemaphore timeline;
 
 
@@ -94,6 +95,11 @@ static ProfName prof_names[PROF_NAMES];
 static u32 nprof_names;
 static u16 prof_hash[2 * PROF_NAMES];   /* open addressing: name index + 1 */
 static double prof_slot_wait_ms, prof_guest_wait_ms;
+/* guest waits for the GPU by how many submissions behind the newest the awaited one was (0: the newest) */
+static double prof_wait_ms[4];
+static u64 prof_wait_n[4];
+/* passes ended, by the gpu.c line that ended them */
+static struct { u32 line; u64 count; } prof_ends[64];
 
 static u16 prof_intern(const char *name) {
     u32 h = 2166136261u;
@@ -153,9 +159,25 @@ static void prof_report(u64 frames) {
     for (u32 i = 0; i < nprof_names && i < (prof_on > 1 ? 50u : 25u) && sorted[i].ms > 0; i++)
         hlog(0, "gpu prof: %7.3f ms %6.1f/frame  %s", sorted[i].ms / frames, (double)sorted[i].count / frames,
              sorted[i].name);
+    static const char *const behind[4] = {"the newest submission", "1 behind", "2-9 behind", "10+ behind"};
+    for (u32 i = 0; i < 4; i++)
+        if (prof_wait_n[i])
+            hlog(0, "gpu prof: guest waits on %s: %.1f/frame, %.2f ms/frame", behind[i], (double)prof_wait_n[i] / frames,
+                 prof_wait_ms[i] / frames);
+    static u64 last_submitted;
+    hlog(0, "gpu prof: %.1f submissions/frame", (double)(submitted - last_submitted) / frames);
+    last_submitted = submitted;
+    memset(prof_wait_ms, 0, sizeof prof_wait_ms);
+    memset(prof_wait_n, 0, sizeof prof_wait_n);
+    for (u32 i = 0; i < 64 && prof_ends[i].line; i++)
+        if (prof_ends[i].count) hlog(0, "gpu prof: %6.1f passes/frame ended at gpu.c:%u", (double)prof_ends[i].count / frames, prof_ends[i].line);
+    for (u32 i = 0; i < 64; i++) prof_ends[i].count = 0;
     for (u32 i = 0; i < nprof_names; i++) prof_names[i].ms = 0, prof_names[i].count = 0;
     prof_slot_wait_ms = prof_guest_wait_ms = 0;
 }
+
+/* the render thread's time per frame in our code, for the report every 600 frames */
+static double t_submit_ms, t_present_ms, t_wait_ms;
 
 static double ms_now(void) {
     LARGE_INTEGER c, f;
@@ -242,7 +264,8 @@ static void barrier(void) {
     vkCmdPipelineBarrier2(cmd(), &d);
 }
 
-static void end_rendering(void);
+static void end_rendering_at(u32 line);
+#define end_rendering() end_rendering_at(__LINE__)
 
 static void flush(void) {
     end_rendering();
@@ -259,6 +282,7 @@ static void flush(void) {
     VkResult r = vkQueueSubmit2(vk.queue, 1, &si, NULL);
     if (r < 0) fatal("vkQueueSubmit2: %d (device lost?)", r);
     cur = -1;
+    work_unflushed = 0;
     reap();
 }
 
@@ -353,6 +377,7 @@ typedef struct Image {
     int nviews, capviews;
     struct Image *next;
 } Image;
+static void image_touch(Image *im);
 #define IMAGE_BUCKETS 4096
 static Image *buckets[IMAGE_BUCKETS];
 static int nimages;
@@ -582,7 +607,7 @@ static Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
     int i = byaddr_lower(t->addr + 1);
     for (int n = 0; i > 0 && n < 64; n++) {
         Image *I = byaddr[--i];
-        if (sub_of(I, t, layer, level)) { I->used = frame_no + 1; return I; }
+        if (sub_of(I, t, layer, level)) { image_touch(I); return I; }
     }
     Image *im = image_get(t);
     if (!im) return NULL;
@@ -961,6 +986,7 @@ typedef struct State {
     u64 xfb_written[4];
     bool xfb_active;                    /* between Begin (or Resume) and End (or Pause) */
     bool xfb_captured;                  /* a draw captured since the last barrier */
+    u64 xfb_dirty[4][2];                /* the bytes captured since then: [lo, hi) of each buffer's addresses */
 } State;
 
 static State st;                        /* the GPU's state carries over between command buffers, as on NVN */
@@ -987,8 +1013,11 @@ typedef struct PendingWrite { VkBuffer buf; u64 off; u32 size; u8 data[16]; } Pe
 static PendingWrite pending[1024];
 static u32 npending;
 
-static void end_rendering(void) {
+static void end_rendering_at(u32 line) {
     if (!st.rendering) return;
+    if (prof_on > 0)
+        for (u32 i = 0; i < 64; i++)
+            if (prof_ends[i].line == line || !prof_ends[i].line) { prof_ends[i].line = line; prof_ends[i].count++; break; }
     vkCmdEndRendering(cmd());
     st.rendering = false;
     prof_mark("outside passes (copies, clears, barriers)");
@@ -999,6 +1028,8 @@ static void end_rendering(void) {
         npending = 0;
     }
     barrier();
+    st.xfb_captured = false;
+    memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
 }
 
 /* NX_WATCH=<hex address>: log every GPU write to that texture storage */
@@ -1734,7 +1765,7 @@ static void descset_use(DescSet *d, const u64 *tex, u32 n) {
             if (!d->res[id]) descset_resolve(d, id);
             Image *im = d->img[id];
             if (!im) continue;
-            im->used = frame_no + 1;
+            image_touch(im);
             if (d->kind == DS_IMG) im->gpu_written = true;      /* shaders may store into it */
         }
         if (d->epoch == image_epoch) return;   /* else resolving destroyed an image (a container took it over) */
@@ -2476,7 +2507,50 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
         static bool logged;
         if (!logged) { logged = true; hlog(0, "gpu: transform feedback in an indirect draw: its bytes are not counted"); }
     }
-    for (u32 b = 0; b < 4; b++) st.xfb_written[b] += v * vs->xfb_stride[b];
+    for (u32 b = 0; b < 4; b++) {
+        if (!vs->xfb_stride[b]) continue;
+        u64 lo = st.xfb[b].addr + st.xfb_written[b], hi = v ? lo + v * vs->xfb_stride[b] : st.xfb[b].addr + st.xfb[b].size;
+        u64 *d = st.xfb_dirty[b];
+        if (d[0] == d[1]) d[0] = lo, d[1] = hi;
+        else d[0] = lo < d[0] ? lo : d[0], d[1] = hi > d[1] ? hi : d[1];
+        st.xfb_written[b] += v * vs->xfb_stride[b];
+    }
+}
+
+static bool xfb_dirty_overlaps(u64 addr, u64 size) {
+    if (!addr) return false;
+    if (!size) size = 1;
+    for (u32 b = 0; b < 4; b++)
+        if (st.xfb_dirty[b][0] < st.xfb_dirty[b][1] && addr < st.xfb_dirty[b][1] && st.xfb_dirty[b][0] < addr + size)
+            return true;
+    return false;
+}
+
+/* does this draw read (or capture over) what earlier draws captured since the last barrier? Captures go to
+ * successive offsets, so a run of capturing draws needs no barrier between them, nor does a draw that reads none
+ * of the captured bytes */
+static bool xfb_hazard(u32 op, const void *payload) {
+    for (u32 i = 0; i < 32; i++)
+        if (xfb_dirty_overlaps(st.vbuf[i].addr, st.vbuf[i].size ? st.vbuf[i].size : ~0ull - st.vbuf[i].addr)) return true;
+    for (u32 stage = 0; stage < ST_COUNT; stage++) {
+        for (u32 i = 0; i < 18; i++) if (xfb_dirty_overlaps(st.ubo[stage][i].addr, st.ubo[stage][i].size)) return true;
+        for (u32 i = 0; i < 16; i++) if (xfb_dirty_overlaps(st.ssbo[stage][i].addr, st.ssbo[stage][i].size)) return true;
+    }
+    if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
+        const CmdDraw *d = payload;
+        if (d->index_type != ~0u && xfb_dirty_overlaps(d->index_addr, (u64)(d->first + d->count) * 4)) return true;
+    } else if (op == OP_DRAW_ARRAYS_INDIRECT || op == OP_DRAW_ELEMENTS_INDIRECT) {
+        const CmdDrawIndirect *d = payload;
+        if (xfb_dirty_overlaps(d->index_addr, ~0ull >> 8) || xfb_dirty_overlaps(d->indirect, 64) ||
+            xfb_dirty_overlaps(d->count_addr, 4)) return true;
+    } else return true;
+    const ShaderCode *vs = st.program ? st.program->stage[ST_VERTEX] : NULL;
+    if (st.xfb_active && vs && vs->caps & SHC_XFB)
+        for (u32 b = 0; b < 4; b++)
+            if (vs->xfb_stride[b] && st.xfb_written[b] < st.xfb[b].size &&
+                xfb_dirty_overlaps(st.xfb[b].addr + st.xfb_written[b], st.xfb[b].size - st.xfb_written[b]))
+                return true;
+    return false;
 }
 
 static void draw_one(u32 op, const void *payload);
@@ -2533,10 +2607,11 @@ static void query_end(VkCommandBuffer c) {
 #define QUERIED(stmt) do { query_begin(c); stmt; query_end(c); } while (0)
 
 static void draw(u32 op, const void *payload) {
-    if (st.xfb_captured) {              /* what was captured is read as vertices (or captured into) next */
+    if (st.xfb_captured && xfb_hazard(op, payload)) {   /* what was captured is read (or captured into) next */
         end_rendering();
         barrier();
         st.xfb_captured = false;
+        memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
     }
     draw_one(op, payload);
     dump_after_draw();
@@ -2554,6 +2629,7 @@ static u32 nind_log;
 
 static void draw_one(u32 op, const void *payload) {
     draws++;
+    work_unflushed++;
     Shaders *pr = st.program;
     if (!st.render_enable) { skip_draw("rendering disabled (SetRenderEnable)"); return; }
     if (op == OP_DRAW_TEXTURE || op == OP_DRAW_XFB || op == OP_MULTI_DRAW_INDIRECT) { skip_draw("DrawTexture / transform feedback / multi-draw"); return; }
@@ -2764,6 +2840,7 @@ static CPipe *cpipes;
 
 static void dispatch(u32 op, const u8 *pay) {
     dispatches++;
+    work_unflushed++;
     static u64 dump_hash = ~0ull;
     static u32 dumped;
     if (dump_hash == ~0ull) dump_hash = getenv("NX_DUMP_SSBO") ? strtoull(getenv("NX_DUMP_SSBO"), NULL, 16) : 0;
@@ -3007,6 +3084,11 @@ static void run(u64 at, int depth) {
             CmdRenderTargets h;
             memcpy(&h, pay, sizeof h);
             end_rendering();
+            /* games submit a whole frame at once: hand the GPU what is recorded so far, at a pass boundary, so
+             * that it works while the rest is translated (NX_FLUSH_DRAWS, 0 for one submission per guest one) */
+            static int flush_every = -1;
+            if (flush_every < 0) flush_every = getenv("NX_FLUSH_DRAWS") ? atoi(getenv("NX_FLUSH_DRAWS")) : 250;
+            if (flush_every && work_unflushed >= (u32)flush_every) flush();
             const TexRef *refs = (const TexRef *)(pay + sizeof h);
             st.nrt = h.ncolor > 8 ? 8 : h.ncolor;
             for (u32 i = 0; i < st.nrt; i++) st.rt[i] = refs[i];
@@ -3120,6 +3202,7 @@ static void run(u64 at, int depth) {
 
 void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     (void)queue;
+    double t0 = ms_now();
     EnterCriticalSection(&gpu_cs);
     submit_serial++;
     for (u32 i = 0; i < count; i++)
@@ -3127,6 +3210,7 @@ void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     flush();
     static u64 submits;
     if (++submits == 1) hlog(1, "gpu: first submission");
+    t_submit_ms += ms_now() - t0;
     LeaveCriticalSection(&gpu_cs);
 }
 
@@ -3160,8 +3244,17 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
                               .pValues = &value};
     double t0 = prof_on > 0 ? ms_now() : 0;
+    u64 back = submitted - value;
+    double tw = ms_now();
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
-    if (prof_on > 0) prof_guest_wait_ms += ms_now() - t0;
+    t_wait_ms += ms_now() - tw;
+    if (prof_on > 0) {
+        double ms = ms_now() - t0;
+        u32 k = back == 0 ? 0 : back == 1 ? 1 : back < 10 ? 2 : 3;
+        prof_guest_wait_ms += ms;
+        prof_wait_ms[k] += ms;
+        prof_wait_n[k]++;
+    }
     if (r < 0) fatal("vkWaitSemaphores: %d (device lost?)", r);
     return r == VK_SUCCESS;
 }
@@ -3389,49 +3482,24 @@ static int range_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-/* Only the textures uploaded from guest memory can go stale, so only their pages are asked about (asking over
- * whole pools, hundreds of MB, took most of the render thread's time): their ranges, sorted and merged */
-static void refresh_cpu_textures(void) {
-    static u64 *pages;
-    static size_t cap;
-    static Range *rs;
-    static int caprs;
-    int nr = 0;
-    static int whole = -1;                              /* NX_REFRESH_POOLS: ask over whole pools (the old way) */
-    if (whole < 0) whole = getenv("NX_REFRESH_POOLS") != NULL;
-    for (int i = 0; whole && i < npools; i++) {
-        if (!pools[i].cpu || !pools[i].hb) continue;
-        if (nr == caprs) rs = realloc(rs, (caprs = caprs * 2 + 1024) * sizeof *rs);
-        rs[nr++] = (Range){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
+static double refresh_ms, refresh_mb;   /* time and bytes asked about, for the report every 600 frames */
+
+/* the pages written in [lo, hi), appended to pages[] (write watch reset) */
+static size_t written_pages(u64 lo, u64 hi, u64 **pages, size_t *cap, size_t n, double *mb) {
+    *mb += (double)(hi - lo) / (1 << 20);
+    for (;;) {
+        if (*cap - n < 4096) *pages = realloc(*pages, (*cap = *cap * 2 + 65536) * sizeof **pages);
+        ULONG_PTR count = *cap - n;
+        ULONG gran;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)lo, hi - lo, (void **)(*pages + n), &count, &gran) != 0)
+            return n;
+        n += count;
+        if (count < *cap - n + count) return n;     /* all of them */
     }
-    for (int b = 0; b < IMAGE_BUCKETS && !whole; b++)
-        for (Image *im = buckets[b]; im; im = im->next) {
-            if (!im->valid || im->gpu_written || !im->size || im->info.addr < AS_BASE) continue;
-            if (nr == caprs) rs = realloc(rs, (caprs = caprs * 2 + 1024) * sizeof *rs);
-            rs[nr++] = (Range){im->info.addr & ~0xfffull, (im->info.addr + im->size + 0xfff) & ~0xfffull};
-        }
-    if (!nr) return;
-    qsort(rs, nr, sizeof *rs, range_cmp);
-    int m = 0;
-    for (int i = 1; i < nr; i++) {
-        if (rs[i].lo <= rs[m].hi + 0x10000) { if (rs[i].hi > rs[m].hi) rs[m].hi = rs[i].hi; }
-        else rs[++m] = rs[i];
-    }
-    nr = m + 1;
-    size_t n = 0;
-    for (int i = 0; i < nr; i++) {
-        for (;;) {
-            if (cap - n < 4096) pages = realloc(pages, (cap = cap * 2 + 65536) * sizeof *pages);
-            ULONG_PTR count = cap - n;
-            ULONG gran;
-            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)rs[i].lo, rs[i].hi - rs[i].lo,
-                              (void **)(pages + n), &count, &gran) != 0) break;
-            n += count;
-            if (count < cap - n + count) break;     /* all of them */
-        }
-    }
-    if (!n) return;
-    /* pages come sorted per range and the ranges are sorted: one sorted list */
+}
+
+/* upload again every image (used or not) on the written pages, sorted */
+static int refresh_pages(const u64 *pages, size_t n) {
     int refreshed = 0;
     for (int b = 0; b < IMAGE_BUCKETS; b++)
         for (Image *im = buckets[b]; im; im = im->next) {
@@ -3445,8 +3513,97 @@ static void refresh_cpu_textures(void) {
                 refreshed++;
             }
         }
-    static int logged;
-    if (refreshed && logged < 5) { logged++; hlog(1, "gpu: %d textures written by the CPU uploaded again", refreshed); }
+    return refreshed;
+}
+
+/* An image is asked about at each present while it was used in that frame or the one before. One unused for longer
+ * is asked about when it is used again (image_touch): until then the write watch keeps its pages' bits, unless an
+ * image sharing them was asked about, and that one's refresh_pages uploads it too. Asking about every image each
+ * frame took 2 ms of the render thread in Mesagoza (180 MB of pages) */
+static bool image_watched(const Image *im) {
+    return im->valid && !im->gpu_written && im->size && im->info.addr >= AS_BASE;
+}
+
+static void image_touch(Image *im) {
+    bool idle = im->used + 1 < frame_no;
+    im->used = frame_no + 1;
+    if (!idle || !image_watched(im)) return;
+    static u64 *pages;
+    static size_t cap;
+    size_t n = written_pages(im->info.addr & ~0xfffull, (im->info.addr + im->size + 0xfff) & ~0xfffull, &pages, &cap, 0,
+                             &refresh_mb);
+    if (n) refresh_pages(pages, n);
+}
+
+/* The asking runs on a thread of its own (2 ms a frame in Mesagoza, on the render thread's critical path): at each
+ * present the render thread takes the pages found since the last one, uploads their images again, and hands the
+ * thread the ranges of the images to ask about next. A texture the CPU rewrote is so seen one frame later than
+ * before */
+static Range *scan_rs;
+static int scan_nr, scan_caprs;
+static u64 *scan_pages;
+static size_t scan_n, scan_cap;
+static double scan_mb;
+static HANDLE scan_go, scan_done;
+
+static unsigned __stdcall scan_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(scan_go, INFINITE);
+        size_t n = 0;
+        double mb = 0;
+        for (int i = 0; i < scan_nr; i++) n = written_pages(scan_rs[i].lo, scan_rs[i].hi, &scan_pages, &scan_cap, n, &mb);
+        scan_n = n;
+        scan_mb = mb;
+        SetEvent(scan_done);
+    }
+}
+
+static void refresh_scan(void) {
+    if (!scan_go) {
+        scan_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+        scan_done = CreateEventW(NULL, FALSE, TRUE, NULL);
+        _beginthreadex(NULL, 0, scan_thread, NULL, 0, NULL);
+    }
+    WaitForSingleObject(scan_done, INFINITE);       /* the scan started at the last present */
+    refresh_mb += scan_mb;
+    scan_mb = 0;
+    if (scan_n) {
+        /* pages come sorted per range and the ranges are sorted: one sorted list */
+        int refreshed = refresh_pages(scan_pages, scan_n);
+        static int logged;
+        if (refreshed && logged < 5) { logged++; hlog(1, "gpu: %d textures written by the CPU uploaded again", refreshed); }
+        scan_n = 0;
+    }
+    int nr = 0;
+    static int whole = -1;                              /* NX_REFRESH_POOLS: ask over whole pools (the old way) */
+    if (whole < 0) whole = getenv("NX_REFRESH_POOLS") != NULL;
+    for (int i = 0; whole && i < npools; i++) {
+        if (!pools[i].cpu || !pools[i].hb) continue;
+        if (nr == scan_caprs) scan_rs = realloc(scan_rs, (scan_caprs = scan_caprs * 2 + 1024) * sizeof *scan_rs);
+        scan_rs[nr++] = (Range){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
+    }
+    for (int b = 0; b < IMAGE_BUCKETS && !whole; b++)
+        for (Image *im = buckets[b]; im; im = im->next) {
+            if (!image_watched(im) || im->used < frame_no) continue;
+            if (nr == scan_caprs) scan_rs = realloc(scan_rs, (scan_caprs = scan_caprs * 2 + 1024) * sizeof *scan_rs);
+            scan_rs[nr++] = (Range){im->info.addr & ~0xfffull, (im->info.addr + im->size + 0xfff) & ~0xfffull};
+        }
+    if (!nr) { SetEvent(scan_done); return; }
+    qsort(scan_rs, nr, sizeof *scan_rs, range_cmp);
+    int m = 0;
+    for (int i = 1; i < nr; i++) {
+        if (scan_rs[i].lo <= scan_rs[m].hi + 0x10000) { if (scan_rs[i].hi > scan_rs[m].hi) scan_rs[m].hi = scan_rs[i].hi; }
+        else scan_rs[++m] = scan_rs[i];
+    }
+    scan_nr = m + 1;
+    SetEvent(scan_go);
+}
+
+static void refresh_cpu_textures(void) {
+    double t0 = ms_now();
+    refresh_scan();
+    refresh_ms += ms_now() - t0;
 }
 
 /* the indirect draws of a traced frame, logged with the arguments the GPU wrote for them once it is done (instance
@@ -3495,6 +3652,7 @@ static void query_report(void) {
 
 void gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
+    double t_present0 = ms_now();
     EnterCriticalSection(&gpu_cs);
     refresh_cpu_textures();
     Image *im = image_get(&w->info[index]);
@@ -3519,12 +3677,19 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     u64 frames = ++frame_no;
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
+    if (frames % 600 == 0) {
+        hlog(1, "gpu: CPU-written texture check %.2f ms/frame over %.0f MB", refresh_ms / 600, refresh_mb / 600);
+        hlog(1, "gpu: per frame: translating and submitting %.2f ms, presenting %.2f ms, waiting for the GPU %.2f ms",
+             t_submit_ms / 600, t_present_ms / 600, t_wait_ms / 600);
+        refresh_ms = refresh_mb = t_submit_ms = t_present_ms = t_wait_ms = 0;
+    }
     for (int i = 0; frames % 600 == 0 && i < nskip_why; i++) hlog(1, "gpu:   %llu skipped: %s", skip_count[i], skip_why[i]);
     if (prof_on > 0 && frames % 300 == 0) prof_report(300);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */
     vk_present(im ? im->image : NULL, w->crop[0], w->crop[1], cw, ch, window_origin == 0, timeline, submitted);
+    t_present_ms += ms_now() - t_present0;
     LeaveCriticalSection(&gpu_cs);
 }
 

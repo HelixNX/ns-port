@@ -501,8 +501,13 @@ static void swapchain_create(void) {
     VkPresentModeKHR modes[16];
     if (nm > 16) nm = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &nm, modes);
+    /* NX_NOPACE (uncapped): not even the display's pace; IMMEDIATE tears, so only then */
+    bool nopace = getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE"));
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     for (u32 i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    for (u32 i = 0; nopace && i < nm; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
+    static const char *const mode_names[] = {"immediate", "mailbox", "FIFO", "relaxed FIFO"};
+    hlog(1, "vk: present mode %s", mode < 4 ? mode_names[mode] : "other");
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == ~0u) {
         int w, h;

@@ -222,12 +222,16 @@ static void core_acquire(KThread *t) {
     if (t->cur_core >= 0) return;
     t->ready = true;
     t->ready_seq = ++ready_seq;
+    LARGE_INTEGER q0, q1;
+    QueryPerformanceCounter(&q0);
     for (;;) {
         int r = core_try_place(t);
         if (r == 1 || t->cur_core >= 0) break;
         SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, r < 0 ? 1 : INFINITE, 0);
         if (t->cur_core >= 0) break;
     }
+    QueryPerformanceCounter(&q1);
+    t->ready_qpc += q1.QuadPart - q0.QuadPart;
     t->ready = false;
 }
 
@@ -647,8 +651,13 @@ void thread_sleep(s64 ns) {
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER due;
     due.QuadPart = -(ns + 99) / 100;
+    LARGE_INTEGER q0, q1;
+    QueryPerformanceCounter(&q0);
     if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
     else Sleep((DWORD)((ns + 999999) / 1000000));
+    QueryPerformanceCounter(&q1);
+    t->sleep_qpc += q1.QuadPart - q0.QuadPart;
+    t->sleeps++;
     klock();
     t->wait = W_NONE;
     core_acquire(t);
@@ -683,7 +692,7 @@ void event_clear(KEvent *e) {
 void kernel_report_cpu(u64 frames) {
     static LARGE_INTEGER last_t;
     static u64 last_frames;
-    static struct { KThread *t; u64 cpu; } prev[128];
+    static struct { KThread *t; u64 cpu, ready, sleep, sleeps; } prev[128];
     static int nprev;
     LARGE_INTEGER f, now;
     QueryPerformanceFrequency(&f);
@@ -691,7 +700,7 @@ void kernel_report_cpu(u64 frames) {
     double wall = last_t.QuadPart ? (double)(now.QuadPart - last_t.QuadPart) / (double)f.QuadPart : 0;
     char line[1024];
     int n = 0;
-    struct { const char *name; double pct; } busy[128];
+    struct { const char *name; double pct, ready, sleep, sleeps; } busy[128];
     int nb = 0;
     AcquireSRWLockShared(&klk);
     for (KThread *t = threads; t; t = t->next) {
@@ -700,11 +709,14 @@ void kernel_report_cpu(u64 frames) {
         u64 cpu = ((u64)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((u64)u.dwHighDateTime << 32 | u.dwLowDateTime);
         int i = 0;
         while (i < nprev && prev[i].t != t) i++;
-        if (i == nprev && nprev < 128) prev[nprev++] = (typeof(prev[0])){t, cpu};
+        if (i == nprev && nprev < 128) prev[nprev++] = (typeof(prev[0])){t, cpu, t->ready_qpc, t->sleep_qpc, t->sleeps};
         else if (i < nprev) {
             double pct = wall > 0 ? (double)(cpu - prev[i].cpu) / 1e7 / wall * 100 : 0;
-            prev[i].cpu = cpu;
-            if (pct >= 5 && nb < 128) busy[nb++] = (typeof(busy[0])){t->name, pct};
+            double ready = wall > 0 ? (double)(t->ready_qpc - prev[i].ready) / (double)f.QuadPart / wall * 100 : 0;
+            double sleep = wall > 0 ? (double)(t->sleep_qpc - prev[i].sleep) / (double)f.QuadPart / wall * 100 : 0;
+            double sleeps = (double)(t->sleeps - prev[i].sleeps);
+            prev[i] = (typeof(prev[0])){t, cpu, t->ready_qpc, t->sleep_qpc, t->sleeps};
+            if ((pct >= 5 || ready >= 5 || sleep >= 5) && nb < 128) busy[nb++] = (typeof(busy[0])){t->name, pct, ready, sleep, sleeps};
         }
     }
     const char *pn = getenv("NX_PROFILE");                /* NX_PROFILE: dispatch.c */
@@ -717,6 +729,10 @@ void kernel_report_cpu(u64 frames) {
         for (int i = 0; i < nb && n < (int)sizeof line - 40; i++)
             n += snprintf(line + n, sizeof line - n, " %s %.0f%%", busy[i].name, busy[i].pct);
         hlog(0, "%s", line);
+        for (int i = 0; i < nb; i++)
+            if (busy[i].ready >= 1 || busy[i].sleep >= 1)
+                hlog(1, "cpu:   %s: running %.0f%%, waiting for a core %.0f%%, asleep %.0f%% (%.1f sleeps/frame)", busy[i].name,
+                     busy[i].pct, busy[i].ready, busy[i].sleep, frames > last_frames ? busy[i].sleeps / (double)(frames - last_frames) : 0);
     }
     last_t = now;
     last_frames = frames;
