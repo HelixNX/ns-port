@@ -2,11 +2,14 @@
 # format of ida_export.py. Run inside the game's repository (game.json in it or a parent, or NX_GAME set).
 # The Ghidra project is kept in <analysis>/ghidra and reused: a module already in it is exported again without
 # being analysed again.
-# Usage: ghidra_export.ps1 [-Modules main,sdk] [-Seeds] [-Ghidra <install dir>] [-MaxMem 12G]
+# Usage: ghidra_export.ps1 [-Modules main,sdk] [-Seeds] [-Ghidra <install dir, default $env:GHIDRA_HOME>] [-MaxMem 12G]
 #   -Seeds: also make functions at nxmod.py's code seeds (exports, RELATIVE relocations, init_array)
-param([string[]]$Modules, [switch]$Seeds, [string]$Ghidra = $(if ($env:GHIDRA_HOME) { $env:GHIDRA_HOME } else { 'D:\ReverseEngineering\ghidra_12.1.3_PUBLIC' }),
+param([string[]]$Modules, [switch]$Seeds, [string]$Ghidra = $env:GHIDRA_HOME,
       [string]$MaxMem = '12G')
 $ErrorActionPreference = 'Stop'
+if (-not $Ghidra -or -not (Test-Path "$Ghidra\support\analyzeHeadless.bat")) {
+    throw 'no Ghidra: set GHIDRA_HOME to its install folder (the one with support\analyzeHeadless.bat) or pass -Ghidra'
+}
 $cfgPath = if ($env:NX_GAME) { $env:NX_GAME } else {
     $d = (Get-Location).Path
     while ($d -and -not (Test-Path "$d\game.json")) { $d = Split-Path -Parent $d }
