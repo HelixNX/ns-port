@@ -159,6 +159,11 @@ of work; online code paths must fail as on a console with no internet, not crash
   - Workflow: each run reaches new content and dumps new shaders (their draws are skipped, often a black screen);
     run `translate.py --spv` and run again. Runs: `$env:NX_NOPACE='1'; $env:NX_INPUT='300-30000/60:A'`, about
     4,000 frames in 5 minutes. Skipped draws are counted per reason every 600 frames.
+    `run.ps1` kills the game when `-Timeout` runs out (default 60 s): for play sessions give it hours
+    (`-Timeout 86400`), or a session is cut off without saving (2026-10-19: a 30-minute timeout did that).
+    After pulling a change to translate.py: SPIR-V lives in `build/shaders/spv/<translator version>` (an FNV-1a
+    hash of translate.py), so every shader is translated again. Run `translate.py --spv` once (~1 min for 5,000
+    shaders) or the first run waits on the JIT for each one.
   - Debugging added: `run.ps1 -DumpAfter N` also prints mutex owners, full host stacks of running threads (taken
     without the kernel lock) and audout state; `NX_DUMP_MEM=addr:len,*ptr:len` (hex dumps, `*` dereferences);
     `NX_TRACE_CALLS=addr,...` (log calls through pointers: args, caller, result, the word at x1).
@@ -260,6 +265,14 @@ of work; online code paths must fail as on a console with no internet, not crash
     was also seen with a blue outline. Next: F12 with
     `NX_DUMP_DRAWS` on the lit scene buffer (12f5ee2000) and on the effects layer (12f4f6a000) to find the draw
     that adds them.
+  - **Open (next, 2026-10-19): the player's portrait is black** on the map marker (frame 50234, the circle
+    under the eyes) and on the enrollment form (probably the same cause). What is known: a 360x360 f56 target
+    `12ef662600` (portrait-sized) is cleared to (0,0,0,0) in every traced frame, and no draw in those frames
+    renders into it or samples it. Either the portrait is rendered once before that and lost, or the marker
+    reads another texture: every UI draw lists the same 26 textures, so the draw log cannot tell. Next:
+    `NX_DUMP_DRAWS=12fb5aa000` (the final 1920x1080 f37 target) with the map open and F12: the first image
+    showing the black circle names the marker's draw and its texture. Then trace back who should have written
+    that texture (a render, a copy or a CPU upload; `NX_TRACE` from a new game's portrait screen).
   - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
     the `?` icon is fixed.
 - **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
