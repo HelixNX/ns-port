@@ -18,12 +18,14 @@ void h_fps_speed_base(Ctx *c) {
     s32 r = nx_framerate();
     nx_flag_fps = r != FRAMERATE_GAME && r != 30;
     u64 ns = nx_flag_fps ? (u64)nx_frame_ns() : NS_30;
-    if (ns != entry_now) {                      /* rodata: made writable for the write */
+    if (ns != entry_now) {                      /* rodata: made writable once and left so (uncapped writes it every
+                                                 * frame; restoring read-only raced another thread's write) */
+        static volatile LONG writable;
         DWORD old;
         void *p = (void *)(uintptr_t)FRAME_ENTRY;
-        if (VirtualProtect(p, 8, PAGE_READWRITE, &old)) {
+        if (writable || VirtualProtect(p, 8, PAGE_READWRITE, &old)) {
+            writable = 1;
             *(volatile u64 *)p = ns;
-            VirtualProtect(p, 8, old, &old);
             entry_now = ns;
         } else {
             static bool logged;
