@@ -85,6 +85,21 @@ speed); hid from SDL3 (as MK8); save data write/read; DLC area reachable.
 
 **V7 Performance and PC features.** Measure first. Unlocked frame rate and resolution only where the game's own
 timing allows (SV ties logic to frame time in places: check before unlocking).
+Quality options (the user's idea, 2026-10-19), ideally in the game's own Options menu:
+- What could be offered. Things we control: render scale (the targets the game creates at 1920x1080 and
+  its half-/quarter-res chains, scaled together; texture coordinates are normalised, but viewport, scissor
+  and texel-size constants are not), anisotropic filtering (sampler overrides), shadow map size (1024x1024
+  cascades today). Things in the game's own data: LOD and draw distance, grass density, the 30 fps cap.
+  Find the variables in main first (the engine likely has quality tiers for docked and handheld:
+  look for where the docked/handheld check, `nn::oe::GetOperationMode`, feeds render settings).
+- Where the options live. (a) The game's Options menu: Trinity UI layouts and message text come from
+  `data.trpfs`, the menu logic is guest code, maybe Lua. Adding entries means patching the menu's item list
+  and text at load time, plus overriding the functions that apply them (`overrides.txt`). It looks native but
+  breaks with game updates, and the new text must exist in every language the game ships. (b) Our own
+  overlay (like the F3 FPS counter): a host-drawn menu on a hotkey, settings saved next to the exe. Much
+  less work and independent of the game's version. Start with (b), then try (a) once the settings work.
+- Order of work. Measure the cost of each option first (V7: measure before changing). Render scale first,
+  since it is all ours (gpu.c image creation and viewport mapping).
 
 **V8 Packaging for friends who own the game.** One launcher exe dropped next to their own NSPs, keys and firmware:
 on first launch it checks the files (update version, keys), unpacks the NSPs (our own NSP/NCA reader, no nstool),
@@ -241,7 +256,8 @@ of work; online code paths must fail as on a console with no internet, not crash
     layer (960x540 f41 `12f4f6a000`). Suspect NVN blend factor / equation mappings (MK8 notes call them guesses).
   - **Open: huge coloured glows from the `?` / `!` markers over wild Pokémon** (2026-10-19, frame 10268: red,
     green, blue, white and pink blobs up to a quarter of the screen, near the camera). The user thinks it is
-    lighting / reflections rather than bloom. Perhaps the same cause as the Let's Go glow above. Next: F12 with
+    lighting / reflections rather than bloom. Perhaps the same cause as the Let's Go glow above. A `!` marker
+    was also seen with a blue outline. Next: F12 with
     `NX_DUMP_DRAWS` on the lit scene buffer (12f5ee2000) and on the effects layer (12f4f6a000) to find the draw
     that adds them.
   - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
