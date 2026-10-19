@@ -40,6 +40,7 @@ static int cur = -1;                    /* the slot being recorded, or -1 */
 static u64 submitted;                   /* last timeline value submitted */
 static VkSemaphore timeline;
 
+
 /* things to destroy once the GPU is past `value` */
 typedef struct Dead { u64 value; int kind; void *a, *b; VkAlloc alloc; } Dead;
 enum { DEAD_HOSTBUF, DEAD_IMAGE, DEAD_VIEW };
@@ -79,13 +80,112 @@ static void bury(int kind, void *a, const VkAlloc *alloc) {
 
 static VkCommandBuffer cmd(void);
 
+/* NX_GPU_PROF=1: GPU time by pass. A timestamp goes in at each render pass, dispatch and submission edge, the
+ * interval after it charged to its label; read back when the slot is reused, logged every 300 frames in ms per
+ * frame, with the render thread's time waiting for slots and guest threads' waits for the GPU */
+#define PROF_MAX 8192
+static int prof_on = -1;
+static VkQueryPool prof_pool[SLOTS];
+static u32 prof_n[SLOTS];
+static u16 prof_label[SLOTS][PROF_MAX];
+typedef struct { char name[80]; double ms; u64 count; } ProfName;
+#define PROF_NAMES 4096
+static ProfName prof_names[PROF_NAMES];
+static u32 nprof_names;
+static u16 prof_hash[2 * PROF_NAMES];   /* open addressing: name index + 1 */
+static double prof_slot_wait_ms, prof_guest_wait_ms;
+
+static u16 prof_intern(const char *name) {
+    u32 h = 2166136261u;
+    for (const char *c = name; *c; c++) h = (h ^ (u8)*c) * 16777619u;
+    for (u32 k = h % (2 * PROF_NAMES);; k = (k + 1) % (2 * PROF_NAMES)) {
+        u16 e = prof_hash[k];
+        if (!e) break;
+        if (!strcmp(prof_names[e - 1].name, name)) return e - 1;
+    }
+    if (nprof_names == PROF_NAMES) return PROF_NAMES - 1;
+    snprintf(prof_names[nprof_names].name, sizeof prof_names[0].name, "%s", name);
+    for (u32 k = h % (2 * PROF_NAMES);; k = (k + 1) % (2 * PROF_NAMES))
+        if (!prof_hash[k]) { prof_hash[k] = (u16)(nprof_names + 1); break; }
+    return (u16)nprof_names++;
+}
+
+static void prof_mark_in(int slot, const char *label) {
+    if (prof_n[slot] >= PROF_MAX) return;
+    vkCmdWriteTimestamp2(slots[slot].cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_pool[slot], prof_n[slot]);
+    prof_label[slot][prof_n[slot]++] = prof_intern(label);
+}
+
+static void prof_mark(const char *label) {
+    if (prof_on <= 0) return;
+    cmd();
+    prof_mark_in(cur, label);
+}
+
+/* the slot's work is done: charge its intervals */
+static void prof_collect(int slot) {
+    u32 n = prof_n[slot];
+    prof_n[slot] = 0;
+    if (n < 2) return;
+    static u64 t[PROF_MAX];
+    if (vkGetQueryPoolResults(vk.dev, prof_pool[slot], 0, n, n * sizeof *t, t, sizeof *t, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    for (u32 i = 0; i + 1 < n; i++) {
+        ProfName *p = &prof_names[prof_label[slot][i]];
+        if (t[i + 1] >= t[i]) p->ms += (double)(t[i + 1] - t[i]) * vk.props.limits.timestampPeriod / 1e6;
+        p->count++;
+    }
+}
+
+static int prof_cmp(const void *a, const void *b) {
+    const ProfName *x = a, *y = b;
+    return x->ms < y->ms ? 1 : x->ms > y->ms ? -1 : 0;
+}
+
+static void prof_report(u64 frames) {
+    double total = 0;
+    for (u32 i = 0; i < nprof_names; i++) total += prof_names[i].ms;
+    hlog(0, "gpu prof: %.2f ms of GPU work per frame; render thread waited %.2f ms for slots, guests %.2f ms for the GPU",
+         total / frames, prof_slot_wait_ms / frames, prof_guest_wait_ms / frames);
+    static ProfName sorted[PROF_NAMES];
+    memcpy(sorted, prof_names, nprof_names * sizeof *sorted);
+    qsort(sorted, nprof_names, sizeof *sorted, prof_cmp);
+    for (u32 i = 0; i < nprof_names && i < (prof_on > 1 ? 50u : 25u) && sorted[i].ms > 0; i++)
+        hlog(0, "gpu prof: %7.3f ms %6.1f/frame  %s", sorted[i].ms / frames, (double)sorted[i].count / frames,
+             sorted[i].name);
+    for (u32 i = 0; i < nprof_names; i++) prof_names[i].ms = 0, prof_names[i].count = 0;
+    prof_slot_wait_ms = prof_guest_wait_ms = 0;
+}
+
+static double ms_now(void) {
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
 static void slot_open(void) {
     static int next;
     Slot *s = &slots[next];
+    if (prof_on < 0) {
+        prof_on = getenv("NX_GPU_PROF") ? atoi(getenv("NX_GPU_PROF")) : 0;
+        for (int i = 0; prof_on && i < SLOTS; i++) {
+            VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = PROF_MAX};
+            VKCHECK(vkCreateQueryPool(vk.dev, &qi, NULL, &prof_pool[i]));
+            vkResetQueryPool(vk.dev, prof_pool[i], 0, PROF_MAX);
+        }
+    }
     if (s->value) {
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                   .pSemaphores = &timeline, .pValues = &s->value};
+        double t0 = prof_on ? ms_now() : 0;
         VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+        if (prof_on) prof_slot_wait_ms += ms_now() - t0;
+    }
+    if (prof_on) {
+        prof_collect(next);
+        vkResetQueryPool(vk.dev, prof_pool[next], 0, PROF_MAX);
     }
     for (int i = 0; i < s->nextra; i++) vk_buffer_free(&s->extra[i]);
     s->nextra = 0;
@@ -94,6 +194,7 @@ static void slot_open(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKCHECK(vkBeginCommandBuffer(s->cmd, &bi));
+    if (prof_on) prof_mark_in(next, "outside passes (copies, clears, barriers)");
     cur = next;
     next = (next + 1) % SLOTS;
 }
@@ -147,6 +248,7 @@ static void flush(void) {
     end_rendering();
     if (cur < 0) return;
     Slot *s = &slots[cur];
+    prof_mark("(end)");
     VKCHECK(vkEndCommandBuffer(s->cmd));
     s->value = ++submitted;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = timeline, .value = s->value,
@@ -856,10 +958,24 @@ static void state_reset(State *s) {
     s->stencil_mask[0] = s->stencil_mask[1] = 0xff;
 }
 
+/* small GPU writes made while rendering (counter reports between occlusion boxes, events), done when the pass
+ * ends: Vulkan allows no buffer updates inside rendering, and ending the pass for each one split the occlusion
+ * pass into hundreds */
+typedef struct PendingWrite { VkBuffer buf; u64 off; u32 size; u8 data[16]; } PendingWrite;
+static PendingWrite pending[1024];
+static u32 npending;
+
 static void end_rendering(void) {
     if (!st.rendering) return;
     vkCmdEndRendering(cmd());
     st.rendering = false;
+    prof_mark("outside passes (copies, clears, barriers)");
+    if (npending) {
+        barrier();                      /* after the draws before them */
+        for (u32 i = 0; i < npending; i++)
+            vkCmdUpdateBuffer(cmd(), pending[i].buf, pending[i].off, pending[i].size, pending[i].data);
+        npending = 0;
+    }
     barrier();
 }
 
@@ -947,6 +1063,15 @@ static bool begin_rendering(void) {
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = st.area, .layerCount = layers,
                           .colorAttachmentCount = st.nrt, .pColorAttachments = color,
                           .pDepthAttachment = has_d ? &depth : NULL, .pStencilAttachment = has_s ? &depth : NULL};
+    if (prof_on > 0) {                  /* the pass by its size and formats */
+        char lb[80];
+        int n = snprintf(lb, sizeof lb, "pass %ux%u", w, h);
+        if (layers > 1) n += snprintf(lb + n, sizeof lb - n, "x%u", layers);
+        for (u32 i = 0; i < st.nrt && n < 60; i++)
+            if (st.rt_format[i]) n += snprintf(lb + n, sizeof lb - n, " c%u:%d", i, st.rt_format[i]);
+        if (has_d || has_s) snprintf(lb + n, sizeof lb - n, " ds:%d", has_d ? st.depth_format : st.stencil_format);
+        prof_mark(lb);
+    }
     vkCmdBeginRendering(cmd(), &ri);
     st.rendering = true;
     return true;
@@ -1168,6 +1293,14 @@ static void gpu_write(u64 addr, const void *data, u32 size) {
     if (!gpu_buffer(addr, &buf, &off)) {
         u8 *p = gpu_cpu(addr, size);
         if (p) memcpy(p, data, size);  /* not GPU-reachable: write it now */
+        return;
+    }
+    if (st.rendering && size <= 16 && npending < sizeof pending / sizeof *pending) {
+        PendingWrite *w = &pending[npending++];
+        w->buf = buf;
+        w->off = off;
+        w->size = (size + 3) & ~3u;
+        memcpy(w->data, data, size);
         return;
     }
     end_rendering();
@@ -2463,6 +2596,12 @@ static void draw_one(u32 op, const void *payload) {
         if (tn > 0 && tn < (int)sizeof tb && tb[tn - 1] == '\n') tb[--tn] = 0;
         if (!filter[0] || strstr(tb, filter)) hlog(0, "%s", tb);
     }
+    if (prof_on > 1) {                  /* NX_GPU_PROF=2: by draw, its shaders and pass size */
+        char lb[80];
+        snprintf(lb, sizeof lb, "  draw %ux%u vs %016llx fs %016llx", st.area.extent.width, st.area.extent.height,
+                 pr->stage[ST_VERTEX]->hash, pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0ull);
+        prof_mark(lb);
+    }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     set_dynamic_state(c, ((const CmdDraw *)payload)->mode);
     VkWriteDescriptorSet w[32];
@@ -2609,6 +2748,11 @@ static void dispatch(u32 op, const u8 *pay) {
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 0, nw, w);
     VkDescriptorSet sets[3] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp, is ? is->set : empty_img};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 1, 3, sets, 0, NULL);
+    if (prof_on > 0) {
+        char lb[48];
+        snprintf(lb, sizeof lb, "compute %016llx", pr_hash());
+        prof_mark(lb);
+    }
     if (op == OP_DISPATCH) {
         u32 g[3];
         memcpy(g, pay, 12);
@@ -2620,6 +2764,7 @@ static void dispatch(u32 op, const u8 *pay) {
         u64 off;
         if (gpu_buffer(a, &buf, &off)) vkCmdDispatchIndirect(c, buf, off);
     }
+    prof_mark("outside passes (copies, clears, barriers)");
     barrier();
 }
 
@@ -2903,7 +3048,9 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     if (value > submitted) gpu_flush(0);
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
                               .pValues = &value};
+    double t0 = prof_on > 0 ? ms_now() : 0;
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
+    if (prof_on > 0) prof_guest_wait_ms += ms_now() - t0;
     if (r < 0) fatal("vkWaitSemaphores: %d (device lost?)", r);
     return r == VK_SUCCESS;
 }
@@ -3216,6 +3363,7 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
     for (int i = 0; frames % 600 == 0 && i < nskip_why; i++) hlog(1, "gpu:   %llu skipped: %s", skip_count[i], skip_why[i]);
+    if (prof_on > 0 && frames % 300 == 0) prof_report(300);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */

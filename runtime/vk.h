@@ -29,7 +29,7 @@
     X(vkEndCommandBuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) \
     X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCreatePipelineCache) \
     X(vkGetPipelineCacheData) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) \
-    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateQueryPool) X(vkResetQueryPool) \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateQueryPool) X(vkResetQueryPool) X(vkGetQueryPoolResults) \
     X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearAttachments) \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBlitImage) X(vkCmdCopyImage) \
     X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdFillBuffer) \
