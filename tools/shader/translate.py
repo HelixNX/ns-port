@@ -37,7 +37,11 @@ STAGE_EXT = {'vertex': 'vert', 'fragment': 'frag', 'compute': 'comp', 'geometry'
              'tess_control': 'tesc', 'tess_eval': 'tese'}
 STAGE_BASE = {'vertex': 0, 'fragment': 16, 'compute': 0, 'geometry': 32, 'tess_control': 48, 'tess_eval': 64}
 # set 1 binding of each texture array (a view's type must match the shader's image dimension): runtime/gpu.c TB_*
-TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5, 't1da': 6}
+TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5, 't1da': 6, 'ut2d': 7, 'ut2da': 8}
+# Integer textures (runtime/gpu.c HANDLE_INT): the runtime sets bit 19 of a handle whose texture holds integers
+# (UINT/SINT, stencil) and puts its integer view in ut2d / ut2da at the same index; fetches and gathers of 2D and 2D
+# array textures read through it when the bit is set (a float read of an integer view is undefined)
+INT_FLAG = '((%s >> 19) & 1u) != 0u'
 
 
 class Unsupported(Exception):
@@ -121,6 +125,10 @@ class Translator:
 
     def cbuf(self, idx, off):
         """32-bit word of c[idx] at byte offset off (constant)"""
+        if idx == 0 and self.stage == 'vertex' and off in (0x640, 0x644):
+            # NVN's driver data: the draw's base vertex and base instance, which indirect draws take from GPU memory
+            # (GPU-culled objects have large base instances: read as 0, trees and rocks near the camera vanished)
+            return 'uint(gl_BaseVertex)' if off == 0x640 else 'uint(gl_BaseInstance)'
         self.cbufs.add(idx)
         if off & 3:
             raise Unsupported('unaligned cbuf offset')
@@ -226,8 +234,10 @@ class Translator:
             if off in m:
                 return m[off], False
         if self.stage == 'vertex':
+            # Maxwell's vertex and instance ids leave out the draw's base vertex / base instance (shaders add them
+            # from c0, see cbuf); Vulkan's indices include them
             if off == 0x2fc:
-                return 'uint(gl_VertexIndex)', False
+                return 'uint(gl_VertexIndex - gl_BaseVertex)', False
             if off == 0x2f8:
                 return 'uint(gl_InstanceIndex - gl_BaseInstance)', False
         raise Unsupported('input attribute %#x' % off)
@@ -274,7 +284,7 @@ class Translator:
         if dref is not None:
             styp += 'Shadow'
         self.uses.add('tex_' + arr)
-        s = '%s(%s[nonuniformEXT(min(%s & 0xfffffu, 65535u))], smp[nonuniformEXT(min(%s >> 20, 4095u))])' % (
+        s = '%s(%s[nonuniformEXT((%s & 0xffffu))], smp[nonuniformEXT(min(%s >> 20, 4095u))])' % (
             styp, arr, handle, handle)
         if query:
             return 'textureQueryLod(%s, %s)' % (s, coords)
@@ -282,8 +292,17 @@ class Translator:
             if dref is not None:
                 return 'textureGather(%s, %s, %s)' % (s, coords, dref)
             if offset:
-                return 'textureGatherOffset(%s, %s, %s, %d)' % (s, coords, offset, gather)
-            return 'textureGather(%s, %s, %d)' % (s, coords, gather)
+                e = 'textureGatherOffset(%s, %s, %s, %d)' % (s, coords, offset, gather)
+            else:
+                e = 'textureGather(%s, %s, %d)' % (s, coords, gather)
+            if kind in ('2D', '2DARRAY'):       # integer textures: the raw bits through the integer view
+                self.uses.add('tex_u' + arr)
+                us = 'u%s(u%s[nonuniformEXT((%s & 0xffffu))], smp[nonuniformEXT(min(%s >> 20, 4095u))])' % (
+                    styp, arr, handle, handle)
+                ue = ('textureGatherOffset(%s, %s, %s, %d)' % (us, coords, offset, gather) if offset else
+                      'textureGather(%s, %s, %d)' % (us, coords, gather))
+                e = '(%s ? uintBitsToFloat(%s) : %s)' % (INT_FLAG % handle, ue, e)
+            return e
         if offset and gather is None:
             # GLSL wants constant offsets outside gathers: shift the coordinates by whole texels instead
             lv = 'int(%s)' % lod if lod is not None else '0'
@@ -1323,7 +1342,12 @@ class Translator:
         self.uses.add('tex_' + arr)
         if offset:
             coords = '(%s + %s)' % (coords, offset)
-        return 'texelFetch(%s[nonuniformEXT(min(%s & 0xfffffu, 65535u))], %s, %s)' % (arr, handle, coords, lod)
+        e = 'texelFetch(%s[nonuniformEXT((%s & 0xffffu))], %s, %s)' % (arr, handle, coords, lod)
+        if kind in ('2D', '2DARRAY'):           # integer textures: the raw bits through the integer view
+            self.uses.add('tex_u' + arr)
+            e = '(%s ? uintBitsToFloat(texelFetch(u%s[nonuniformEXT((%s & 0xffffu))], %s, %s)) : %s)' % (
+                INT_FLAG % handle, arr, handle, coords, lod, e)
+        return e
 
     def op_TLDS(self, w, form, pc):
         a, b, enc = bits(w, 8, 8), bits(w, 20, 8), bits(w, 53, 4)
@@ -1506,7 +1530,7 @@ class Translator:
         h = self.cbuf(2, bits(w, 36, 13) * 4) if bits(w, 51, 1) else self.R(bits(w, 39, 8))
         name = {'f': 'i', 'a': 'ua', 'ai': 'ia'}[kind] + dim.lower()
         self.uses.add('img_' + name)
-        return '%s[nonuniformEXT(min(%s & 0xfffffu, 65535u))]' % (name, h), coords
+        return '%s[nonuniformEXT((%s & 0xffffu))]' % (name, h), coords
 
     def op_SUST(self, w, form, pc):
         if bits(w, 52, 1):
@@ -1583,9 +1607,9 @@ class Translator:
     def op_KIL(self, w, form, pc):
         t = self.flow(bits(w, 0, 5))
         if t == 'true':
-            self.emit('discard;')
+            self.emit('if (kill_ok()) discard;')
         elif t != 'false':
-            self.emit('if (%s) discard;' % t)
+            self.emit('if (%s && kill_ok()) discard;' % t)
 
     # ------------------------------------------------------------------ outputs
     def xfb_layout(self):
@@ -1625,7 +1649,7 @@ class Translator:
             return
         if self.omap_target & 0xf:
             # NVN's alpha test (nvnColorStateSetAlphaTest + SetAlphaRef) on target 0, from push constants
-            self.emit('if (!alpha_ok(%s)) discard;' % (self.Rf(3) if self.omap_target & 8 else '1.0'))
+            self.emit('if (!alpha_ok(%s) && kill_ok()) discard;' % (self.Rf(3) if self.omap_target & 8 else '1.0'))
         r = 0
         for rt in range(8):
             m = self.omap_target >> (4 * rt) & 0xf
@@ -1886,7 +1910,8 @@ class Translator:
                 out.append('uint cbr%d(uint a) { return a < 65536u ? cb%d.d[a >> 4][(a >> 2) & 3u] : 0u; }' % (i, i))
         if any(u.startswith('tex_') for u in self.uses):
             decl = {'t1d': 'texture1D', 't2d': 'texture2D', 't3d': 'texture3D', 'tcube': 'textureCube',
-                    't2da': 'texture2DArray', 'tcubea': 'textureCubeArray', 't1da': 'texture1DArray'}
+                    't2da': 'texture2DArray', 'tcubea': 'textureCubeArray', 't1da': 'texture1DArray',
+                    'ut2d': 'utexture2D', 'ut2da': 'utexture2DArray'}
             for name, typ in decl.items():
                 if 'tex_' + name in self.uses:
                     out.append('layout(set = 1, binding = %d) uniform %s %s[];' % (TEX_BINDING[name], typ, name))
@@ -1894,7 +1919,7 @@ class Translator:
             if 'txq' in self.uses:
                 # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D
                 out += ['uvec4 txq(uint h, int lod) {',
-                        '    uint t = min(h & 0xfffffu, 65535u), s = min(h >> 20, 4095u);',
+                        '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
                         '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
                         '    int l = textureQueryLevels(sampler2DArray(t2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]));',
                         '    if (z.xy == ivec2(1)) {',
@@ -1938,7 +1963,9 @@ class Translator:
                 if self.omap_target >> (4 * rt) & 0xf:
                     out.append('layout(location = %d) out vec4 out_c%d;' % (rt, rt))
         if self.stage == 'fragment':
-            out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; } pc;',
+            # debug: bit 0 of pc.debug (NX_NO_DISCARD) turns every discard off
+            out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; } pc;',
+                    'bool kill_ok() { return (pc.debug & 1u) == 0u; }',
                     'bool alpha_ok(float a) {',
                     '    switch (pc.alpha_func) {',
                     '    case 1u: return false;',
@@ -1977,6 +2004,16 @@ class Translator:
         out += body
         out.append('}')
         return '\n'.join(out) + '\n'
+
+
+def translator_version():
+    """FNV-1a of this file: SPIR-V goes in spv/<version>, so a translator change never leaves stale translations
+    (runtime/gpu.c spv_path computes the same)"""
+    h = 2166136261
+    with open(__file__, 'rb') as f:
+        for b in f.read():
+            h = ((h ^ b) * 16777619) & 0xffffffff
+    return '%08x' % h
 
 
 def main():
@@ -2033,7 +2070,7 @@ def main():
         glslang = os.path.join(here, '../../../deps/glslang/bin/glslang.exe')
         if not os.path.exists(glslang) and os.environ.get('VULKAN_SDK'):    # the Vulkan SDK's copy
             glslang = os.path.join(os.environ['VULKAN_SDK'], 'Bin', 'glslangValidator.exe')
-        spvdir = os.path.join(src, 'spv')
+        spvdir = os.path.join(src, 'spv', translator_version())
         os.makedirs(spvdir, exist_ok=True)
 
         def compile_one(p):

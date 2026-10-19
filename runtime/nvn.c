@@ -1186,6 +1186,11 @@ static void cmd_depth_clamp(Ctx *c) { emit_u32x2(c, OP_DEPTH_CLAMP, (u32)A(1) & 
 static void cmd_primitive_restart(Ctx *c) { emit_u32x2(c, OP_PRIMITIVE_RESTART, (u32)A(1) & 1, (u32)A(2)); }
 static void cmd_patch_size(Ctx *c) { emit_u32x2(c, OP_PATCH_SIZE, (u32)A(1), 0); }
 static void cmd_render_enable(Ctx *c) { emit_u32x2(c, OP_RENDER_ENABLE, (u32)A(1) & 1, 0); }
+/* nvnCommandBufferSetRenderEnableConditional(cmd, mode, counters): not done (draws render regardless); logged */
+static void cmd_render_enable_cond(Ctx *c) {
+    static u64 n;
+    if (n++ < 4) hlog(0, "nvn: SetRenderEnableConditional(mode %u, counters %llx) (call %llu): ignored", (u32)A(1), A(2), n);
+}
 
 /* a texture by value (TexRef): what it is and which part of it */
 static bool texref(u64 tex, u64 view, TexRef *r) {
@@ -1639,7 +1644,7 @@ static const NvnProc procs[] = {
     {"nvnCommandBufferSetInnerTessellationLevels", nothing},
     {"nvnCommandBufferSetOuterTessellationLevels", nothing},
     {"nvnCommandBufferSetRenderEnable", cmd_render_enable},
-    {"nvnCommandBufferSetRenderEnableConditional", nothing},
+    {"nvnCommandBufferSetRenderEnableConditional", cmd_render_enable_cond},
     {"nvnCommandBufferSetRenderTargets", cmd_render_targets},
     {"nvnCommandBufferClearColor", cmd_clear_color},
     {"nvnCommandBufferClearColori", cmd_clear_color_i},

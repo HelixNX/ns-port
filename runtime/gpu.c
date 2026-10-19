@@ -233,7 +233,7 @@ void gpu_pool_destroyed(Pool *p) {
 
 /* ---------------------------------------------------------------------------------------------- images */
 typedef struct View { ViewInfo v; u32 kind; VkImageView view; } View;
-enum { VIEW_SAMPLED, VIEW_ATTACHMENT, VIEW_STORAGE };
+enum { VIEW_SAMPLED, VIEW_ATTACHMENT, VIEW_STORAGE, VIEW_SAMPLED_INT };
 typedef struct Image {
     TexInfo info;
     VkImage image;
@@ -402,6 +402,27 @@ static VkFormat sampled_format(VkFormat f) {
         if (!seen && nw < 16) { warned[nw++] = f; hlog(0, "gpu: integer texture format %d sampled as float", f); }
     }
     return f;
+}
+
+/* Integer textures (UINT/SINT formats, and depth-stencil textures in stencil mode) are read by shaders through
+ * integer views: the texture arrays TB_U2D / TB_U2D_ARRAY hold them, and the handle written to c[2] gets bit 19
+ * (texture ids stay below 65536), which translate.py tests at every fetch and gather (a float read of an integer
+ * view is undefined: AMD returned garbage for the stencil a culling pass reads, hiding objects near the camera) */
+#define HANDLE_INT (1u << 19)
+static VkFormat uint_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_UINT;
+    case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_UINT;
+    case VK_FORMAT_R32_SINT: return VK_FORMAT_R32_UINT;
+    case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_UINT;
+    case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R32G32_SINT: return VK_FORMAT_R32G32_UINT;
+    case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_UINT;
+    case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R32G32B32A32_SINT: return VK_FORMAT_R32G32B32A32_UINT;
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    default: return f;
+    }
 }
 
 static Image *image_create(const TexInfo *t, u32 h);
@@ -678,10 +699,11 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     } else {
         ci.viewType = view_type(v->target);
         if (ci.viewType == VK_IMAGE_VIEW_TYPE_CUBE && nlayers < 6) ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ci.format = sampled_format(fmt);
+        ci.format = kind == VIEW_SAMPLED_INT ? uint_twin(fmt) : sampled_format(fmt);
         VkImageAspectFlags asp = im->aspects;
         if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
             asp = v->ds_mode == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (kind == VIEW_SAMPLED_INT && (asp & VK_IMAGE_ASPECT_DEPTH_BIT)) return NULL;      /* depth is float */
         ci.subresourceRange = (VkImageSubresourceRange){asp, base_level, nlevels, base_layer, nlayers};
         VkComponentSwizzle sw[4];
         for (int i = 0; i < 4; i++) {
@@ -1198,8 +1220,10 @@ static u64 now_ns(void) {
  * Pipelines depend only on the shaders and the attachment formats: all other state is dynamic. */
 #define TEXPOOL_MAX 65536
 #define SMPPOOL_MAX 4096
-enum { TB_2D, TB_3D, TB_CUBE, TB_2D_ARRAY, TB_CUBE_ARRAY, TB_1D, TB_1D_ARRAY, TB_COUNT };
-static const u32 tb_target[TB_COUNT] = {TEX_2D, TEX_3D, TEX_CUBE, TEX_2D_ARRAY, TEX_CUBE_ARRAY, TEX_1D, TEX_1D_ARRAY};
+enum { TB_2D, TB_3D, TB_CUBE, TB_2D_ARRAY, TB_CUBE_ARRAY, TB_1D, TB_1D_ARRAY, TB_U2D, TB_U2D_ARRAY, TB_COUNT };
+static const u32 tb_target[TB_COUNT] = {TEX_2D, TEX_3D, TEX_CUBE, TEX_2D_ARRAY, TEX_CUBE_ARRAY, TEX_1D, TEX_1D_ARRAY,
+                                        TEX_2D, TEX_2D_ARRAY};
+#define TB_IS_INT(b) ((b) >= TB_U2D)
 static VkDescriptorSetLayout set_ubo, set_tex, set_smp, set_img;
 static VkPipelineLayout layout_gfx;
 static VkDescriptorPool desc_pool;
@@ -1346,6 +1370,7 @@ typedef struct DescSet {
     u32 *idx;                           /* interned descriptor in each entry (as last seen), ~0 none */
     u8 *res;                            /* texture entries: written into the set since idx or the images changed */
     Image **img;                        /* ... and the image written (NULL: the dummy) */
+    u8 *intv;                           /* texture entries: read through integer views (HANDLE_INT) */
     u64 epoch, synced;
     struct DescSet *next;
 } DescSet;
@@ -1353,12 +1378,12 @@ enum { DS_TEX, DS_SMP, DS_IMG };
 static DescSet *descsets;
 static VkImageView dummy_views[TB_COUNT], dummy_storage;
 static VkSampler dummy_sampler;
-#define DUMMY_ADDRS 4                   /* images at guest addresses 1-4 are ours: never evicted */
+#define DUMMY_ADDRS 5                   /* images at guest addresses 1-5 are ours: never evicted */
 
-static Image *dummy_image(u64 addr, u32 target, u32 depth, u32 flags) {
+static Image *dummy_image(u64 addr, u32 target, u32 depth, u32 flags, u32 format) {
     TexInfo t = {0};
     t.addr = addr;                      /* no guest memory */
-    t.format = 37;                      /* RGBA8 */
+    t.format = format;                  /* 37 RGBA8, 39 RGBA8UI */
     t.target = target;
     t.width = t.height = t.levels = 1;
     t.depth = depth;
@@ -1366,6 +1391,7 @@ static Image *dummy_image(u64 addr, u32 target, u32 depth, u32 flags) {
     t.flags = flags;
     Image *im = image_get(&t);
     VkClearColorValue black = {{0, 0, 0, 1}};
+    if (format == 39) black = (VkClearColorValue){.uint32 = {0, 0, 0, 1}};
     VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
     vkCmdClearColorImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &r);
     im->valid = true;
@@ -1375,18 +1401,20 @@ static Image *dummy_image(u64 addr, u32 target, u32 depth, u32 flags) {
 /* every entry starts as a 1x1 black texture of each view type / a default sampler, so that no index a shader
    computes is unwritten */
 static void dummies_init(void) {
-    Image *im2 = dummy_image(1, TEX_2D_ARRAY, 6, 0);       /* 2D, 2D array, cube and cube array views */
-    Image *im3 = dummy_image(3, TEX_3D, 1, 0);
-    Image *im1 = dummy_image(4, TEX_1D_ARRAY, 1, 0);
+    Image *im2 = dummy_image(1, TEX_2D_ARRAY, 6, 0, 37);   /* 2D, 2D array, cube and cube array views */
+    Image *im3 = dummy_image(3, TEX_3D, 1, 0, 37);
+    Image *im1 = dummy_image(4, TEX_1D_ARRAY, 1, 0, 37);
+    Image *imu = dummy_image(5, TEX_2D_ARRAY, 1, 0, 39);   /* integer 2D and 2D array views */
     for (u32 b = 0; b < TB_COUNT; b++) {
         u32 tg = tb_target[b];
         bool cube = tg == TEX_CUBE || tg == TEX_CUBE_ARRAY;
-        ViewInfo v = {37, tg, 0, 1, 0, cube ? 6 : 1, {2, 3, 4, 5}, 0};
-        dummy_views[b] = image_view(tg == TEX_3D ? im3 : tg == TEX_1D || tg == TEX_1D_ARRAY ? im1 : im2, &v, VIEW_SAMPLED);
+        ViewInfo v = {TB_IS_INT(b) ? 39 : 37, tg, 0, 1, 0, cube ? 6 : 1, {2, 3, 4, 5}, 0};
+        dummy_views[b] = TB_IS_INT(b) ? image_view(imu, &v, VIEW_SAMPLED_INT) :
+                         image_view(tg == TEX_3D ? im3 : tg == TEX_1D || tg == TEX_1D_ARRAY ? im1 : im2, &v, VIEW_SAMPLED);
         if (!dummy_views[b]) fatal("gpu: no dummy texture for view type %u", b);
     }
     ViewInfo v = {37, TEX_2D, 0, 1, 0, 1, {2, 3, 4, 5}, 0};
-    Image *im = dummy_image(2, TEX_2D, 1, TEX_FLAG_IMAGE);  /* and a 1x1 storage image */
+    Image *im = dummy_image(2, TEX_2D, 1, TEX_FLAG_IMAGE, 37);  /* and a 1x1 storage image */
     dummy_storage = image_view(im, &v, VIEW_STORAGE);
     VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR,
                                .minFilter = VK_FILTER_LINEAR, .maxLod = 16};
@@ -1423,6 +1451,7 @@ static DescSet *descset_get(const CmdPool *p, u32 kind) {
     memset(d->idx, 0xff, d->count * sizeof *d->idx);
     d->res = calloc(d->count, 1);
     d->img = calloc(d->count, sizeof *d->img);
+    d->intv = calloc(d->count, 1);
     d->epoch = ~0ull;
     d->next = descsets;
     descsets = d;
@@ -1470,7 +1499,7 @@ static void images_evict(u64 target, bool wait) {
  * that way: a 3D image only as 3D (whatever the entry says: the game draws its colour grading LUT as a 2D array
  * and samples it as 3D), a 1D image as 1D or 1D array, a 2D image as 2D (the entry's first layer), 2D array, and
  * cube or cube array if it was made cube compatible */
-static VkImageView tex_view_as(Image *im, const ViewInfo *v, u32 tg) {
+static VkImageView tex_view_as(Image *im, const ViewInfo *v, u32 tg, u32 kind) {
     ViewInfo w = *v;
     w.target = tg;
     u32 it = im->info.target;
@@ -1480,13 +1509,13 @@ static VkImageView tex_view_as(Image *im, const ViewInfo *v, u32 tg) {
         if (tg != TEX_2D && tg != TEX_2D_ARRAY) return NULL;
         w.min_layer = base;
         w.num_layers = tg == TEX_2D ? 1 : vn;
-        return image_view(im, &w, VIEW_SAMPLED);
+        return image_view(im, &w, kind);
     }
     if (it == TEX_3D) {
         if (tg != TEX_3D) return NULL;
         w.min_layer = 0;
         w.num_layers = 1;
-        return image_view(im, &w, VIEW_SAMPLED);
+        return image_view(im, &w, kind);
     }
     bool is1d = it == TEX_1D || it == TEX_1D_ARRAY;
     if (is1d != (tg == TEX_1D || tg == TEX_1D_ARRAY) || tg == TEX_3D) return NULL;
@@ -1500,17 +1529,26 @@ static VkImageView tex_view_as(Image *im, const ViewInfo *v, u32 tg) {
         w.num_layers = tg == TEX_CUBE ? 6 : (vn >= 6 && base + vn <= n ? vn : n - base) / 6 * 6;
         break;
     }
-    return image_view(im, &w, VIEW_SAMPLED);
+    return image_view(im, &w, kind);
 }
 
 /* entry i of a texture set: im's views of every type it allows, the black texture of the type elsewhere; returns
  * im, or NULL if no view of it was written */
+static bool tex_is_int(const Image *im, const ViewInfo *v) {
+    if (im->aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+        return !(im->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) || v->ds_mode == 1;
+    VkFormat f = usable_format(v->format);
+    if (f == VK_FORMAT_UNDEFINED || format_aspects(f) != im->aspects) f = im->format;
+    return format_numeric(f) != 0;
+}
+
 static Image *tex_write(VkDescriptorSet set, u32 i, Image *im, const ViewInfo *v) {
     VkDescriptorImageInfo info[TB_COUNT];
     VkWriteDescriptorSet w[TB_COUNT];
-    bool any = false;
-    for (u32 b = 0; b < TB_COUNT; b++) {
-        VkImageView view = im ? tex_view_as(im, v, tb_target[b]) : NULL;
+    bool any = false, isint = im && tex_is_int(im, v);
+    for (u32 b = 0; b < TB_COUNT; b++) {             /* an integer texture only in the integer arrays */
+        VkImageView view = im && isint == TB_IS_INT(b) ?
+                           tex_view_as(im, v, tb_target[b], isint ? VIEW_SAMPLED_INT : VIEW_SAMPLED) : NULL;
         any |= view != NULL;
         info[b] = (VkDescriptorImageInfo){NULL, view ? view : dummy_views[b], VK_IMAGE_LAYOUT_GENERAL};
         w[b] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b,
@@ -1536,6 +1574,7 @@ static void descset_resolve(DescSet *d, u32 i) {
     d->res[i] = 1;
     if (d->kind == DS_TEX) {
         d->img[i] = tex_write(d->set, i, im, &v);
+        d->intv[i] = d->img[i] && tex_is_int(d->img[i], &v);
         return;
     }
     VkDescriptorImageInfo info = {NULL, im ? image_view(im, &v, VIEW_STORAGE) : NULL, VK_IMAGE_LAYOUT_GENERAL};
@@ -1604,6 +1643,21 @@ static void spv_path(char *path, size_t size, u64 hash) {
         char *slash = strrchr(exe, '\\');
         if (slash) *slash = 0;
         snprintf(spv_dir, sizeof spv_dir, "%s\\..\\shaders\\spv", exe);
+        /* translations live in a folder per translator version (FNV-1a of translate.py, as translate.py names it):
+         * after a translator change every shader is translated again, nothing stale is used */
+        char tp[MAX_PATH];
+        snprintf(tp, sizeof tp, "%s/tools/shader/translate.py", NX_ROOT);
+        FILE *f = fopen(tp, "rb");
+        if (f) {
+            u32 h = 2166136261u;
+            int ch;
+            while ((ch = fgetc(f)) != EOF) h = (h ^ (u8)ch) * 16777619u;
+            fclose(f);
+            size_t n = strlen(spv_dir);
+            snprintf(spv_dir + n, sizeof spv_dir - n, "\\%08x", h);
+            CreateDirectoryA(spv_dir, NULL);
+            hlog(1, "gpu: shader translations in %s", spv_dir);
+        }
     }
     snprintf(path, size, "%s\\%016llx.spv", spv_dir, hash);
 }
@@ -1619,7 +1673,7 @@ static volatile u64 jit_done;          /* the last request a finished batch cove
 static unsigned __stdcall jit_thread(void *p) {
     char dir[MAX_PATH];
     snprintf(dir, sizeof dir, "%s", spv_dir);
-    char *slash = strrchr(dir, '\\');                     /* the shader dir: spv_dir's parent */
+    char *slash = strstr(dir, "\\spv");                   /* the shader dir: above spv\<version> */
     if (slash) *slash = 0;
     const char *py = getenv("NX_PYTHON") ? getenv("NX_PYTHON") : "python";
     for (;;) {
@@ -2053,8 +2107,10 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
         u32 v[4] = {(u32)dev, (u32)(dev >> 32), (u32)r->size, 0};
         memcpy(drv + (k < 16 ? ssbo_at + 16 * k : 0x220 + 16 * (k - 16)), v, 16);
     }
+    DescSet *ts = descset_get(&st.texpool, DS_TEX);
     for (u32 k = 0; k < 32; k++) {
-        u32 h = (u32)st.tex[stage][k];
+        u32 h = (u32)st.tex[stage][k], id = h & 0xfffff;
+        if (ts && id < ts->count && ts->intv[id]) h |= HANDLE_INT;
         memcpy(drv + 0x600 + 0x20 + 8 * k, &h, 4);
     }
     for (u32 k = 0; k < 8; k++) {      /* image handles at 0x120 */
@@ -2314,6 +2370,35 @@ static void dump_after_draw(void) {
             }
 }
 
+/* Traced frames (F12, NX_TRACE): an occlusion query around each Vulkan draw, its samples logged at present: a
+ * draw with no samples while its object is in view was culled in its shaders or its geometry collapsed */
+typedef struct QueryLog { u64 draw, vs, fs; } QueryLog;
+#define QUERY_MAX 16384
+static VkQueryPool query_pool;
+static QueryLog query_draw[QUERY_MAX];
+static u32 nqueries;
+static bool query_on;
+
+static void query_begin(VkCommandBuffer c) {
+    query_on = trace_frame() && nqueries < QUERY_MAX && st.rendering;
+    if (!query_on) return;
+    if (!query_pool) {
+        VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                    .queryCount = QUERY_MAX};
+        VKCHECK(vkCreateQueryPool(vk.dev, &ci, NULL, &query_pool));
+        vkResetQueryPool(vk.dev, query_pool, 0, QUERY_MAX);
+    }
+    vkCmdBeginQuery(c, query_pool, nqueries, VK_QUERY_CONTROL_PRECISE_BIT);
+}
+
+static void query_end(VkCommandBuffer c) {
+    if (!query_on) return;
+    vkCmdEndQuery(c, query_pool, nqueries);
+    query_draw[nqueries++] = (QueryLog){draws, pipe_vs_hash, pipe_fs_hash};
+    query_on = false;
+}
+#define QUERIED(stmt) do { query_begin(c); stmt; query_end(c); } while (0)
+
 static void draw(u32 op, const void *payload) {
     if (st.xfb_captured) {              /* what was captured is read as vertices (or captured into) next */
         end_rendering();
@@ -2329,10 +2414,15 @@ static void draw(u32 op, const void *payload) {
     }
 }
 
+typedef struct IndLog { u64 draw, vs, fs, addr; bool arrays; } IndLog;
+#define IND_LOG_MAX 8192
+static IndLog ind_log[IND_LOG_MAX];
+static u32 nind_log;
+
 static void draw_one(u32 op, const void *payload) {
     draws++;
     Shaders *pr = st.program;
-    if (!st.render_enable) return;
+    if (!st.render_enable) { skip_draw("rendering disabled (SetRenderEnable)"); return; }
     if (op == OP_DRAW_TEXTURE || op == OP_DRAW_XFB || op == OP_MULTI_DRAW_INDIRECT) { skip_draw("DrawTexture / transform feedback / multi-draw"); return; }
     if (!pr || !pr->stage[ST_VERTEX]) { skip_draw("no vertex shader"); return; }
     if (pr->mask & ~(1u << ST_VERTEX | 1u << ST_FRAGMENT)) { skip_draw("geometry or tessellation shaders"); return; }
@@ -2472,7 +2562,12 @@ static void draw_one(u32 op, const void *payload) {
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_gfx, 0, nw, w);
     VkDescriptorSet sets[3] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp, is ? is->set : empty_img};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_gfx, 1, 3, sets, 0, NULL);
-    struct { u32 func; float ref, point_size; u32 pad; } pc = {st.color.alpha_test, st.alpha_ref, st.point_size, 0};
+    /* debug word (fragment shaders' pc.debug): bit 0 NX_NO_DISCARD, discards off in draws that write depth (is an
+     * object drawn but discarded?); 2D layers keep theirs (with every discard off, the title screen covered all) */
+    static int no_discard = -1;
+    if (no_discard < 0) no_discard = getenv("NX_NO_DISCARD") != NULL;
+    struct { u32 func; float ref, point_size; u32 debug; } pc = {st.color.alpha_test, st.alpha_ref, st.point_size,
+                                                                (u32)(no_discard && (st.ds.flags & 2))};
     /* only with a color target 0: without one (the G-buffer passes, targets 1-4) its alpha means nothing, and
      * testing it hid whole objects */
     if (st.ms.a2c && st.samples <= 1 && (pc.func == 0 || pc.func == 8) && st.nrt && st.rt[0].t.addr) {
@@ -2491,12 +2586,12 @@ static void draw_one(u32 op, const void *payload) {
             u32 n;
             if (!quad_indices(d, indexed, &ib, &io, &n)) { skip_draw("quads"); return; }
             vkCmdBindIndexBuffer(c, ib, io, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(c, n, d->instances, 0, indexed ? d->base_vertex : 0, d->base_instance);
+            QUERIED(vkCmdDrawIndexed(c, n, d->instances, 0, indexed ? d->base_vertex : 0, d->base_instance));
             return;
         }
         if (d->mode == 2 || d->mode == 8 || d->mode == 9) { skip_draw("line loop / quad strip / polygon"); return; }
         if (!indexed) {
-            vkCmdDraw(c, d->count, d->instances, d->first, d->base_instance);
+            QUERIED(vkCmdDraw(c, d->count, d->instances, d->first, d->base_instance));
             return;
         }
         VkBuffer ib;
@@ -2504,21 +2599,23 @@ static void draw_one(u32 op, const void *payload) {
         if (!gpu_buffer(d->index_addr, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
         VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         vkCmdBindIndexBuffer(c, ib, io, it);
-        vkCmdDrawIndexed(c, d->count, d->instances, 0, d->base_vertex, d->base_instance);
+        QUERIED(vkCmdDrawIndexed(c, d->count, d->instances, 0, d->base_vertex, d->base_instance));
         return;
     }
     const CmdDrawIndirect *d = payload;
     VkBuffer buf, ib;
     u64 off, io;
     if (!gpu_buffer(d->indirect, &buf, &off)) { skip_draw("indirect buffer not GPU memory"); return; }
+    if (trace_frame() && nind_log < IND_LOG_MAX)
+        ind_log[nind_log++] = (IndLog){draws, pipe_vs_hash, pipe_fs_hash, d->indirect, op == OP_DRAW_ARRAYS_INDIRECT};
     if (op == OP_DRAW_ARRAYS_INDIRECT) {
-        vkCmdDrawIndirect(c, buf, off, 1, 16);
+        QUERIED(vkCmdDrawIndirect(c, buf, off, 1, 16));
         return;
     }
     if (!gpu_buffer(d->index_addr, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
     VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     vkCmdBindIndexBuffer(c, ib, io, it);
-    vkCmdDrawIndexedIndirect(c, buf, off, 1, 20);
+    QUERIED(vkCmdDrawIndexedIndirect(c, buf, off, 1, 20));
 }
 
 /* ---- compute */
@@ -2839,8 +2936,22 @@ static void run(u64 at, int depth) {
         case OP_REPORT_COUNTER: {
             PL(CmdReport);
             /* NVNcounterData {u64 value, u64 timestamp}: timestamps are ours, other counters report "visible" */
-            u64 v[2] = {p->counter == 0 ? 0 : 0x10000, now_ns()};
+            /* Counters are running totals the game subtracts (samples passed after a test draw minus before). A
+             * constant answer made every difference 0, "occluded": trees and other occlusion-tested objects were
+             * never drawn near the camera. Each report now counts up by 0x10000, so every test passes (no occlusion
+             * culling; real counts would need Vulkan occlusion queries). Timestamps stay ours. */
+            static u64 running;
+            running += 0x10000;
+            u64 v[2] = {p->counter == 0 ? 0 : running, now_ns()};
             if (p->addr) gpu_write(p->addr, v, 16);
+            static u32 seen[8];                 /* which counter types the game reads, once each, with how often */
+            static u64 n_reports;
+            n_reports++;
+            if (p->counter < 256 && !(seen[p->counter / 32] >> (p->counter % 32) & 1)) {
+                seen[p->counter / 32] |= 1u << (p->counter % 32);
+                hlog(0, "gpu: the game reads GPU counter type %u (answered with %llu; %llu reports so far)",
+                     p->counter, v[0], n_reports);
+            }
             break;
         }
         case OP_RESET_COUNTER: break;
@@ -3191,6 +3302,50 @@ static void refresh_cpu_textures(void) {
     if (refreshed && logged < 5) { logged++; hlog(1, "gpu: %d textures written by the CPU uploaded again", refreshed); }
 }
 
+/* the indirect draws of a traced frame, logged with the arguments the GPU wrote for them once it is done (instance
+ * counts from the game's GPU culling: 0 means culled) */
+static void ind_log_report(void) {
+    if (!nind_log) return;
+    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
+                              .pValues = &submitted};
+    VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+    u32 culled = 0;
+    for (u32 i = 0; i < nind_log; i++) {
+        const IndLog *l = &ind_log[i];
+        const u32 *a = (const u32 *)gpu_cpu(l->addr, 20);
+        if (!a) continue;
+        if (a[1] == 0) culled++;
+        if (l->arrays)
+            hlog(0, "indirect draw %llu: vs %016llx fs %016llx: vertices %u instances %u first %u base instance %u",
+                 l->draw, l->vs, l->fs, a[0], a[1], a[2], a[3]);
+        else
+            hlog(0, "indirect draw %llu: vs %016llx fs %016llx: indices %u instances %u first %u base vertex %d base instance %u",
+                 l->draw, l->vs, l->fs, a[0], a[1], a[2], (s32)a[3], a[4]);
+    }
+    hlog(0, "indirect draws: %u, %u with no instances", nind_log, culled);
+    nind_log = 0;
+}
+
+static void query_report(void) {
+    if (!nqueries) return;
+    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
+                              .pValues = &submitted};
+    VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+    u64 *r = malloc(nqueries * sizeof *r);
+    VkResult res = vkGetQueryPoolResults(vk.dev, query_pool, 0, nqueries, nqueries * sizeof *r, r, sizeof *r,
+                                         VK_QUERY_RESULT_64_BIT);
+    u32 none = 0;
+    for (u32 i = 0; res == VK_SUCCESS && i < nqueries; i++) {
+        if (!r[i]) none++;
+        hlog(0, "samples: draw %llu vs %016llx fs %016llx: %llu", query_draw[i].draw, query_draw[i].vs,
+             query_draw[i].fs, r[i]);
+    }
+    hlog(0, "samples: %u draws queried, %u drew nothing%s", nqueries, none, res == VK_SUCCESS ? "" : " (results not ready)");
+    free(r);
+    vkResetQueryPool(vk.dev, query_pool, 0, nqueries);
+    nqueries = 0;
+}
+
 void gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
     EnterCriticalSection(&gpu_cs);
@@ -3198,6 +3353,8 @@ void gpu_present(u64 queue, Window *w, u32 index) {
     Image *im = image_get(&w->info[index]);
     if (im) image_upload(im);
     flush();
+    ind_log_report();
+    query_report();
     static u64 budget;
     if (!budget) {
         for (u32 i = 0; i < vk.mem.memoryHeapCount; i++)
