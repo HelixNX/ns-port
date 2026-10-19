@@ -68,7 +68,12 @@ typedef struct Vk {
     u32 family;
     VkSurfaceKHR surface;
     u64 host_import_align;              /* minImportedHostPointerAlignment */
+    u32 dyn_logic_op;                   /* extendedDynamicState2LogicOp (AMD has none: the logic op is in the pipeline) */
+    VkShaderStageFlags warp32;          /* stages whose pipelines ask for 32-wide subgroups (Maxwell's warps) */
 } Vk;
+
+/* chained into a pipeline stage that is in vk.warp32: the translated shaders' subgroup code assumes 32 lanes */
+extern const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp32;
 extern Vk vk;
 
 /* device memory: sub-allocated from 64 MB blocks (dedicated above 16 MB) */

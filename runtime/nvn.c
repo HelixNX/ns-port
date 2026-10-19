@@ -748,6 +748,7 @@ static ShaderCode *shader_intern(u64 data, u64 control) {
     codes.items[codes.count++] = s;
     ReleaseSRWLockExclusive(&codes.lock);
     shader_dump(s, PTR(control));
+    gpu_shader_created(s);
     hlog(2, "nvn: shader %016llx: stage %u, %u bytes, constants %u", h, s->stage, end, csize);
     gpu_shaders_set(s);
     return s;

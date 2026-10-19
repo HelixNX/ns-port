@@ -13,10 +13,13 @@ VK_DEVICE_FNS(VK_DEFINE)
 #undef VK_DEFINE
 
 Vk vk;
+const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp32 = {
+    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = 32};
 static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
 void gpu_capture_next(void);
+void overlay_toggle(void);
 static volatile LONG resized;
 
 /* ---------------------------------------------------------------------------------------------- window */
@@ -41,6 +44,7 @@ void window_loop(void *guest_main_thread) {
                 }
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
             } while (SDL_PollEvent(&e));
         }
         input_poll();
@@ -106,7 +110,8 @@ static void load_instance(void) {
             .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
             .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = vk_debug};
         VkDebugUtilsMessengerEXT m;
         if (!create || create(vk.instance, &mi, NULL, &m) != VK_SUCCESS) hlog(1, "vk: no debug messenger");
@@ -173,6 +178,31 @@ void vk_init(void) {
     }
     if (vk.family == ~0u) fatal("no graphics queue that can present");
 
+    /* optional features: a dynamic logic op (else gpu.c puts it in the pipeline key), patch control points (unused:
+       draws with tessellation shaders are skipped) */
+    VkPhysicalDeviceRobustness2FeaturesEXT hasrob = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT has2 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &hasrob};
+    VkPhysicalDeviceFeatures2 hasf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &has2};
+    vkGetPhysicalDeviceFeatures2(vk.phys, &hasf);
+    vk.dyn_logic_op = has2.extendedDynamicState2LogicOp;
+    if (!vk.dyn_logic_op) hlog(1, "vk: no dynamic logic op: logic ops are part of the pipeline");
+
+    /* subgroups of 32 like Maxwell's warps: the translated ballots, lane masks and shuffles keep 32 lanes (AMD runs
+     * 64-wide waves by default, which lost lanes 32-63 and left a compute loop spinning until the driver reset) */
+    VkPhysicalDeviceVulkan13Features has13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 hasf13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &has13};
+    vkGetPhysicalDeviceFeatures2(vk.phys, &hasf13);
+    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p13};
+    VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+    vkGetPhysicalDeviceProperties2(vk.phys, &pp);
+    if (has13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 && p11.subgroupSize != 32)
+        vk.warp32 = p13.requiredSubgroupSizeStages;
+    hlog(1, "vk: subgroup size %u (%u-%u), 32 required for stages %x", p11.subgroupSize, p13.minSubgroupSize,
+         p13.maxSubgroupSize, vk.warp32);
+    if (p11.subgroupSize != 32 && !vk.warp32) hlog(0, "vk: subgroups are not 32 wide: warp-level shader code will be wrong");
+
     /* features: everything the NVN state maps to is dynamic state, so pipelines depend on shaders and formats */
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, .transformFeedback = 1};
@@ -182,8 +212,12 @@ void vk_init(void) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &u8i, .depthClipControl = 1};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT clip = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
                                                        &clipc, .depthClipEnable = 1};
+    /* bounds-checked buffer and image access (out of range: reads zero, writes dropped) where the device has it, so
+     * a shader reading past what it was given does not take the device down; global memory (raw addresses) is not
+     * covered */
     VkPhysicalDeviceRobustness2FeaturesEXT rob = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &clip,
-                                                  .nullDescriptor = 1};
+        .robustBufferAccess2 = hasrob.robustBufferAccess2, .robustImageAccess2 = hasrob.robustImageAccess2,
+        .nullDescriptor = 1};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, &rob,
         .customBorderColors = 1, .customBorderColorWithoutFormat = 1};
@@ -192,7 +226,8 @@ void vk_init(void) {
         .vertexInputDynamicState = 1};
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &vin,
-        .extendedDynamicState2 = 1, .extendedDynamicState2LogicOp = 1, .extendedDynamicState2PatchControlPoints = 1};
+        .extendedDynamicState2 = 1, .extendedDynamicState2LogicOp = vk.dyn_logic_op,
+        .extendedDynamicState2PatchControlPoints = has2.extendedDynamicState2PatchControlPoints};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, &eds2,
         .extendedDynamicState3PolygonMode = 1, .extendedDynamicState3RasterizationSamples = 1,
@@ -201,11 +236,13 @@ void vk_init(void) {
         .extendedDynamicState3ColorBlendEquation = 1, .extendedDynamicState3ColorWriteMask = 1,
         .extendedDynamicState3DepthClampEnable = 1, .extendedDynamicState3DepthClipEnable = 1};
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &eds3,
-        .dynamicRendering = 1, .synchronization2 = 1, .maintenance4 = 1, .shaderDemoteToHelperInvocation = 1};
+        .dynamicRendering = 1, .synchronization2 = 1, .maintenance4 = 1, .shaderDemoteToHelperInvocation = 1,
+        .subgroupSizeControl = vk.warp32 != 0};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13,
         .timelineSemaphore = 1, .bufferDeviceAddress = 1, .descriptorIndexing = 1, .runtimeDescriptorArray = 1,
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1,
         .descriptorBindingUpdateUnusedWhilePending = 1, .shaderSampledImageArrayNonUniformIndexing = 1,
+        .descriptorBindingStorageImageUpdateAfterBind = 1, .shaderStorageImageArrayNonUniformIndexing = 1,
         .scalarBlockLayout = 1, .hostQueryReset = 1, .shaderFloat16 = 0, .samplerFilterMinmax = 1,
         .samplerMirrorClampToEdge = 1, .descriptorBindingVariableDescriptorCount = 1,
         .shaderOutputLayer = 1, .shaderOutputViewportIndex = 1,
@@ -519,6 +556,111 @@ static void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, 
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
+/* ---------------------------------------------------------------------------------------------- fps overlay */
+/* Frame times between presents; average fps, 5% and 1% lows (the mean of the slowest 5% / 1% of frame times)
+ * over the last OV_FRAMES frames, drawn with a 5x7 font into a host buffer and copied onto the swapchain
+ * image. On unless NX_FPS=0; F3 toggles it. */
+#define OV_FRAMES 1024
+#define OV_W 200
+#define OV_H 80
+#define OV_SCALE 2
+static volatile LONG overlay_on = -1;
+static struct {
+    double times[OV_FRAMES];                /* ms */
+    u32 n, next;
+    LARGE_INTEGER last, freq, shown;
+    char lines[4][24];
+    VkBuf buf[PRESENT_FRAMES];
+} ov;
+
+static const struct { char c; u8 rows[7]; } glyphs[] = {
+    {'0', {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}}, {'1', {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}},
+    {'2', {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}}, {'3', {0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e}},
+    {'4', {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}}, {'5', {0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e}},
+    {'6', {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}}, {'7', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}}, {'9', {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c}},
+    {'.', {0, 0, 0, 0, 0, 0x0c, 0x0c}}, {'%', {0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03}},
+    {'A', {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}}, {'F', {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10}},
+    {'G', {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}}, {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f}},
+    {'M', {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}}, {'O', {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
+    {'P', {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}}, {'S', {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}},
+    {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}}, {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}},
+    {'X', {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11}},
+};
+
+void overlay_toggle(void) {
+    InterlockedExchange(&overlay_on, overlay_on ? 0 : 1);
+}
+
+static int cmp_desc(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void overlay_stats(void) {
+    static double sorted[OV_FRAMES];
+    u32 n = ov.n;
+    double sum = 0;
+    for (u32 i = 0; i < n; i++) sum += sorted[i] = ov.times[i];
+    qsort(sorted, n, sizeof *sorted, cmp_desc);
+    u32 n5 = n / 20 ? n / 20 : 1, n1 = n / 100 ? n / 100 : 1;
+    double s5 = 0, s1 = 0;
+    for (u32 i = 0; i < n5; i++) s5 += sorted[i];
+    for (u32 i = 0; i < n1; i++) s1 += sorted[i];
+    double last = ov.times[(ov.next + OV_FRAMES - 1) % OV_FRAMES];
+    snprintf(ov.lines[0], sizeof ov.lines[0], "FPS %.1f", 1000.0 * n / sum);
+    snprintf(ov.lines[1], sizeof ov.lines[1], "5%% LOW %.1f", 1000.0 * n5 / s5);
+    snprintf(ov.lines[2], sizeof ov.lines[2], "1%% LOW %.1f", 1000.0 * n1 / s1);
+    snprintf(ov.lines[3], sizeof ov.lines[3], "MS %.1f MAX %.0f", last, sorted[0]);
+}
+
+/* draw the overlay for present frame f; false when it is off or the swapchain format is not 8-bit BGRA/RGBA */
+static bool overlay_draw(u32 f) {
+    if (overlay_on < 0) {
+        const char *e = getenv("NX_FPS");
+        InterlockedExchange(&overlay_on, !(e && *e == '0'));
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!ov.freq.QuadPart) {
+        QueryPerformanceFrequency(&ov.freq);
+        ov.last = ov.shown = now;
+        return false;
+    }
+    ov.times[ov.next] = 1000.0 * (double)(now.QuadPart - ov.last.QuadPart) / (double)ov.freq.QuadPart;
+    ov.next = (ov.next + 1) % OV_FRAMES;
+    if (ov.n < OV_FRAMES) ov.n++;
+    ov.last = now;
+    if (!overlay_on) return false;
+    bool bgra = sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!bgra && sw.format != VK_FORMAT_R8G8B8A8_UNORM && sw.format != VK_FORMAT_R8G8B8A8_SRGB) return false;
+    if (sw.extent.width < OV_W + 8 || sw.extent.height < OV_H + 8) return false;
+    if (!ov.lines[0][0] || now.QuadPart - ov.shown.QuadPart > ov.freq.QuadPart / 2) {
+        overlay_stats();
+        ov.shown = now;
+    }
+    if (!ov.buf[f].buf)
+        vk_buffer(OV_W * OV_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ov.buf[f]);
+    u32 *px = (u32 *)ov.buf[f].a.map;
+    if (!px) return false;
+    u32 bg = 0xff181818, fg = 0xff40ff40;      /* green on dark grey, the same in BGRA and RGBA */
+    for (u32 i = 0; i < OV_W * OV_H; i++) px[i] = bg;
+    for (int l = 0; l < 4; l++) {
+        int x0 = 8, y0 = 6 + l * 18;
+        for (const char *s = ov.lines[l]; *s; s++, x0 += 6 * OV_SCALE) {
+            const u8 *rows = NULL;
+            for (size_t g = 0; g < sizeof glyphs / sizeof *glyphs; g++)
+                if (glyphs[g].c == *s) rows = glyphs[g].rows;
+            if (!rows || x0 + 5 * OV_SCALE > OV_W) continue;
+            for (int r = 0; r < 7 * OV_SCALE; r++)
+                for (int c = 0; c < 5 * OV_SCALE; c++)
+                    if (rows[r / OV_SCALE] >> (4 - c / OV_SCALE) & 1) px[(y0 + r) * OV_W + x0 + c] = fg;
+        }
+    }
+    return true;
+}
+
 void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (!sw.fence[0]) present_init();
     if (InterlockedExchange(&resized, 0) || !sw.sc) {
@@ -557,6 +699,12 @@ void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphor
             .dstOffsets = {{dx, dy, 0}, {dx + (s32)dw, dy + (s32)dh, 1}}};
         vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                        &blit, VK_FILTER_LINEAR);
+    }
+    if (overlay_draw(f)) {
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageOffset = {8, 8, 0}, .imageExtent = {OV_W, OV_H, 1}};
+        vkCmdCopyBufferToImage(cmd, ov.buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     }
     image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     VKCHECK(vkEndCommandBuffer(cmd));

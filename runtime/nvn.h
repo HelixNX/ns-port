@@ -137,11 +137,14 @@ typedef struct ShaderCode {
     void *module;                       /* gpu.c: the translated shader, or NULL */
     u32 caps;                           /* gpu.c: SHC_* found in the translation */
     u32 xfb_stride[4];                  /* transform feedback: bytes per vertex in each buffer (0: not captured) */
-    bool missing;
+    u8 cb_of_slot[16];                  /* gpu.c: the c[i] in each push descriptor slot (translate.py: c[16] takes a free one) */
+    bool missing;                       /* gpu.c: no SPIR-V, and none coming */
+    u64 jit_seq;                        /* gpu.c: its translation request (gpu_shader_created), or 0 */
 } ShaderCode;
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
-enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8 };
+enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8, SHC_TEX_NON2D = 16 };
 typedef struct Shaders { ShaderCode *stage[ST_COUNT]; u32 mask; u64 key; } Shaders;
+void gpu_shader_created(ShaderCode *s);          /* translate it if it has no SPIR-V (gpu.c) */
 Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]);   /* the one Shaders object for these stages */
 
 /* ---------------------------------------------------------------------------------------------- windows, syncs */
