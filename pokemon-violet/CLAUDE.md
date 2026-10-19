@@ -275,10 +275,22 @@ of work; online code paths must fail as on a console with no internet, not crash
     that texture (a render, a copy or a CPU upload; `NX_TRACE` from a new game's portrait screen).
   - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
     the `?` icon is fixed.
-- **Performance (2026-10-19, RX 7800 XT, Mesagoza at 1080p, uncapped):** ~85 -> 103-120 fps. The game advances
-  a fixed 1/30 s per frame (uncapped, everything runs that much faster), so 60 fps needs its timestep found and
-  patched; for now uncapped runs are for measuring only (`$env:NX_NOPACE='1'`, which also presents with IMMEDIATE:
-  with FIFO a visible window is held to 60).
+- **Frame rate (2026-10-19): any rate plays at normal speed.** `NX_FRAMERATE=60` (or 120, 0 uncapped; unset is
+  the game's own 30); F5 cycles game / 60 / 120 / uncapped during play; F3's overlay shows the cap, TICK (game
+  time per second in 30 Hz ticks: 30 = normal speed) and SPEED.
+  - How: the game steps each frame by a frame duration from a table (`main+3c2fbb0` = table[present interval -
+    1], 33.3 ms) and derives its speed from the same entry (`main+d9643c`). `violetrecomp/fps.c` writes the entry
+    every frame (rodata: through VirtualProtect; WriteProcessMemory failed silently and the game ran fast) and
+    keeps the speed's divisor at 30 fps. The instructions are patched through `violetrecomp/patches.txt` (lifter
+    feature: "if" alternates switched at run time, "call"/"after" host hooks); re-lift main after changing it.
+  - Found with Fl4sh's Violet 4.0.0 "60 FPS" and "Dynamic FPS (ASM)" pchtxt patches (gamebanana) as a map, in
+    `pokemon-violet/mods-ref/` (text only, not in git; the zips are at the workspace root). pchtxt addresses equal
+    our main.elf addresses (no 0x100 shift); their build id is ours (709BFD66...). Not ported yet from the
+    dynamic patch: its scaling of a movement value at `cce37c` (stutter when walking) and a removed store at
+    `1526d64`; the purpose of the 60.0 at `170c408` and the 100000.0 at `20a8d3c` is not known.
+- **Performance (2026-10-19, RX 7800 XT, Mesagoza at 1080p, uncapped):** ~85 -> 103-120 fps. Uncapped runs:
+  `$env:NX_NOPACE='1'` (= `NX_FRAMERATE=0`; presents with IMMEDIATE above 60 when there is no MAILBOX: with FIFO
+  a visible window is held to 60).
   - Found: the render thread kept its emulated core while we translated and presented (~6 ms a frame), and the
     main thread, sharing that core, waited for it 59% of the time. Submit and present now give the core up.
   - Also: work goes to the GPU every 250 draws (`NX_FLUSH_DRAWS`), the CPU-written texture check runs on its own
