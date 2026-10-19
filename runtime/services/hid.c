@@ -65,6 +65,10 @@ static const Iface iface_hid = {"hid", (const IpcCmd[]){
 #define NPAD_SIZE      0x5000u
 #define LIFO_FULLKEY   0x28u            /* then handheld, dual, left, right, palma, system ext: 0x350 each */
 #define LIFO_SIZE      0x350u
+#define LIFO_COUNT     7
+#define LIFO_SIXAXIS   0x1758u          /* motion: full key, handheld, dual left, dual right, left, right: 0x708 each */
+#define LIFO_SIXAXIS_SIZE 0x708u
+#define NPAD_COUNT     10               /* No1..No8, Handheld, Other */
 #define LIFO_ENTRIES   17
 #define NPAD_DEVTYPE   0x4188u
 #define NPAD_SYSPROPS  0x4190u
@@ -117,8 +121,29 @@ static void npad_update(void) {
     memcpy(st + 8, &input[0].buttons, 8);
     memcpy(st + 0x10, &input[0].lx, 16);
     memcpy(st + 0x20, &attr, 4);
-    lifo_push(np + LIFO_FULLKEY, st, sizeof st, n);
-    lifo_push(np + LIFO_FULLKEY + 6 * LIFO_SIZE, st, sizeof st, n);   /* system ext */
+    /* hid writes every lifo of every npad, a disconnected one with an empty state. Violet also reads the Handheld
+     * npad; with its lifos never written, the player and the camera wandered (mostly left) with no input */
+    u8 idle[0x28] = {0};
+    memcpy(idle, &n, 8);
+    for (int i = 0; i < NPAD_COUNT; i++)
+        for (int l = 0; l < LIFO_COUNT; l++) {
+            bool live = i == 0 && (l == 0 || l == 6);                     /* player 1: full key and system ext */
+            lifo_push(mem + NPAD_BASE + i * NPAD_SIZE + LIFO_FULLKEY + l * LIFO_SIZE, live ? st : idle, sizeof st, n);
+        }
+    /* the motion sensors of a controller lying still.
+     * SixAxisSensorState: s64 delta time (ns), s64 sampling, float accel[3] (g), gyro[3], rotation[3],
+     * direction[3][3] (orientation), u32 attributes (1: connected), u32 reserved */
+    u8 sx[0x60] = {0};
+    s64 dt = 16000000;
+    float accel[3] = {0, 0, -1}, dir[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    u32 sattr = 1;
+    memcpy(sx, &dt, 8);
+    memcpy(sx + 8, &n, 8);
+    memcpy(sx + 0x10, accel, 12);
+    memcpy(sx + 0x34, dir, 36);
+    memcpy(sx + 0x58, &sattr, 4);
+    lifo_push(np + LIFO_SIXAXIS, sx, sizeof sx, n);                   /* full key */
+    lifo_push(np + LIFO_SIXAXIS + LIFO_SIXAXIS_SIZE, sx, sizeof sx, n);   /* handheld */
 }
 
 static unsigned __stdcall input_thread(void *p) {

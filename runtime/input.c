@@ -1,11 +1,16 @@
 /* Input: the keyboard and the first gamepad (SDL3) as player 1's Pro Controller (services/hid.c).
  *
- * Keyboard: ESDF = left stick, IJKL = right stick, arrows = D-pad (games give the D-pad its own actions, e.g.
+ * Keyboard: WASD = left stick, IJKL = right stick, arrows = D-pad (games give the D-pad its own actions, e.g.
  * Violet's emotes, so it is not also a stick), Z = A, X = B, C = X, V = Y, Q = L, R = R, 1 = ZL, 3 = ZR,
  * Enter = +, Backspace = -. Gamepads map by label (an Xbox pad's bottom button is A).
+ * Mouse: the right stick while captured (a click in the window captures it, Esc or losing focus releases it): the
+ * stick follows the mouse's smoothed speed, full at 2000 pixels a second times NX_MOUSE_SENS (default 1); below
+ * 150 pixels a second (a resting hand on a high-resolution mouse) it stays centred.
  * NX_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
  * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
- * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks). */
+ * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks)
+ * NX_INPUT_LOG logs every change of the input; NX_INPUT_REPLAY=<log file> plays such a log back by frame (a run
+ * recorded by hand, replayed unattended), on top of live input. */
 #include "hos.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
@@ -23,8 +28,27 @@ enum {
 };
 
 static SDL_Gamepad *pad;
+static bool mouse_captured;
+static float mouse_dx, mouse_dy;        /* motion since the last poll (window thread: events and polls alike) */
+
+static void mouse_capture(SDL_WindowID id, bool on) {
+    SDL_Window *w = SDL_GetWindowFromID(id);
+    if (w && SDL_SetWindowRelativeMouseMode(w, on)) mouse_captured = on;
+    mouse_dx = mouse_dy = 0;
+}
 
 void input_event(const SDL_Event *e) {
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouse_captured) mouse_capture(e->button.windowID, true);
+    else if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_ESCAPE && mouse_captured)
+        mouse_capture(e->key.windowID, false);
+    else if (e->type == SDL_EVENT_WINDOW_FOCUS_LOST && mouse_captured) mouse_capture(e->window.windowID, false);
+    else if (e->type == SDL_EVENT_MOUSE_MOTION && mouse_captured) {
+        mouse_dx += e->motion.xrel;
+        mouse_dy += e->motion.yrel;
+    }
+    if (e->type == SDL_EVENT_JOYSTICK_ADDED)            /* every device SDL finds, a gamepad or not */
+        hlog(1, "input: joystick %u %s (%s)", (unsigned)e->jdevice.which, SDL_GetJoystickNameForID(e->jdevice.which),
+             SDL_IsGamepad(e->jdevice.which) ? "gamepad" : "not a gamepad");
     if (e->type == SDL_EVENT_GAMEPAD_ADDED && !pad) {
         pad = SDL_OpenGamepad(e->gdevice.which);
         if (pad) hlog(1, "input: gamepad %s", SDL_GetGamepadName(pad));
@@ -72,6 +96,36 @@ static u64 scripted(u64 frame) {
     return b;
 }
 
+/* NX_INPUT_REPLAY: the input of the last logged change at or before this frame */
+static bool replayed(u64 frame, u64 *b, s32 *lx, s32 *ly, s32 *rx, s32 *ry) {
+    static struct Rec { u64 frame, b; s32 lx, ly, rx, ry; } *rec;
+    static size_t n, at;
+    static bool init;
+    if (!init) {
+        init = true;
+        const char *path = getenv("NX_INPUT_REPLAY");
+        FILE *f = path ? fopen(path, "r") : NULL;
+        if (path && !f) hlog(0, "input: cannot open %s", path);
+        char line[512];
+        size_t cap = 0;
+        while (f && fgets(line, sizeof line, f)) {
+            const char *p = strstr(line, "input: frame ");
+            struct Rec r;
+            if (!p || sscanf(p, "input: frame %llu buttons %llx left %d,%d right %d,%d", &r.frame, &r.b, &r.lx, &r.ly,
+                             &r.rx, &r.ry) != 6)
+                continue;
+            if (n == cap) rec = realloc(rec, (cap = cap * 2 + 256) * sizeof *rec);
+            rec[n++] = r;
+        }
+        if (f) { fclose(f); hlog(1, "input: replaying %zu input changes from %s", n, path); }
+    }
+    while (at < n && rec[at].frame <= frame) at++;
+    if (!at) return false;
+    const struct Rec *r = &rec[at - 1];
+    *b = r->b; *lx = r->lx; *ly = r->ly; *rx = r->rx; *ry = r->ry;
+    return true;
+}
+
 void input_poll(void) {
     const bool *k = SDL_GetKeyboardState(NULL);
     u64 b = 0;
@@ -84,10 +138,10 @@ void input_poll(void) {
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
         if (k[keys[i].sc]) b |= keys[i].bit;
-    if (k[SDL_SCANCODE_S]) lx -= 32767;                /* the left stick on ESDF, apart from the D-pad */
-    if (k[SDL_SCANCODE_F]) lx += 32767;
-    if (k[SDL_SCANCODE_E]) ly += 32767;
-    if (k[SDL_SCANCODE_D]) ly -= 32767;
+    if (k[SDL_SCANCODE_A]) lx -= 32767;                /* the left stick on WASD, apart from the D-pad */
+    if (k[SDL_SCANCODE_D]) lx += 32767;
+    if (k[SDL_SCANCODE_W]) ly += 32767;
+    if (k[SDL_SCANCODE_S]) ly -= 32767;
     if (k[SDL_SCANCODE_J]) rx -= 32767;
     if (k[SDL_SCANCODE_L]) rx += 32767;
     if (k[SDL_SCANCODE_I]) ry += 32767;
@@ -111,6 +165,35 @@ void input_poll(void) {
         if (ax * ax + ay * ay > 6000 * 6000) { lx = axis(ax); ly = axis(-ay); }      /* SDL's y points down */
         if (bx * bx + by * by > 6000 * 6000) { rx = axis(bx); ry = axis(-by); }
     }
+    {                                                   /* the mouse's speed (pixels a second), smoothed over ~50 ms */
+        static float vx, vy, sens;
+        static u64 last;
+        if (!sens) sens = getenv("NX_MOUSE_SENS") ? (float)atof(getenv("NX_MOUSE_SENS")) : 1.0f;
+        if (sens <= 0) sens = 1.0f;
+        u64 now = SDL_GetTicksNS();
+        float dt = last ? (float)(now - last) * 1e-9f : 0.008f;
+        last = now;
+        if (dt > 0.1f) dt = 0.1f;
+        if (dt > 0) {
+            float a = 1.0f - SDL_expf(-dt / 0.05f);
+            vx += (mouse_dx / dt - vx) * a;
+            vy += (mouse_dy / dt - vy) * a;
+        }
+        mouse_dx = mouse_dy = 0;
+        if (!mouse_captured) vx = vy = 0;
+        float mx = vx * sens * (32767.0f / 2000.0f), my = -vy * sens * (32767.0f / 2000.0f);   /* y points down */
+        if (vx * vx + vy * vy > 150.0f * 150.0f) {
+            rx = mx > 32767 ? 32767 : mx < -32767 ? -32767 : (s32)mx;
+            ry = my > 32767 ? 32767 : my < -32767 ? -32767 : (s32)my;
+        }
+    }
+    u64 pb;
+    s32 plx, ply, prx, pry;
+    if (replayed(gpu_frames(), &pb, &plx, &ply, &prx, &pry)) {
+        b |= pb;
+        if (plx || ply) { lx = plx; ly = ply; }
+        if (prx || pry) { rx = prx; ry = pry; }
+    }
     u64 sb = scripted(gpu_frames());                    /* scripted stick directions move the sticks fully */
     if (sb & B_LS_LEFT) lx = -32767;
     if (sb & B_LS_RIGHT) lx = 32767;
@@ -130,5 +213,14 @@ void input_poll(void) {
     if (rx > 16000) b |= B_RS_RIGHT;
     if (ry > 16000) b |= B_RS_UP;
     if (ry < -16000) b |= B_RS_DOWN;
+    /* NX_INPUT_LOG: every change of what the game is given (input that seems to come from nowhere) */
+    static int log_input = -1;
+    static u64 lb;
+    static s32 llx, lly, lrx, lry;
+    if (log_input < 0) log_input = getenv("NX_INPUT_LOG") != NULL;
+    if (log_input && (b != lb || lx != llx || ly != lly || rx != lrx || ry != lry)) {
+        hlog(0, "input: frame %llu buttons %llx left %d,%d right %d,%d", gpu_frames(), b, lx, ly, rx, ry);
+        lb = b; llx = lx; lly = ly; lrx = rx; lry = ry;
+    }
     hid_set_input(0, b, lx, ly, rx, ry);
 }
