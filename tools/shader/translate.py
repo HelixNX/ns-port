@@ -1,9 +1,11 @@
 """Maxwell shader -> GLSL 4.60 for Vulkan (our own translator; see CLAUDE.md, decision 4).
 
-Usage: python translate.py [--check | --spv] [shader dir] [out dir]
+Usage: python translate.py [--check | --spv] [--only=<hash>,...] [shader dir] [out dir]
     default: ../../../build/shaders -> ../../../build/shaders/glsl (<hash>.vert / .frag / .comp)
     --check  also compiles every output with glslang (deps/glslang/bin/glslang.exe) and reports failures
-    --spv    the same, keeping the SPIR-V in <shader dir>/spv/<hash>.spv (what the runtime loads for now)
+    --spv    the same, keeping the SPIR-V in <shader dir>/spv/<hash>.spv (what the runtime loads)
+    --only   just these shaders, or @file for a list of them (the runtime translates shaders it has no SPIR-V
+             for this way while the game runs)
 
 Model:
   - Registers are `uint rN` (bit patterns; floats through F()/U()), predicates `bool pN`, condition codes cc_z/s/c/o.
@@ -15,7 +17,7 @@ Model:
     c[2] texture handles (bound slot k at 0x20 + 8k), c[3 + b] the game's uniform buffer binding b.
     The executor (runtime/gpu.c) fills c[0] and c[2] itself.
   - Textures are bindless: the 32-bit NVN handle (texture id | sampler id << 20) indexes the texture pool's
-    descriptor array (set 1) and the sampler pool's (set 2).
+    descriptor arrays (set 1, one per view type: TEX_BINDING, runtime/gpu.c TB_*) and the sampler pool's (set 2).
   - Global memory (LDG/STG) uses 64-bit device addresses, which c[0] holds instead of guest addresses.
   - Transform feedback (the GLSLC layout in the control section): each captured varying is copied at exit into an
     output of its own with xfb_buffer / xfb_offset / xfb_stride, at the locations from 31 down.
@@ -34,6 +36,8 @@ PT = 7
 STAGE_EXT = {'vertex': 'vert', 'fragment': 'frag', 'compute': 'comp', 'geometry': 'geom',
              'tess_control': 'tesc', 'tess_eval': 'tese'}
 STAGE_BASE = {'vertex': 0, 'fragment': 16, 'compute': 0, 'geometry': 32, 'tess_control': 48, 'tess_eval': 64}
+# set 1 binding of each texture array (a view's type must match the shader's image dimension): runtime/gpu.c TB_*
+TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5, 't1da': 6}
 
 
 class Unsupported(Exception):
@@ -58,8 +62,11 @@ def flit(u):
 
 
 class Translator:
-    def __init__(self, sh):
+    def __init__(self, sh, int_attrs=0):
         self.sh = sh
+        # vertex inputs fed from integer formats: 2 bits per location (1 unsigned, 2 signed), declared uvec4 / ivec4
+        # (a UINT/SINT format into a float input is undefined in Vulkan; NVIDIA keeps the bits, AMD does not)
+        self.int_attrs = int_attrs
         self.stage = sh.stage
         self.lines = []
         self.regs = set()
@@ -1332,8 +1339,11 @@ class Translator:
             e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), '0', self.tex_offsets('2D', b))
         elif enc == 5:      # 2D.LL
             e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0))
-        elif enc == 8:      # 3D.LZ
+        elif enc == 7:      # 3D.LZ
             e = self.fetch('3D', 'h_', 'ivec3(%s, %s, %s)' % (ia(0), ia(1), ib(0)), '0')
+        elif enc == 8:      # 2D ARRAY.LZ: the layer in Ra (16 bits), x and y in Rb, Rb+1 (Violet's terrain material map:
+            #                 it clamps both to the size first; reading x from Ra+1 as TEXS does transposed the map)
+            e = self.fetch('2DARRAY', 'h_', 'ivec3(%s, %s, int(%s & 0xffffu))' % (ib(0), ib(1), self.R(a)), '0')
         elif enc == 12:     # 2D.LL.AOFFI
             e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0),
                            self.tex_offsets('2D', b + 1 if b != RZ else RZ))
@@ -1463,10 +1473,10 @@ class Translator:
             h, lod = self.R(sr), self.R(sr + 1 if sr != RZ else RZ)
         else:
             h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
-        self.uses.add('tex_t2d')
-        t = 't2d[nonuniformEXT(min(h_ & 0xfffffu, 65535u))]'
-        self.emit('{ uint h_ = %s; ivec2 s_ = textureSize(%s, int(%s)); uvec4 v_ = uvec4(uvec2(s_), 1u, uint(textureQueryLevels(sampler2D(%s, smp[nonuniformEXT(min(h_ >> 20, 4095u))]))));'
-                  % (h, t, lod, t))
+        # each view type has its own array (runtime/gpu.c TB_*): every 2D image has a 2D array view, a 3D image only
+        # a 3D one; the 1x1 black texture where the entry has no view of that type
+        self.uses.update(('tex_t2da', 'tex_t3d', 'txq'))
+        self.emit('{ uint h_ = %s; uvec4 v_ = txq(h_, int(%s));' % (h, lod))
         self.indent += 1
         r = d
         for c in range(4):
@@ -1856,12 +1866,22 @@ class Translator:
             lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
             out.append('layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;' % (lx, ly, lz))
         out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }']
+        if self.int_attrs:
+            out += ['uint U(uint x) { return x; }', 'uint U(int x) { return uint(x); }']
         if 'fmz' in self.uses:
             out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                     'float ffmz(float a, float b, float c) { return (a == 0.0 || b == 0.0) ? c : fma(a, b, c); }']
         base = STAGE_BASE[self.stage]
+        # 16 push descriptor slots per stage (32 in all, the usual maxPushDescriptors) for c[0..16]: c[i] in slot i,
+        # and c[16] in a slot this shader leaves free; the runtime reads the slots back from the cbN bindings
+        slot = {i: i for i in self.cbufs if i < 16}
+        for i in sorted(i for i in self.cbufs if i >= 16):
+            free = [s for s in range(3, 16) if s not in slot.values()]
+            if not free:
+                raise Unsupported('c[%d] and every other constant buffer' % i)
+            slot[i] = free[0]
         for i in sorted(self.cbufs):
-            out.append('layout(set = 0, binding = %d, std140) uniform CB%d { uvec4 d[4096]; } cb%d;' % (base + i, i, i))
+            out.append('layout(set = 0, binding = %d, std140) uniform CB%d { uvec4 d[4096]; } cb%d;' % (base + slot[i], i, i))
             if 'cbdyn%d' % i in self.uses:
                 out.append('uint cbr%d(uint a) { return a < 65536u ? cb%d.d[a >> 4][(a >> 2) & 3u] : 0u; }' % (i, i))
         if any(u.startswith('tex_') for u in self.uses):
@@ -1869,8 +1889,20 @@ class Translator:
                     't2da': 'texture2DArray', 'tcubea': 'textureCubeArray', 't1da': 'texture1DArray'}
             for name, typ in decl.items():
                 if 'tex_' + name in self.uses:
-                    out.append('layout(set = 1, binding = 0) uniform %s %s[];' % (typ, name))
+                    out.append('layout(set = 1, binding = %d) uniform %s %s[];' % (TEX_BINDING[name], typ, name))
             out.append('layout(set = 2, binding = 0) uniform sampler smp[];')
+            if 'txq' in self.uses:
+                # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D
+                out += ['uvec4 txq(uint h, int lod) {',
+                        '    uint t = min(h & 0xfffffu, 65535u), s = min(h >> 20, 4095u);',
+                        '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
+                        '    int l = textureQueryLevels(sampler2DArray(t2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]));',
+                        '    if (z.xy == ivec2(1)) {',
+                        '        ivec3 d = textureSize(t3d[nonuniformEXT(t)], lod);',
+                        '        if (d != ivec3(1)) { z = d; l = textureQueryLevels(sampler3D(t3d[nonuniformEXT(t)], smp[nonuniformEXT(s)])); }',
+                        '    }',
+                        '    return uvec4(uvec3(z), uint(l));',
+                        '}']
         # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)
         idecl = {'1d': 'image1D', '1darray': 'image1DArray', '2d': 'image2D', '2darray': 'image2DArray', '3d': 'image3D'}
         for dim, typ in idecl.items():
@@ -1883,7 +1915,8 @@ class Translator:
                 out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMemI { int v; };')
         if self.stage == 'vertex':
             for k in sorted(self.in_attrs):
-                out.append('layout(location = %d) in vec4 in_a%d;' % (k, k))
+                ty = {1: 'uvec4', 2: 'ivec4'}.get(self.int_attrs >> (2 * k) & 3, 'vec4')
+                out.append('layout(location = %d) in %s in_a%d;' % (k, ty, k))
             for k in sorted(self.out_attrs):
                 out.append('layout(location = %d) out vec4 out_a%d;' % (k, k))
             loc = 31        # capture outputs take the locations from the top, which the game's varyings leave free
@@ -1936,6 +1969,10 @@ class Translator:
             out.append('    bool ' + ', '.join('b%d = %s' % (f, 'true' if f == 0 else 'false') for f in flags[i:i + 16]) + ';')
         if self.stage == 'vertex':
             out.append('    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);')
+            # components the shader leaves unwritten read as the hardware's default (0, 0, 0, 1), as for the
+            # position (the sky divides by a varying's w that only the default sets)
+            for k in sorted(self.out_attrs):
+                out.append('    out_a%d = vec4(0.0, 0.0, 0.0, 1.0);' % k)
             out.append('    gl_PointSize = pc.point_size;')     # NVN's point size, unless the shader writes one
         out += body
         out.append('}')
@@ -1946,6 +1983,21 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     check = '--check' in sys.argv
     spv = '--spv' in sys.argv
+    only = set()
+    for a in sys.argv[1:]:
+        if a.startswith('--only='):
+            v = a[7:]
+            if v.startswith('@'):       # --only=@file: hashes listed in a file (a command line holds ~2,000)
+                with open(v[1:]) as f:
+                    v = f.read().replace('\n', ',')
+            only |= {h.strip() for h in v.split(',') if h.strip()}
+    variants = {}                       # <hash>:<hex mask> asks for a variant with integer inputs (Translator int_attrs)
+    for e in list(only):
+        if ':' in e:
+            h, m = e.split(':', 1)
+            only.discard(e)
+            only.add(h)
+            variants.setdefault(h, set()).add(int(m, 16))
     here = os.path.dirname(os.path.abspath(__file__))
     if args:
         src = args[0]
@@ -1958,26 +2010,29 @@ def main():
     ok, failed = 0, {}
     outputs = []
     for name in sorted(os.listdir(src)):
-        if not name.endswith('.bin'):
+        if not name.endswith('.bin') or only and name[:-4] not in only:
             continue
         sh = Shader(os.path.join(src, name))
         h = name[:-4]
-        try:
-            text = Translator(sh).generate()
-        except Unsupported as e:
-            failed.setdefault(str(e), []).append(h)
-            continue
-        path = os.path.join(dst, '%s.%s' % (h, STAGE_EXT[sh.stage]))
-        with open(path, 'w', newline='\n') as f:
-            f.write(text)
-        outputs.append(path)
-        ok += 1
+        for mask in sorted(variants.get(h, {0})):     # a variant is written as <hash>_<mask>
+            try:
+                text = Translator(sh, mask).generate()
+            except Unsupported as e:
+                failed.setdefault(str(e), []).append(h)
+                continue
+            path = os.path.join(dst, '%s.%s' % (h if not mask else '%s_%08x' % (h, mask), STAGE_EXT[sh.stage]))
+            with open(path, 'w', newline='\n') as f:
+                f.write(text)
+            outputs.append(path)
+            ok += 1
     print('%d translated, %d not' % (ok, sum(len(v) for v in failed.values())))
     for why, hs in sorted(failed.items(), key=lambda kv: -len(kv[1])):
         print('  %4d  %s  (e.g. %s)' % (len(hs), why, hs[0]))
     if check or spv:
         from concurrent.futures import ThreadPoolExecutor
         glslang = os.path.join(here, '../../../deps/glslang/bin/glslang.exe')
+        if not os.path.exists(glslang) and os.environ.get('VULKAN_SDK'):    # the Vulkan SDK's copy
+            glslang = os.path.join(os.environ['VULKAN_SDK'], 'Bin', 'glslangValidator.exe')
         spvdir = os.path.join(src, 'spv')
         os.makedirs(spvdir, exist_ok=True)
 
