@@ -195,6 +195,65 @@ of work; online code paths must fail as on a console with no internet, not crash
     the title screen first: `NX_INPUT='300-900/60:A;1000-1600/90:B;1800-2400:LSDOWN'`.
   - Next: fix the character movement above, then the first steps in the overworld (leave the bedroom). Also find
     what c0[0x640..] holds on the console.
+- **Second machine (2026-10-18, AMD RX 7800 XT, workspace on H:)**: set up from the NSPs alone, analysis with
+  Ghidra instead of IDA. Uncommitted in nxrecomp so far (besides the earlier local edits to build paths in
+  `nxrecomp.cmake`, `a64test.py`, `translate.py` and violetrecomp's `build.bat`):
+  - `tools/ghidra/` (`ghidra_export.ps1`, `GhidraExport.java`, `GhidraOptions.java`): writes the same
+    `<module>_ida.json`. Run `ghidra_export.ps1 -Seeds` inside violetrecomp (Ghidra 12.1.3; `GHIDRA_HOME` or
+    `-Ghidra` names its folder). "Non-Returning Functions - Discovered" must stay off: it took PLT stubs as noreturn
+    and cut 9,706 sdk functions short (51% -> 96% coverage). main: 19 min analysis + 5 min seeding, 156,946
+    functions, 4,289 switch tables. Lift: 15,860,007 instructions, 6 untranslated (as with IDA).
+  - a64lift: function and jump-table recovery repeat until neither finds anything (case code of a table Ghidra
+    missed was the only caller of main+14260, a guest trap at startup). The test suites pass (43,810 + 35,652).
+  - AMD (amdvlk aborts with fail-fast 7 on a lost device; catch it with a Win32 debugger, not lldb): no D24
+    formats (`usable_format` falls back to D32S8 / D32), no dynamic logic op (in the pipeline key), set 1 has one
+    texture array per view type (TB_*, translate.py TEX_BINDING; a 3D read of a 2D-array view lost the device;
+    32-bit integer textures get same-bits float views), and c[16] (st.ubo[13]) was at push binding 32, past the
+    layout: translate.py now puts it in a slot the shader leaves free and the runtime reads the slots from the
+    SPIR-V (`cb_of_slot`). Found with GPU-assisted validation (VK_LAYER_SETTINGS_PATH to a settings file with
+    gpuav_enable, gpuav_safe_mode, validate_best_practices_amd).
+  - Debugging added: NX_PIPE_LOG, NX_SKIP_SHADERS=hash,..., NX_GPU_SKIP=8 (non-2D textures), NX_INPUT_LOG,
+    unsupported-format warnings.
+  - Input: WASD = left stick, mouse = right stick (click captures, Esc releases, NX_MOUSE_SENS, dead zone).
+  - Menu cursor, player and camera wander (mostly left; pressing the opposite way only offsets it) with
+    NX_INPUT_LOG showing zero input, also on one core. Not the gyro (the six-axis lifos are at NPAD +0x1758, 0x708
+    each; the first try at +0x17e0 was wrong). Suspect: main reads the Handheld npad as well as No1, and hid
+    wrote no lifo but No1's full key and system ext. hid now writes all 7 lifos of all 10 npads (idle states);
+    fixed (the drift stopped).
+  - Black grass outdoors: the translator read TLDS encoding 8 as 3D.LZ; it is 2D ARRAY.LZ (layer in Ra, as TEXS;
+    3D.LZ is 7). 1,099 of 4,425 shaders fetched through the 3D array, which holds a dummy for 2D images, so the
+    terrain's material map read as zeros (no albedo in the G-buffer). Fixed: grass and ground render outdoors,
+    and the starter Pokémon now load (they lost the device before).
+  - Shaders are translated while the game runs (gpu.c, "Shaders are translated while the game runs"): nvn.c
+    queues a shader with no SPIR-V when the game creates it, a host thread runs `translate.py --spv
+    --only=@build/shaders/jit_list.txt` (a file: the game creates ~2,300 shaders at boot, past the command-line
+    limit; _popen also died on that with fail-fast 5), and a draw waits for its shader instead of being skipped.
+    NX_SHADER_JIT=0 turns it off, NX_PYTHON picks the interpreter. NX_ROOT is now in game_config.h.
+  - Input recording: NX_INPUT_LOG logs every input change; NX_INPUT_REPLAY=<log> plays a log back by frame.
+    build/input_walkout.log is a session that walks out of the house (save near the front door now);
+    input_door.log is its walk shifted to start at frame 2400.
+  - Validation (2026-10-18): plain NX_VK_VALIDATION is usable. GPU-assisted validation (VK_LAYER_SETTINGS_PATH
+    with gpuav_enable) made Windows reset the display drivers (TDR) on this machine: don't use it again.
+    Fixed from its report: blits the formats cannot do are skipped and logged (AMD: no depth/stencil format is a
+    blit destination); descriptorBindingStorageImageUpdateAfterBind and
+    shaderStorageImageArrayNonUniformIndexing are enabled. Still reported (build/validation_1.log): the shadow
+    pass's R8_UINT target sampled and stored as float, alpha-to-coverage on with no alpha output, vertex
+    attribute types (R8G8B8A8_UINT / R32_SINT into float inputs), a point-list topology mismatch, a
+    vertex-to-fragment interface mismatch.
+  - Open: device lost at random points outdoors (frame ~1,800 and ~7,400; build/crash_1800.log), also before the
+    driver resets. Next: one run with VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_crash_diagnostic (Vulkan SDK) to see
+    the draw in flight.
+  - Open: the sky is split into four quadrants at the screen centre (x 960, y 540; ~8% step), already in the lit
+    scene buffer (12f5ee2000). Not the lighting pass's half-res reads (their coordinates check out). Next:
+    `NX_DUMP_DRAWS=12f5ee2000` and F12 at the sky: frames/frame_<n>_draw_<d>_fs_<hash>.ppm after every draw into
+    it (added, untested); the first one showing the split names the shader.
+  - robustBufferAccess2 / robustImageAccess2 are on where supported (vk.c), against shaders reading past what they
+    were given. Raw-address global memory is not covered; clamping it in the translator is the next step if
+    device losses go on.
+  - Fail-fast (0xC0000409) codes seen: 5 is the CRT's invalid parameter (ours), 7 is amdvlk's lost device. A
+    run under a Win32 debugger got VK_ERROR_UNKNOWN on an image bind, so don't trust debugger runs for GPU work.
+  - Open: the black portrait on the enrollment form, lighting (LUT slices one off? 8/16-bit integer textures
+    read as float), hwopus silent, storage images (set 3) still share one array across dimensions.
     Commits: nxrecomp `e122065` (translator), `abb28ce` (runtime fixes), `dda831d` (storage images), `8024860`
     (lifter jump tables), `576381c` (audren work buffer), `f408ac0` (debugging tools).
 
@@ -221,8 +280,8 @@ of work; online code paths must fail as on a console with no internet, not crash
 
 ## Commands
 
-- `extract/` (the NSPs unpacked, 11.9 GB) was deleted on 2026-10-17 after `dump/` was made. Extract again (PowerShell, `$env:USERPROFILE='E:\projects\ns-port\keys'`, `$n` = `..\.tools\nstool.exe`):
+- `extract/` (the NSPs unpacked, 11.9 GB) was deleted on 2026-10-17 after `dump/` was made. Extract again (PowerShell, from `pokemon-violet/`: `$env:USERPROFILE="$PWD\..\keys"`, `$n` = `..\.tools\nstool.exe`):
   `& $n -x extract\base rom\<base>.nsp; & $n -x extract\upd rom\<update>.nsp` (40 s), then ExeFS `& $n --tik extract\upd\01008f6008c5e800…11.tik -x /0 dump\exefs
   extract\upd\d24a763a8882575f1c252dce37021db5.nca`, RomFS the same with `--basenca
   extract\base\ef6d3388d34a30dda23208f98780c610.nca -x /1 dump\romfs`.
-- `llvm-nm` (MSYS2 `C:\msys64\mingw64\bin\llvm-nm.exe -D [-C] dump/elf/main.elf`) lists imports and exports.
+- `llvm-nm -D [-C] dump/elf/main.elf` (LLVM's, from Visual Studio's Clang tools or MSYS2) lists imports and exports.

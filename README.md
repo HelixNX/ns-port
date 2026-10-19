@@ -64,14 +64,18 @@ The exact update version matters. Module bases and lift-time overrides are tied 
 ## Prerequisites
 
 - Windows x64 with a Vulkan 1.3+ GPU.
-- Visual Studio (MSVC `link.exe`, `vcvars64.bat`); **clang-cl 19**, CMake ≥ 3.24 and Ninja (MSYS2 `mingw64`).
+- Visual Studio 2022 with "Desktop development with C++" and "C++ Clang tools for Windows" (clang-cl, CMake and
+  Ninja come with it). MSYS2's clang-cl also works. `nxrecomp/tools/vcenv.bat` finds them; set `NX_VCVARS` and
+  `NX_CC` to override.
 - Python 3 with `capstone` and `unicorn` (`pip install capstone unicorn`; the lifter tests use unicorn).
-- IDA Pro 9 with idalib, for the one-time function export (`nxrecomp/tools/ida_export.py`).
+- For the one-time function export, either Ghidra 12 (free; `nxrecomp/tools/ghidra/ghidra_export.ps1`, with
+  `GHIDRA_HOME` set) or IDA Pro 9 with idalib (`nxrecomp/tools/ida_export.py`).
 - `.tools/nstool.exe` ([jakcron/nstool](https://github.com/jakcron/nstool)).
-- `deps/`: `SDL3/SDL3-<ver>` (VC development package), `Vulkan-Headers`, `glslang` (release build).
+- Vulkan headers and SDL3, either in `deps/` (`Vulkan-Headers`, `SDL3/SDL3-<ver>` from SDL's VC development zip)
+  or installed: the Vulkan SDK (sets `VULKAN_SDK`) and vcpkg's `sdl3` (with `VCPKG_ROOT` set).
+- glslang for the shader translator: `deps/glslang` or the Vulkan SDK's `glslangValidator`.
 
-The paths in `build.bat` (`E:\Microsoft Visual Studio\…\vcvars64.bat`, `C:/msys64/mingw64/bin/clang-cl.exe`,
-`ninja.exe`) are this machine's. Edit them for yours.
+Nothing in the build has machine-specific paths: if something isn't found, the build says what to install or set.
 
 ## Setup (Pokémon Violet)
 

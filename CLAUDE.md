@@ -33,18 +33,21 @@ behaviour only: our own implementation, never copied code.
 
 ## Toolchain (shared)
 
-- Compiler: **clang-cl 19** (MSYS2 `C:\msys64\mingw64\bin\clang-cl.exe`) in MSVC mode, with MSVC `link.exe`.
-  No LLVM 9 and no mingw ABI. Run inside `E:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat`.
+- Compiler: **clang-cl 19+** in MSVC mode, with MSVC `link.exe` (no mingw ABI). `nxrecomp/tools/vcenv.bat` finds
+  them: Visual Studio through vswhere, clang-cl from its "C++ Clang tools" component (else MSYS2's); `NX_VCVARS` and
+  `NX_CC` override. Never hard-code a machine's paths in anything committed: the repos must build on any machine.
 - Flags: `-O1 -ffp-contract=off -fno-strict-aliasing`. If one file compiles too slowly, build it at -O0 or split it.
-- Build: Python generates the C sources; CMake + Ninja build them. Projects reach shared libraries as `../deps`.
+- Build: Python generates the C sources; CMake + Ninja build them. Libraries (`nxrecomp.cmake`): Vulkan headers and
+  SDL3 from `deps/` if there, else the Vulkan SDK (`VULKAN_SDK`) and vcpkg (`VCPKG_ROOT`).
 - Verified: a clang-cl test linked SDL3 and glslang statically and ran. A 2.6 M-instruction lift compiled with
   clang 19 in 5.4 min on 12 cores.
-- GPU: GTX 1650 Ti; Vulkan loader 1.4.341. Machine: 16 GB RAM, 12 cores.
+- Tested on: NVIDIA GTX 1650 Ti (16 GB RAM, 12 cores) and AMD RX 7800 XT. Graphics must not rely on one vendor's
+  handling of undefined behaviour: keep NX_VK_VALIDATION runs free of errors.
 
 ## Tool notes
 
 - nstool reads `title.keys` only from `%USERPROFILE%\.switch`; private copies are in `keys/.switch`. Run it from
-  PowerShell (Git Bash rewrites `/0`): `$env:USERPROFILE='E:\projects\ns-port\keys'; E:\projects\ns-port\.tools\nstool.exe …`
+  PowerShell (Git Bash rewrites `/0`), from the workspace root: `$env:USERPROFILE="$PWD\keys"; .\.tools\nstool.exe …`
   - An update's ExeFS sits at the end of its NCA. To peek at a new update without copying it all, write a sparse
     file with only the header (first 0x4000) and that range.
 - Python: unicorn 2.1.4 and capstone 5.0.7 are in user site-packages, so don't run them with `python -I`.

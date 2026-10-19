@@ -13,7 +13,7 @@
       ],
       "env": {
         "REA_ANALYSIS_PROVIDER": "ida",
-        "REA_IDA_MCP_CONFIG": "E:\\projects\\ns-port\\.claude\\ida-mcp.json"
+        "REA_IDA_MCP_CONFIG": ".claude/ida-mcp.json"
       }
     }
   }
