@@ -275,6 +275,21 @@ of work; online code paths must fail as on a console with no internet, not crash
     that texture (a render, a copy or a CPU upload; `NX_TRACE` from a new game's portrait screen).
   - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
     the `?` icon is fixed.
+- **Performance (2026-10-19, RX 7800 XT, Mesagoza at 1080p, uncapped):** ~85 -> 103-120 fps. The game advances
+  a fixed 1/30 s per frame (uncapped, everything runs that much faster), so 60 fps needs its timestep found and
+  patched; for now uncapped runs are for measuring only (`$env:NX_NOPACE='1'`, which also presents with IMMEDIATE:
+  with FIFO a visible window is held to 60).
+  - Found: the render thread kept its emulated core while we translated and presented (~6 ms a frame), and the
+    main thread, sharing that core, waited for it 59% of the time. Submit and present now give the core up.
+  - Also: work goes to the GPU every 250 draws (`NX_FLUSH_DRAWS`), the CPU-written texture check runs on its own
+    thread (was 2 ms a frame), fewer pass breaks after transform feedback captures.
+  - Now (8-10 ms a frame): the render thread translates for 4-5 ms, GPU work ~7.3 ms. Next: cheaper translation
+    (sample `NX_PROFILE='thread 5c'`), the shaders of the main scene pass (`NX_GPU_PROF=2`), and the 1% lows
+    (~12-19 ms).
+  - Reading the log: every 600 frames, `nvn: frame time` (average, 1% low, worst), `gpu: per frame` (render thread
+    translating / presenting / waiting for the GPU), `cpu:` per thread (running, waiting for a core, asleep).
+    `NX_GPU_PROF=1` adds GPU time per pass and what ended each pass, but its timestamps slow the GPU and make
+    frame times uneven: leave it off for play.
 - **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
   instead of IDA:
   - `tools/ghidra/` (`ghidra_export.ps1`, `GhidraExport.java`, `GhidraOptions.java`): writes the same
