@@ -86,6 +86,15 @@ speed); hid from SDL3 (as MK8); save data write/read; DLC area reachable.
 **V7 Performance and PC features.** Measure first. Unlocked frame rate and resolution only where the game's own
 timing allows (SV ties logic to frame time in places: check before unlocking).
 
+**V8 Packaging for friends who own the game.** One launcher exe dropped next to their own NSPs, keys and firmware:
+on first launch it checks the files (update version, keys), unpacks the NSPs (our own NSP/NCA reader, no nstool),
+lifts and compiles the game code, extracts and translates every shader, then caches the result; later launches
+start the game. Ships only our code: a prebuilt runtime, a bundled LLVM (clang + lld) and generated Windows import
+libraries, embedded Python or the tools ported, the function list as data (or our own analysis) instead of
+IDA/Ghidra. **Never ship anything built from the game** (lifted C, exe, shaders), not even to owners: each person
+builds from their own copy. Needs before it: the up-front shader extraction (shaders from `data.trpfs` instead
+of collected while playing) and a faster lift/compile (first-run time, now 20-40 min).
+
 Risks: exceptions (V1) and the size of the build are the unknowns MK8 didn't have; NVN coverage is the largest amount
 of work; online code paths must fail as on a console with no internet, not crash.
 
@@ -195,9 +204,41 @@ of work; online code paths must fail as on a console with no internet, not crash
     the title screen first: `NX_INPUT='300-900/60:A;1000-1600/90:B;1800-2400:LSDOWN'`.
   - Next: fix the character movement above, then the first steps in the overworld (leave the bedroom). Also find
     what c0[0x640..] holds on the console.
-- **Second machine (2026-10-18, AMD RX 7800 XT, workspace on H:)**: set up from the NSPs alone, analysis with
-  Ghidra instead of IDA. Uncommitted in nxrecomp so far (besides the earlier local edits to build paths in
-  `nxrecomp.cmake`, `a64test.py`, `translate.py` and violetrecomp's `build.bat`):
+- **Portability pass (2026-10-18, AMD RX 7800 XT; committed: nxrecomp `e705520`..`234d70d`, violetrecomp
+  `e999f18`, workspace `7ab7c28`).** The overworld is playable on AMD. Every bug below relied on what NVIDIA does
+  with undefined behaviour; the rule now is spec-correct SPIR-V and Vulkan use, checked with NX_VK_VALIDATION.
+  - Device losses (driver timeouts ~30 s after loading into the overworld), flickering grass, missing trees and
+    particles: compute shader `fba20ffd…` (GPU culling) uses ballots/shuffles written for 32-lane warps; AMD ran
+    64-wide waves and its "all lanes done" count never matched, so a loop spun. Compute pipelines now require
+    32-wide subgroups (VK_EXT_subgroup_size_control; AMD allows it for compute only, `vk.warp32`). No vertex or
+    fragment shader uses warp ops yet; if one does, translate them per 32-lane half.
+    Found with the crash-diagnostic layer (VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_crash_diagnostic; dumps go to
+    %USERPROFILE%\cdl) and NX_PIPE_LOG (pipeline handle -> shader hash).
+  - Sky in four quadrants: vertex outputs a shader leaves unwritten must read (0,0,0,1) (the sky divides by a w
+    only the default sets); translate.py initialises every output.
+  - Square cells on the terrain: TLDS 2D ARRAY.LZ takes x, y from Rb, Rb+1 (layer in Ra), not Ra+1, Rb.
+  - Dotted mountains / terrain edges: single-sampled alpha to coverage became an alpha >= 0.5 test (AMD dithers
+    A2C), only when color target 0 exists (G-buffer passes use targets 1-4).
+  - Integer vertex formats: 32-bit UINT/SINT fetched as same-size float formats; 8/16-bit ones get vertex shader
+    variants with uvec4/ivec4 inputs (`translate.py --only=<hash>:<mask>`, 2 bits per location; runtime
+    `shader_variant`, JIT-translated on first use). Used by the transform-feedback skinning pass (bone indices).
+  - Render thread 64% -> 28% of a core at 30 fps (a getenv per storage buffer per draw). The game holds itself at
+    30 (it creates its window with interval 1); its logic advances per frame (unpaced runs play fast).
+  - Build: no machine paths. tools/vcenv.bat (vswhere, clang-cl), nxrecomp.cmake (deps/ or Vulkan SDK + vcpkg),
+    GHIDRA_HOME for ghidra_export.ps1. FPS overlay (F3; NX_FPS=0). NX_DUMP_SSBO=<hash>, NX_DUMP_DRAWS=<target>
+    with F12 (render target after every draw), NX_PROFILE='thread 5c'.
+  - **Open: objects near the camera are hidden (trees you can bump into).** Culling compute `b4b95eb6…` reads a
+    full-screen depth-stencil texture through a stencil view and keeps `& 7`: the game marks a region in stencil
+    and hides objects there. Shaders declare every texture float; a stencil view returns integers (undefined on
+    AMD). Fix: texture numeric types known to the shader (integer views for stencil and R8_UINT-style textures),
+    or a stencil copy into an R32_UINT image read through a same-bits float view.
+  - **Open: the Let's Go glow is far too bright** (green haze, a hexagon flare). Bloom is fine (this engine's
+    "bright pass" is a clamped downsample by design); the composite `acbcacd1…` adds it from the half-res effects
+    layer (960x540 f41 `12f4f6a000`). Suspect NVN blend factor / equation mappings (MK8 notes call them guesses).
+  - Open: the "…" thought bubble shows only its corners, grey (draws `de9e66ba…` / `f3fbc253…`, BC3 sRGB atlas);
+    the `?` icon is fixed.
+- **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
+  instead of IDA:
   - `tools/ghidra/` (`ghidra_export.ps1`, `GhidraExport.java`, `GhidraOptions.java`): writes the same
     `<module>_ida.json`. Run `ghidra_export.ps1 -Seeds` inside violetrecomp (Ghidra 12.1.3; `GHIDRA_HOME` or
     `-Ghidra` names its folder). "Non-Returning Functions - Discovered" must stay off: it took PLT stubs as noreturn
