@@ -31,8 +31,32 @@ from a64insn import Unimpl, lift_insn           # noqa: E402
 
 WORK = os.path.join(a64lift.gamecfg.BUILD, 'a64test')
 WIN, WIN_SIZE = 0x7200000000, 0x20000
-VCVARS = r'E:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat'
-CLANG = r'C:\msys64\mingw64\bin\clang-cl.exe'
+
+def _find_tools():
+    """vcvars64.bat and clang-cl, as tools/vcenv.bat finds them: NX_VCVARS / NX_CC, else Visual Studio through
+    vswhere and its LLVM component, else MSYS2's clang-cl"""
+    vcvars, cc = os.environ.get('NX_VCVARS'), os.environ.get('NX_CC')
+    vs = None
+    vswhere = os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                           r'Microsoft Visual Studio\Installer\vswhere.exe')
+    if os.path.exists(vswhere):
+        vs = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
+                             'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
+                            capture_output=True, text=True).stdout.strip() or None
+    if not vcvars and vs:
+        vcvars = os.path.join(vs, r'VC\Auxiliary\Build\vcvars64.bat')
+    if not cc:
+        for c in ([os.path.join(vs, r'VC\Tools\Llvm\x64\bin\clang-cl.exe')] if vs else []) + \
+                 [r'C:\msys64\mingw64\bin\clang-cl.exe']:
+            if os.path.exists(c):
+                cc = c
+                break
+    if not vcvars or not cc:
+        sys.exit('a64test: no Visual Studio C++ tools or clang-cl found (set NX_VCVARS and NX_CC)')
+    return vcvars, cc
+
+
+VCVARS, CLANG = _find_tools()
 CFLAGS = ['/clang:-O1', '/clang:-ffp-contract=off', '/clang:-fno-strict-aliasing', '/clang:-march=haswell',
           '/clang:-w', '/clang:-fbracket-depth=1024']
 
