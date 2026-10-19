@@ -88,7 +88,10 @@ class Mod:
         self.switches = {int(k, 16): v for k, v in ida.get('switches', {}).items()}
         self.addr_refs = code_address_refs(self)
         self.recover_functions(data)
-        self.recover_switches()
+        # case code a recovered table adds can call functions no one else calls (Ghidra leaves more tables
+        # unresolved than IDA did: main+ce60's case code is the only caller of main+14260)
+        while self.recover_switches():
+            self.recover_functions(data)
         got = {r[0]: r[2] for r in self.m.rels if r[1] in (1025, 1026)}      # GLOB_DAT / JUMP_SLOT slot -> symbol
         self.plt = {}                        # PLT stub offset -> symbol name
         for ea in self.funcs:
@@ -196,6 +199,7 @@ class Mod:
             todo = changed
         if found:
             print('%s: %d jump tables found beyond IDA\'s (%d instructions of case code added)' % (self.name, found, grown))
+        return found
 
     def flow(self, starts):
         """Instructions reachable from starts without entering any function's code (as recover_from walks)."""
