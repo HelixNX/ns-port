@@ -1,0 +1,13 @@
+# Instruction patches for the lifter (format: nxrecomp/tools/lifter/a64lift.py, load_patches), main 4.0.0
+# (build id 709BFD66...). Re-lift main after changing this file.
+#
+# Frame rates other than 30 (fps.c). The game steps by a frame duration from a table (main+3c2fbb0, 33.3 ms) and
+# derives its speed from the same entry; fps.c writes the entry each frame and keeps the speed's divisor at 30 fps,
+# so that one frame moves the game by (frame time / 33.3 ms) of a 30 fps step. Found with Fl4sh's Violet 4.0.0
+# 60 FPS and Dynamic FPS patches (gamebanana) as a map; the hooks are ours.
+main+d9643c  was f8747908  call fps_speed_base           # ldr x8, [x8, x20, lsl #3]: the speed's divisor
+main+b92784  was f9400501  call fps_timer_step           # ldr x1, [x8, #8]: 33.3 ms in scene kind 2
+main+2936584 was 1a9f3288  after fps_scene_kind          # csel w8, w20, wzr, lo: the scene kind
+main+170c408 was 52a7f00a  if fps 52a84e0a               # mov w10, #1.0 -> #60.0 (both patches; purpose not known yet)
+main+20a8d3c was 72a8e868  if fps 72a8f868               # 50000.0 -> 100000.0 (both patches; purpose not known yet)
+main+2b7c540 was 1a893100  if fps 52800000               # distance LOD of animation updates -> 0: full rate
