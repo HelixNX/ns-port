@@ -970,6 +970,8 @@ static VkClearColorValue clear_value(u32 type, const u32 v[4]) {
     return c;
 }
 
+static bool trace_frame(void);
+
 static void do_clear_color(const CmdClearColor *p) {
     if (p->index >= st.nrt || !st.rt[p->index].t.addr || !begin_rendering()) return;
     VkRect2D r = clear_rect();
@@ -980,7 +982,7 @@ static void do_clear_color(const CmdClearColor *p) {
         if (!logged) { logged = true; hlog(1, "gpu: ClearColor with channel mask %x: clearing all channels", p->mask); }
     }
     static int logged;
-    if (logged < 12) {
+    if (logged < 12 || trace_frame()) {        /* every clear of a traced frame (F12, NX_TRACE) */
         logged++;
         float f[4];
         memcpy(f, p->v, 16);
