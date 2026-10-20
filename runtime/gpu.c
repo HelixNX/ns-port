@@ -312,12 +312,20 @@ static int npools, cappools;
 static u64 pools_gen;                   /* bumped when pools come or go (cached device addresses) */
 
 static PoolEnt *pool_find(u64 addr) {
+    static int last = -1;               /* draws look up the same few pools over and over */
+    static u64 last_gen;
+    if (last >= 0 && last_gen == pools_gen && last < npools && addr >= pools[last].gpu && addr < pools[last].end)
+        return &pools[last];
     int lo = 0, hi = npools - 1;
     while (lo <= hi) {
         int m = (lo + hi) / 2;
         if (addr < pools[m].gpu) hi = m - 1;
         else if (addr >= pools[m].end) lo = m + 1;
-        else return &pools[m];
+        else {
+            last = m;
+            last_gen = pools_gen;
+            return &pools[m];
+        }
     }
     return NULL;
 }
@@ -1993,6 +2001,7 @@ static VkShaderModule shader_module(ShaderCode *s) {
     u32 cb_id[17], ncb = 0;             /* the cbN variables (OpName comes before OpDecorate) */
     u8 cb_n[17];
     for (u32 k = 0; k < 16; k++) s->cb_of_slot[k] = (u8)k;
+    s->slots_used = 0;
     for (long i = 5; i < n / 4;) {      /* what the shader touches: PhysicalStorageBufferAddresses, sampled images */
         u32 op = code[i] & 0xffff, wc = code[i] >> 16;
         if (op == 5 && wc >= 3 && ncb < 17) {                   /* OpName "cb<N>": c[N] */
@@ -2005,7 +2014,10 @@ static VkShaderModule shader_module(ShaderCode *s) {
         }
         if (op == 71 && wc == 4 && code[i + 2] == 33)          /* OpDecorate Binding: its slot */
             for (u32 k = 0; k < ncb; k++)
-                if (cb_id[k] == code[i + 1]) s->cb_of_slot[code[i + 3] & 15] = cb_n[k];
+                if (cb_id[k] == code[i + 1]) {
+                    s->cb_of_slot[code[i + 3] & 15] = cb_n[k];
+                    s->slots_used |= (u16)(1u << (code[i + 3] & 15));
+                }
         if (op == 17 && wc == 2 && code[i + 1] == 5347) s->caps |= SHC_GLOBAL;
         if (op == 17 && wc == 2 && code[i + 1] == 53) s->caps |= SHC_XFB;         /* TransformFeedback */
         if (op == 27) s->caps |= SHC_TEXTURE;
@@ -2312,9 +2324,11 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
     }
     VkBuffer sbuf = cc->sbuf;
     u64 soff = cc->soff;
+    u32 used = sc && sc->slots_used ? sc->slots_used : 0xffff, n = 0;   /* only the slots the shader declares */
     for (u32 slot = 0; slot < 16; slot++) {
+        if (!(used >> slot & 1)) continue;
         u32 i = sc ? sc->cb_of_slot[slot] : slot;
-        VkDescriptorBufferInfo *b = &bi[slot];
+        VkDescriptorBufferInfo *b = &bi[n];
         *b = (VkDescriptorBufferInfo){NULL, 0, VK_WHOLE_SIZE};
         if (i == 0) *b = (VkDescriptorBufferInfo){sbuf, soff, 0x600};
         else if (i == 2) *b = (VkDescriptorBufferInfo){sbuf, soff + 0x600, 0x200};
@@ -2329,10 +2343,10 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
                 *b = (VkDescriptorBufferInfo){buf, off, size};
             }
         }
-        w[slot] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = base + slot, .descriptorCount = 1,
-                                      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = b};
+        w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = base + slot, .descriptorCount = 1,
+                                        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = b};
     }
-    return 16;
+    return (int)n;
 }
 
 /* Graphics state as last recorded into the command buffer being built (valid while serial == slot_serial: state is
