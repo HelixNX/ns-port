@@ -65,6 +65,7 @@ typedef struct Vk {
     VkPhysicalDeviceMemoryProperties mem;
     VkDevice dev;
     VkQueue queue;
+    VkQueue present_queue;              /* a second queue of the family for presents (vk.c), else queue */
     u32 family;
     VkSurfaceKHR surface;
     u64 host_import_align;              /* minImportedHostPointerAlignment */
@@ -101,5 +102,8 @@ void vk_init(void);
  * thread that owns the queue (gpu.c), after the work that rendered src has been submitted. */
 void vk_set_unthrottled(bool on);  /* present without waiting for the display's refresh (a new swapchain) */
 void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
+/* vk.queue's submissions, which the present thread shares when the family has one queue (AMD) */
+VkResult vk_submit(const VkSubmitInfo2 *si, VkFence fence);
+u64 vk_presents_dropped(void);         /* frames not shown, uncapped (the display was busy with the last one) */
 
 #endif

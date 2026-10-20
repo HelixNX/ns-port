@@ -1963,11 +1963,13 @@ class Translator:
                 if self.omap_target >> (4 * rt) & 0xf:
                     out.append('layout(location = %d) out vec4 out_c%d;' % (rt, rt))
         if self.stage == 'fragment':
-            # debug: bit 0 of pc.debug (NX_NO_DISCARD) turns every discard off
+            # debug: bit 0 of pc.debug (NX_NO_DISCARD) turns every discard off. The alpha test's function is a
+            # specialization constant (the pipeline's), so without one the driver drops its discard: early depth
             out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; } pc;',
+                    'layout(constant_id = 0) const uint ALPHA_FUNC = 0u;',
                     'bool kill_ok() { return (pc.debug & 1u) == 0u; }',
                     'bool alpha_ok(float a) {',
-                    '    switch (pc.alpha_func) {',
+                    '    switch (ALPHA_FUNC) {',
                     '    case 1u: return false;',
                     '    case 2u: return a < pc.alpha_ref;',
                     '    case 3u: return a == pc.alpha_ref;',

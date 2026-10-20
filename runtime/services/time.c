@@ -2,13 +2,15 @@
  * one rule: the host's current UTC offset (the console's tz database lives in a system archive we don't have). */
 #include "../ipc.h"
 #include <windows.h>
+#include <stdlib.h>
 #include <time.h>
 
 static const u8 clock_source_id[16] = {0x6d, 0x6b, 0x38, 0x72, 0x65, 0x63, 0x6f, 0x6d, 0x70, 0x20, 0x73, 0x74, 0x65, 0x61, 0x64, 0x79};
 static s64 boot_posix;                           /* host time at start-up */
 static s32 utc_offset;                           /* seconds east of UTC */
+static s64 time_shift;                           /* NX_TIME=<posix seconds>: the clocks start there (benchmarks) */
 
-static s64 now_posix(void) { return (s64)time(NULL); }
+static s64 now_posix(void) { return (s64)time(NULL) + time_shift; }
 static s64 steady_seconds(void) { return (s64)(host_cntpct() / 19200000u); }
 
 /* SteadyClockTimePoint: s64 seconds, u128 source id */
@@ -188,6 +190,8 @@ static const Iface iface_time = {"time", (const IpcCmd[]){
 static SvcObj *open_time(const char *name) { return svcobj_new(&iface_time, NULL, name); }
 
 void time_register(void) {
+    const char *e = getenv("NX_TIME");
+    if (e) time_shift = strtoll(e, NULL, 10) - (s64)time(NULL);
     boot_posix = now_posix();
     TIME_ZONE_INFORMATION tz;
     DWORD k = GetTimeZoneInformation(&tz);

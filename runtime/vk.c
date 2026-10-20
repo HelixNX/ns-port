@@ -4,6 +4,7 @@
 #include "game_config.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#include <process.h>
 #include <stdlib.h>
 #include <windows.h>
 
@@ -172,11 +173,12 @@ void vk_init(void) {
     if (nq > 16) nq = 16;
     vkGetPhysicalDeviceQueueFamilyProperties(vk.phys, &nq, qf);
     vk.family = ~0u;
+    u32 family_queues = 1;
     for (u32 i = 0; i < nq && vk.family == ~0u; i++) {
         VkBool32 present = 0;
         vkGetPhysicalDeviceSurfaceSupportKHR(vk.phys, i, vk.surface, &present);
         if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present)
-            vk.family = i;
+            vk.family = i, family_queues = qf[i].queueCount;
     }
     if (vk.family == ~0u) fatal("no graphics queue that can present");
 
@@ -261,9 +263,9 @@ void vk_init(void) {
         .shaderImageGatherExtended = 1, .shaderStorageImageExtendedFormats = 1,
         .shaderStorageImageReadWithoutFormat = 1, .shaderStorageImageWriteWithoutFormat = 1,
         .shaderClipDistance = 1, .shaderCullDistance = 1, .shaderFloat64 = 1, .shaderInt64 = 1, .shaderInt16 = 1};
-    float prio = 1;
+    float prio[2] = {1, 1};
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk.family,
-                                   .queueCount = 1, .pQueuePriorities = &prio};
+                                   .queueCount = family_queues >= 2 ? 2 : 1, .pQueuePriorities = prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f, .queueCreateInfoCount = 1,
                               .pQueueCreateInfos = &qci,
                               .enabledExtensionCount = sizeof device_exts / sizeof *device_exts,
@@ -272,6 +274,8 @@ void vk_init(void) {
 #define VK_LOAD_D(f) if (!(f = (PFN_##f)vkGetDeviceProcAddr(vk.dev, #f))) fatal("Vulkan: no %s", #f);
     VK_DEVICE_FNS(VK_LOAD_D)
     vkGetDeviceQueue(vk.dev, vk.family, 0, &vk.queue);
+    vk.present_queue = vk.queue;
+    if (qci.queueCount == 2) vkGetDeviceQueue(vk.dev, vk.family, 1, &vk.present_queue);
     hlog(1, "vk: using %s, driver %x, host import alignment %llx", vk.props.deviceName, vk.props.driverVersion,
          vk.host_import_align);
 }
@@ -543,7 +547,53 @@ static void swapchain_create(void) {
     hlog(1, "vk: swapchain %ux%u, %u images, present mode %d", ext.width, ext.height, sw.count, mode);
 }
 
+/* The present itself runs on a thread of its own, on the family's second queue where there is one (NVIDIA has 16;
+ * AMD's graphics family has one, which the present thread then shares under queue_lock): on a laptop whose display
+ * hangs off the integrated GPU, NVIDIA's vkQueuePresentKHR held the render thread ~4 ms a frame (it waits for the
+ * frame and copies it across), time it now spends on the next frame. sw_lock covers the swapchain (acquire,
+ * present, recreation) and the present queue, which Vulkan wants used by one thread at a time. Lock order: sw_lock,
+ * then queue_lock */
+static SRWLOCK sw_lock = SRWLOCK_INIT;
+static SRWLOCK queue_lock = SRWLOCK_INIT;
+
+VkResult vk_submit(const VkSubmitInfo2 *si, VkFence fence) {
+    AcquireSRWLockExclusive(&queue_lock);
+    VkResult r = vkQueueSubmit2(vk.queue, 1, si, fence);
+    ReleaseSRWLockExclusive(&queue_lock);
+    return r;
+}
+static struct { HANDLE go; u32 idx[MAX_IMAGES]; u32 head, tail; } pq;   /* images to present, under sw_lock */
+static u64 present_dropped;             /* frames not shown (uncapped: the display was still busy) */
+u64 vk_presents_dropped(void) { return present_dropped; }
+
+static void present_now(u32 idx) {
+    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sw.done[idx],
+                           .swapchainCount = 1, .pSwapchains = &sw.sc, .pImageIndices = &idx};
+    bool shared = vk.present_queue == vk.queue;
+    if (shared) AcquireSRWLockExclusive(&queue_lock);
+    VkResult r = vkQueuePresentKHR(vk.present_queue, &pi);
+    if (shared) ReleaseSRWLockExclusive(&queue_lock);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&resized, 1);
+    else if (r < 0) fatal("vkQueuePresentKHR: %d", r);
+}
+
+static void present_pending(void) {
+    for (; pq.tail != pq.head; pq.tail++) present_now(pq.idx[pq.tail % MAX_IMAGES]);
+}
+
+static unsigned __stdcall present_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(pq.go, INFINITE);
+        AcquireSRWLockExclusive(&sw_lock);
+        present_pending();
+        ReleaseSRWLockExclusive(&sw_lock);
+    }
+}
+
 static void present_init(void) {
+    pq.go = CreateEventW(NULL, FALSE, FALSE, NULL);
+    _beginthreadex(NULL, 0, present_thread, NULL, 0, NULL);
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
     for (int i = 0; i < PRESENT_FRAMES; i++) {
@@ -693,10 +743,28 @@ static bool overlay_draw(u32 f) {
     return true;
 }
 
+static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
+
 void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (!sw.fence[0]) present_init();
+    /* uncapped, with a present thread: a frame that comes while the last one is still being presented is not shown
+     * (as MAILBOX would replace it; under Optimus even MAILBOX waits for the display) */
+    if (unthrottled) {
+        if (!TryAcquireSRWLockExclusive(&sw_lock)) { present_dropped++; return; }
+        if (pq.tail != pq.head) { ReleaseSRWLockExclusive(&sw_lock); present_dropped++; return; }
+    } else AcquireSRWLockExclusive(&sw_lock);
+    present_pending();                  /* the last frame's, if its thread has not got to it */
+    present_locked(src, x, y, w, h, flip_y, wait, wait_value);
+    bool queued = pq.tail != pq.head;
+    ReleaseSRWLockExclusive(&sw_lock);
+    if (queued) SetEvent(pq.go);
+}
+
+static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (InterlockedExchange(&resized, 0) || !sw.sc) {
+        AcquireSRWLockExclusive(&queue_lock);     /* every queue: the render thread's too */
         vkDeviceWaitIdle(vk.dev);
+        ReleaseSRWLockExclusive(&queue_lock);
         swapchain_create();
     }
     if (!sw.sc || !sw.extent.width) return;
@@ -751,10 +819,6 @@ void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphor
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 2 : 1,
                         .pWaitSemaphoreInfos = waits, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
-    VKCHECK(vkQueueSubmit2(vk.queue, 1, &si, sw.fence[f]));
-    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sw.done[idx],
-                           .swapchainCount = 1, .pSwapchains = &sw.sc, .pImageIndices = &idx};
-    r = vkQueuePresentKHR(vk.queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&resized, 1);
-    else if (r < 0) fatal("vkQueuePresentKHR: %d", r);
+    VKCHECK(vk_submit(&si, sw.fence[f]));
+    pq.idx[pq.head++ % MAX_IMAGES] = idx;
 }

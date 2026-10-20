@@ -24,7 +24,7 @@ static bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit;
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror;
     int gpu_skip, flush_draws;
     long trace_lo, trace_hi;
     u64 watch, dump_draws, dump_ssbo, dump_tex;
@@ -38,6 +38,7 @@ static struct {
 typedef struct Slot {
     VkCommandPool pool;
     VkCommandBuffer cmd;
+    VkCommandBuffer pre;                /* runs before cmd: the pool mirrors' copies (mirror_sync) */
     u64 value;                          /* timeline value that marks it done */
     VkBuf staging;
     u64 staging_used;
@@ -55,7 +56,8 @@ static VkSemaphore timeline;
 
 /* things to destroy once the GPU is past `value` */
 typedef struct Dead { u64 value; int kind; void *a, *b; VkAlloc alloc; } Dead;
-enum { DEAD_HOSTBUF, DEAD_IMAGE, DEAD_VIEW };
+enum { DEAD_HOSTBUF, DEAD_IMAGE, DEAD_VIEW, DEAD_MIRROR };
+static void mirror_free(void *m);
 static Dead *dead;
 static int ndead, capdead;
 
@@ -75,6 +77,7 @@ static void reap(void) {
         case DEAD_HOSTBUF: vk_release_host(d->a); free(d->a); break;
         case DEAD_IMAGE: vkDestroyImage(vk.dev, d->a, NULL); vk_free(&d->alloc); break;
         case DEAD_VIEW: vkDestroyImageView(vk.dev, d->a, NULL); break;
+        case DEAD_MIRROR: mirror_free(d->a); break;
         }
     }
     ndead = j;
@@ -274,31 +277,38 @@ static void *staging(u64 size, VkBuffer *buf, u64 *off) {
     return e->a.map;
 }
 
-static void barrier(void) {
+static void barrier_in(VkCommandBuffer c) {
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cmd(), &d);
+    vkCmdPipelineBarrier2(c, &d);
 }
+
+static void barrier(void) { barrier_in(cmd()); }
 
 static void end_rendering_at(u32 line);
 #define end_rendering() end_rendering_at(__LINE__)
+
+static bool mirror_sync(VkCommandBuffer pre);
+static void mirror_scan_start(void);
 
 static void flush(void) {
     end_rendering();
     if (cur < 0) return;
     Slot *s = &slots[cur];
+    bool pre = mirror_sync(s->pre);
     prof_mark("(end)");
     VKCHECK(vkEndCommandBuffer(s->cmd));
     s->value = ++submitted;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = timeline, .value = s->value,
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cmd};
-    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
+    VkCommandBufferSubmitInfo cbi[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->pre},
+                                        {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cmd}};
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pre ? 2 : 1, .pCommandBufferInfos = cbi + !pre,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
-    VkResult r = vkQueueSubmit2(vk.queue, 1, &si, NULL);
+    VkResult r = vk_submit(&si, NULL);
     if (r < 0) fatal("vkQueueSubmit2: %d (device lost?)", r);
     cur = -1;
     work_unflushed = 0;
@@ -306,7 +316,19 @@ static void flush(void) {
 }
 
 /* ---------------------------------------------------------------------------------------------- pools */
-typedef struct PoolEnt { u64 gpu, end, cpu; u32 flags; HostBuffer *hb; } PoolEnt;
+/* Pools the GPU reads most also get a copy in video memory (a mirror), which draws read their vertex, index and
+ * uniform buffers from. Over host memory the GPU fetched ~120 MB a frame through PCIe in Mesagoza (one 367 MB
+ * CPU_UNCACHED pool holds every mesh and uniform buffer), and a laptop's x8 link starved the GTX 1650 Ti while its
+ * video memory sat idle. The mirror follows guest memory: pages the CPU wrote (write watch) are copied in at each
+ * submission before its commands run (mirror_sync), and the GPU's own copies, clears and small writes there go to
+ * both. Storage buffers, transform feedback and indirect arguments stay on host memory; a range they write is read
+ * from host memory from then on (Mirror.bad). NX_POOL_MIRROR=0 turns mirrors off */
+typedef struct { u64 lo, hi; } Range;
+typedef struct Mirror { VkBuf b; bool fresh; Range *bad; int nbad, capbad; } Mirror;
+#define MIRROR_MIN (8ull << 20)         /* smaller pools are not worth a scan per submission */
+static double mirror_mb, mirror_ms;     /* copied in and time scanning, for the report every 600 frames */
+static int nmirrors;
+typedef struct PoolEnt { u64 gpu, end, cpu; u32 flags; HostBuffer *hb; Mirror *mir; } PoolEnt;
 static PoolEnt *pools;
 static int npools, cappools;
 static u64 pools_gen;                   /* bumped when pools come or go (cached device addresses) */
@@ -348,6 +370,84 @@ static u8 *gpu_cpu(u64 addr, u64 size) {
 
 static void images_drop_range(u64 lo, u64 hi);
 
+static Mirror *mirror_new(u64 size) {
+    Mirror *m = calloc(1, sizeof *m);
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+    if (vkCreateBuffer(vk.dev, &bci, NULL, &m->b.buf) != VK_SUCCESS) { free(m); return NULL; }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(vk.dev, m->b.buf, &req);
+    if (!vk_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &m->b.a)) {
+        vkDestroyBuffer(vk.dev, m->b.buf, NULL);
+        free(m);
+        return NULL;
+    }
+    VKCHECK(vkBindBufferMemory(vk.dev, m->b.buf, m->b.a.mem, m->b.a.offset));
+    m->b.size = size;
+    m->fresh = true;                    /* copied whole at the next submission */
+    return m;
+}
+
+static void mirror_free(void *p) {
+    Mirror *m = p;
+    vk_buffer_free(&m->b);
+    free(m->bad);
+    free(m);
+}
+
+/* the mirror's buffer and offset for a GPU address, if its pool has one */
+static VkBuffer mirror_at(u64 addr, u64 *off) {
+    PoolEnt *p = addr ? pool_find(addr) : NULL;
+    if (!p || !p->mir) return NULL;
+    *off = addr - p->gpu;
+    return p->mir->b.buf;
+}
+
+/* a range the GPU writes through host memory (storage buffers, transform feedback): read from there from now on */
+static void mirror_bad(u64 addr, u64 size) {
+    PoolEnt *p = addr && size ? pool_find(addr) : NULL;
+    if (!p || !p->mir) return;
+    Mirror *m = p->mir;
+    u64 lo = addr, hi = size < p->end - addr ? addr + size : p->end;
+    for (int i = 0; i < m->nbad; i++)
+        if (m->bad[i].lo <= lo && hi <= m->bad[i].hi) return;
+    for (int i = 0; i < m->nbad;) {    /* merge what it touches */
+        if (m->bad[i].lo <= hi && lo <= m->bad[i].hi) {
+            if (m->bad[i].lo < lo) lo = m->bad[i].lo;
+            if (m->bad[i].hi > hi) hi = m->bad[i].hi;
+            m->bad[i] = m->bad[--m->nbad];
+        } else i++;
+    }
+    if (m->nbad == m->capbad) m->bad = realloc(m->bad, (m->capbad = m->capbad * 2 + 16) * sizeof *m->bad);
+    m->bad[m->nbad++] = (Range){lo, hi};
+    hlog(2, "gpu: pool mirror: %llx+%llx is written by the GPU (%d ranges)", lo, hi - lo, m->nbad);
+}
+
+/* the storage buffers a stage's shader may write (it uses global memory) */
+static void mirror_bad_ssbos(const BufferRange *ssbo, const ShaderCode *sc) {
+    if (!nmirrors || !sc || !(sc->caps & SHC_GLOBAL)) return;
+    for (u32 k = 0; k < 16; k++)
+        if (ssbo[k].addr) mirror_bad(ssbo[k].addr, ssbo[k].size);
+}
+
+/* a range draws only read (vertex, index or uniform data; size 0: to the pool's end) as (buffer, offset): from the
+ * pool's mirror when it has one and the GPU writes none of the range */
+static bool gpu_buffer_ro(u64 addr, u64 size, VkBuffer *buf, u64 *off) {
+    PoolEnt *p = pool_find(addr);
+    if (!p || !p->hb) return false;
+    *buf = p->hb->buf;
+    *off = addr - p->gpu;
+    Mirror *m = p->mir;
+    if (m) {
+        u64 hi = size && size < p->end - addr ? addr + size : p->end;
+        bool bad = false;
+        for (int i = 0; i < m->nbad && !bad; i++) bad = m->bad[i].lo < hi && addr < m->bad[i].hi;
+        if (!bad) *buf = m->b.buf;
+    }
+    return true;
+}
+
 void gpu_pool_created(Pool *p) {
     if (!gpu_ready) return;
     EnterCriticalSection(&gpu_cs);
@@ -361,10 +461,17 @@ void gpu_pool_created(Pool *p) {
         }
     }
     p->hb = hb;
+    Mirror *mir = NULL;
+    if (hb && env.pool_mirror && p->size >= MIRROR_MIN && p->flags & POOL_GPU_CACHED && !(p->flags & POOL_CPU_NO_ACCESS) &&
+        !(p->storage & 0xfff) && !(p->size & 0xfff) && p->storage >= AS_BASE) {
+        mir = mirror_new(p->size);
+        if (mir) nmirrors++;
+        hlog(1, "gpu: pool %llx+%llx (flags %x) %s", p->gpu, p->size, p->flags, mir ? "mirrored in video memory" : "not mirrored: no memory");
+    }
     if (npools == cappools) pools = realloc(pools, (cappools = cappools * 2 + 64) * sizeof *pools);
     int i = npools;
     while (i > 0 && pools[i - 1].gpu > p->gpu) { pools[i] = pools[i - 1]; i--; }
-    pools[i] = (PoolEnt){p->gpu, p->gpu + p->size, p->flags & POOL_VIRTUAL ? 0 : p->storage, p->flags, hb};
+    pools[i] = (PoolEnt){p->gpu, p->gpu + p->size, p->flags & POOL_VIRTUAL ? 0 : p->storage, p->flags, hb, mir};
     npools++;
     pools_gen++;
     images_drop_range(p->gpu, p->gpu + p->size);
@@ -377,6 +484,7 @@ void gpu_pool_destroyed(Pool *p) {
     for (int i = 0; i < npools; i++)
         if (pools[i].gpu == p->gpu && pools[i].end == p->gpu + p->size) {
             if (pools[i].hb) bury(DEAD_HOSTBUF, pools[i].hb, NULL);
+            if (pools[i].mir) bury(DEAD_MIRROR, pools[i].mir, NULL), nmirrors--;
             memmove(&pools[i], &pools[i + 1], (npools - i - 1) * sizeof *pools);
             npools--;
             pools_gen++;
@@ -1039,7 +1147,7 @@ static void state_reset(State *s) {
 /* small GPU writes made while rendering (counter reports between occlusion boxes, events), done when the pass
  * ends: Vulkan allows no buffer updates inside rendering, and ending the pass for each one split the occlusion
  * pass into hundreds */
-typedef struct PendingWrite { VkBuffer buf; u64 off; u32 size; u8 data[16]; } PendingWrite;
+typedef struct PendingWrite { VkBuffer buf, mbuf; u64 off, moff; u32 size; u8 data[16]; } PendingWrite;
 static PendingWrite pending[1024];
 static u32 npending;
 
@@ -1053,8 +1161,10 @@ static void end_rendering_at(u32 line) {
     prof_mark("outside passes (copies, clears, barriers)");
     if (npending) {
         barrier();                      /* after the draws before them */
-        for (u32 i = 0; i < npending; i++)
+        for (u32 i = 0; i < npending; i++) {
             vkCmdUpdateBuffer(cmd(), pending[i].buf, pending[i].off, pending[i].size, pending[i].data);
+            if (pending[i].mbuf) vkCmdUpdateBuffer(cmd(), pending[i].mbuf, pending[i].moff, pending[i].size, pending[i].data);
+        }
         npending = 0;
     }
     barrier();
@@ -1285,6 +1395,12 @@ static void do_copy_texture_to_buffer(const CmdCopyBT *p) {
     end_rendering();
     VkBufferImageCopy r = bt_region(p, im, off);
     vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+    u64 moff;
+    VkBuffer mbuf = mirror_at(p->buffer, &moff);
+    if (mbuf) {
+        r.bufferOffset = moff;
+        vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, mbuf, 1, &r);
+    }
     barrier();
 }
 
@@ -1373,16 +1489,21 @@ static void gpu_write(u64 addr, const void *data, u32 size) {
         if (p) memcpy(p, data, size);  /* not GPU-reachable: write it now */
         return;
     }
+    u64 moff = 0;
+    VkBuffer mbuf = mirror_at(addr, &moff);
     if (st.rendering && size <= 16 && npending < sizeof pending / sizeof *pending) {
         PendingWrite *w = &pending[npending++];
         w->buf = buf;
         w->off = off;
+        w->mbuf = mbuf;
+        w->moff = moff;
         w->size = (size + 3) & ~3u;
         memcpy(w->data, data, size);
         return;
     }
     end_rendering();
     vkCmdUpdateBuffer(cmd(), buf, off, (size + 3) & ~3u, data);
+    if (mbuf) vkCmdUpdateBuffer(cmd(), mbuf, moff, (size + 3) & ~3u, data);
     barrier();
 }
 
@@ -2125,6 +2246,7 @@ typedef struct PipeKey {
     VkFormat color[8], depth, stencil;
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
+    u32 alpha_func;                     /* NVN's alpha test (1-7; 0 = always passes): the fragment shader's ALPHA_FUNC */
 } PipeKey;
 typedef struct Pipe { PipeKey key; VkPipeline pipe; struct Pipe *next; } Pipe;
 #define PIPE_BUCKETS 1024
@@ -2140,11 +2262,14 @@ static VkPipeline pipeline_get(const PipeKey *k) {
     h %= PIPE_BUCKETS;
     for (Pipe *p = pipes[h]; p; p = p->next)
         if (!memcmp(&p->key, k, sizeof *k)) return p->pipe;
+    /* the alpha test is a specialization constant, so a draw without one has no discard from it (early depth) */
+    VkSpecializationMapEntry sme = {0, 0, sizeof k->alpha_func};
+    VkSpecializationInfo spec = {1, &sme, sizeof k->alpha_func, &k->alpha_func};
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp32 : NULL,
          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->vs, .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp32 : NULL,
-         .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->fs, .pName = "main"}};
+         .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->fs, .pName = "main", .pSpecializationInfo = &spec}};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {
@@ -2358,7 +2483,7 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
             else if (i >= 3) { addr = st.ubo[stage][i - 3].addr; size = st.ubo[stage][i - 3].size; }
             VkBuffer buf;
             u64 off;
-            if (addr && size && gpu_buffer(addr, &buf, &off) && !(off & 63)) {
+            if (addr && size && gpu_buffer_ro(addr, size > 65536 ? 65536 : size, &buf, &off) && !(off & 63)) {
                 if (size > 65536) size = 65536;
                 *b = (VkDescriptorBufferInfo){buf, off, size};
             }
@@ -2570,7 +2695,7 @@ static void set_vertex_input(VkCommandBuffer c) {
             bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL,
                 s, stride, div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, 1};
             u64 off;
-            if (st.vbuf[s].addr && gpu_buffer(st.vbuf[s].addr, &bufs[s], &off)) {
+            if (st.vbuf[s].addr && gpu_buffer_ro(st.vbuf[s].addr, st.vbuf[s].size, &bufs[s], &off)) {
                 offs[s] = off;
                 sizes[s] = st.vbuf[s].size ? st.vbuf[s].size : VK_WHOLE_SIZE;
             }
@@ -2642,6 +2767,7 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
         bufs[b] = NULL, offs[b] = 0, sizes[b] = 0;
         if (!vs->xfb_stride[b]) continue;
         if (!st.xfb[b].addr || !gpu_buffer(st.xfb[b].addr, &bufs[b], &off)) return;
+        mirror_bad(st.xfb[b].addr, st.xfb[b].size);
         u64 w = st.xfb_written[b] < st.xfb[b].size ? st.xfb_written[b] : st.xfb[b].size;
         offs[b] = off + w;
         sizes[b] = st.xfb[b].size - w;
@@ -2841,6 +2967,7 @@ static void draw_one(u32 op, const void *payload) {
     k.samples = st.samples;
     k.minus_one = depth_mode == 0;
     if (!vk.dyn_logic_op) k.logic_op = st.color.logic_op & 15;
+    if (fs && st.color.alpha_test >= 1 && st.color.alpha_test <= 7) k.alpha_func = st.color.alpha_test;
     VkPipeline pipe = pipeline_get(&k);
     if (!pipe) { skip_draw("pipeline creation failed"); return; }
     if (trace_frame()) {
@@ -2938,6 +3065,8 @@ static void draw_one(u32 op, const void *payload) {
     set_dynamic_state(c, ((const CmdDraw *)payload)->mode);
     VkWriteDescriptorSet w[32];
     VkDescriptorBufferInfo bi[32];
+    mirror_bad_ssbos(st.ssbo[ST_VERTEX], pr->stage[ST_VERTEX]);
+    mirror_bad_ssbos(st.ssbo[ST_FRAGMENT], pr->stage[ST_FRAGMENT]);
     int nw = stage_ubos(ST_VERTEX, 0, pr->stage[ST_VERTEX], w, bi);
     nw += stage_ubos(ST_FRAGMENT, 16, pr->stage[ST_FRAGMENT], w + nw, bi + nw);
     bool same = !all && (u32)nw == rec.nw;
@@ -2993,7 +3122,7 @@ static void draw_one(u32 op, const void *payload) {
         }
         VkBuffer ib;
         u64 io;
-        if (!gpu_buffer(d->index_addr, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
+        if (!gpu_buffer_ro(d->index_addr, (u64)d->count << d->index_type, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
         VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         vkCmdBindIndexBuffer(c, ib, io, it);
         QUERIED(vkCmdDrawIndexed(c, d->count, d->instances, 0, d->base_vertex, d->base_instance));
@@ -3009,7 +3138,7 @@ static void draw_one(u32 op, const void *payload) {
         QUERIED(vkCmdDrawIndirect(c, buf, off, 1, 16));
         return;
     }
-    if (!gpu_buffer(d->index_addr, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
+    if (!gpu_buffer_ro(d->index_addr, 1, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
     VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     vkCmdBindIndexBuffer(c, ib, io, it);
     QUERIED(vkCmdDrawIndexedIndirect(c, buf, off, 1, 20));
@@ -3066,6 +3195,7 @@ static void dispatch(u32 op, const u8 *pay) {
     ShaderCode *cs = st.bound[ST_COMPUTE];
     if (!cs) { skip_draw("dispatch without a compute shader"); return; }
     VkShaderModule m = shader_module(cs);
+    mirror_bad_ssbos(st.ssbo[ST_COMPUTE], cs);
     if (!m) { skip_draw("shader not translated"); return; }
     CPipe *cp;
     for (cp = cpipes; cp && cp->m != m; cp = cp->next) {}
@@ -3211,6 +3341,8 @@ static void run(u64 at, int depth) {
             if (u.len && gpu_buffer(u.buffer + u.offset, &buf, &off)) {
                 end_rendering();
                 vkCmdUpdateBuffer(cmd(), buf, off, (u.len + 3) & ~3u, pay + sizeof u);
+                VkBuffer mbuf = mirror_at(u.buffer + u.offset, &off);
+                if (mbuf) vkCmdUpdateBuffer(cmd(), mbuf, off, (u.len + 3) & ~3u, pay + sizeof u);
                 barrier();
             }
             break;
@@ -3289,6 +3421,8 @@ static void run(u64 at, int depth) {
                 end_rendering();
                 VkBufferCopy c = {so, dof, p->size};
                 vkCmdCopyBuffer(cmd(), sb, db, 1, &c);
+                VkBuffer mbuf = mirror_at(p->dst, &c.dstOffset);
+                if (mbuf) vkCmdCopyBuffer(cmd(), sb, mbuf, 1, &c);
                 barrier();
             }
             break;
@@ -3300,6 +3434,8 @@ static void run(u64 at, int depth) {
             if (p->size && gpu_buffer(p->addr, &b, &o)) {
                 end_rendering();
                 vkCmdFillBuffer(cmd(), b, o, p->size & ~3ull, p->value);
+                VkBuffer mbuf = mirror_at(p->addr, &o);
+                if (mbuf) vkCmdFillBuffer(cmd(), mbuf, o, p->size & ~3ull, p->value);
                 barrier();
             }
             break;
@@ -3382,6 +3518,7 @@ void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     (void)queue;
     double t0 = ms_now();
     EnterCriticalSection(&gpu_cs);
+    mirror_scan_start();
     submit_serial++;
     for (u32 i = 0; i < count; i++)
         if (handles[i]) run(handles[i], 0);
@@ -3654,7 +3791,6 @@ static void dump_frame(Image *win, u64 frame) {
 }
 
 /* textures the CPU rewrote since the last frame (write watch over the GPU-visible pools): upload them again */
-typedef struct { u64 lo, hi; } Range;
 static int range_cmp(const void *a, const void *b) {
     u64 x = ((const Range *)a)->lo, y = ((const Range *)b)->lo;
     return x < y ? -1 : x > y;
@@ -3699,7 +3835,9 @@ static int refresh_pages(const u64 *pages, size_t n) {
  * image sharing them was asked about, and that one's refresh_pages uploads it too. Asking about every image each
  * frame took 2 ms of the render thread in Mesagoza (180 MB of pages) */
 static bool image_watched(const Image *im) {
-    return im->valid && !im->gpu_written && im->size && im->info.addr >= AS_BASE;
+    if (!im->valid || im->gpu_written || !im->size || im->info.addr < AS_BASE) return false;
+    PoolEnt *p = nmirrors ? pool_find(im->info.addr) : NULL;
+    return !p || !p->mir;
 }
 
 static void image_touch(Image *im) {
@@ -3756,7 +3894,7 @@ static void refresh_scan(void) {
     int nr = 0;
     bool whole = env.refresh_pools;                     /* NX_REFRESH_POOLS: ask over whole pools (the old way) */
     for (int i = 0; whole && i < npools; i++) {
-        if (!pools[i].cpu || !pools[i].hb) continue;
+        if (!pools[i].cpu || !pools[i].hb || pools[i].mir) continue;
         if (nr == scan_caprs) scan_rs = realloc(scan_rs, (scan_caprs = scan_caprs * 2 + 1024) * sizeof *scan_rs);
         scan_rs[nr++] = (Range){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
     }
@@ -3781,6 +3919,108 @@ static void refresh_cpu_textures(void) {
     double t0 = ms_now();
     refresh_scan();
     refresh_ms += ms_now() - t0;
+}
+
+/* Which pages of the mirrored pools the CPU wrote is asked on a thread of its own (~0.5 ms for 367 MB, whatever is
+ * written), started when the guest submits (mirror_scan_start) and awaited at the first submission after it, while
+ * the render thread translates. Only the guest's submissions start one: the data their commands read was written
+ * before they were submitted, as on the console (where the GPU may start on them at once) */
+typedef struct { u64 lo, hi; size_t first, n; } MScan;
+static MScan *msr;
+static int nmsr, capmsr;
+static u64 *ms_pages;
+static size_t ms_cap;
+static HANDLE ms_go, ms_done;
+static bool ms_running;
+
+static unsigned __stdcall mirror_scan_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(ms_go, INFINITE);
+        size_t n = 0;
+        double mb = 0;
+        for (int i = 0; i < nmsr; i++) {
+            msr[i].first = n;
+            n = written_pages(msr[i].lo, msr[i].hi, &ms_pages, &ms_cap, n, &mb);
+            msr[i].n = n - msr[i].first;
+        }
+        SetEvent(ms_done);
+    }
+}
+
+static void mirror_scan_start(void) {
+    if (!nmirrors || ms_running) return;
+    if (!ms_go) {
+        ms_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+        ms_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+        _beginthreadex(NULL, 0, mirror_scan_thread, NULL, 0, NULL);
+    }
+    nmsr = 0;
+    for (int i = 0; i < npools; i++) {
+        if (!pools[i].mir || pools[i].mir->fresh) continue;
+        if (nmsr == capmsr) msr = realloc(msr, (capmsr = capmsr * 2 + 8) * sizeof *msr);
+        msr[nmsr++] = (MScan){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
+    }
+    if (!nmsr) return;
+    ms_running = true;
+    SetEvent(ms_go);
+}
+
+/* the copies into the mirrors, recorded into `pre`, which runs before the submission's commands and after the work
+ * submitted before it (what that read or wrote is done): the pages the last scan found, and new mirrors whole.
+ * Images on those pages are uploaded again here: the write watch over them is the scan's */
+static bool mirror_sync(VkCommandBuffer pre) {
+    if (!nmirrors) return false;
+    static VkBufferCopy *rg;
+    static size_t caprg;
+    bool begun = false;
+    double t0 = ms_now();
+    if (ms_running) WaitForSingleObject(ms_done, INFINITE);
+    for (int i = 0; i < npools; i++) {
+        PoolEnt *p = &pools[i];
+        Mirror *m = p->mir;
+        if (!m) continue;
+        u64 size = p->end - p->gpu;
+        size_t nr = 0;
+        if (m->fresh) {                 /* all of it, and the write watch starts over */
+            static u64 *pages;
+            static size_t cap;
+            double mb = 0;
+            written_pages(p->cpu, p->cpu + size, &pages, &cap, 0, &mb);
+            if (!caprg) rg = realloc(rg, (caprg = 1024) * sizeof *rg);
+            rg[nr++] = (VkBufferCopy){0, 0, size};
+            m->fresh = false;
+        } else if (ms_running) {
+            const MScan *sc = NULL;
+            for (int k = 0; k < nmsr && !sc; k++) if (msr[k].lo == p->cpu && msr[k].hi == p->cpu + size) sc = &msr[k];
+            if (!sc || !sc->n) continue;
+            const u64 *pg = ms_pages + sc->first;
+            for (size_t k = 0; k < sc->n; k++) {
+                u64 o = pg[k] - p->cpu;
+                if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == o) { rg[nr - 1].size += 4096; continue; }
+                if (nr == caprg) rg = realloc(rg, (caprg = caprg * 2 + 1024) * sizeof *rg);
+                rg[nr++] = (VkBufferCopy){o, o, 4096};
+            }
+            refresh_pages(pg, sc->n);
+        }
+        if (!nr) continue;
+        if (!begun) {
+            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            VKCHECK(vkBeginCommandBuffer(pre, &bi));
+            barrier_in(pre);
+            begun = true;
+        }
+        for (size_t k = 0; k < nr; k++) mirror_mb += (double)rg[k].size / (1 << 20);
+        vkCmdCopyBuffer(pre, p->hb->buf, m->b.buf, (u32)nr, rg);
+    }
+    ms_running = false;
+    if (begun) {
+        barrier_in(pre);
+        VKCHECK(vkEndCommandBuffer(pre));
+    }
+    mirror_ms += ms_now() - t0;
+    return begun;
 }
 
 /* the indirect draws of a traced frame, logged with the arguments the GPU wrote for them once it is done (instance
@@ -3856,8 +4096,13 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
     if (frames % 600 == 0) {
         hlog(1, "gpu: CPU-written texture check %.2f ms/frame over %.0f MB", refresh_ms / 600, refresh_mb / 600);
-        hlog(1, "gpu: per frame: translating and submitting %.2f ms, presenting %.2f ms, waiting for the GPU %.2f ms",
-             t_submit_ms / 600, t_present_ms / 600, t_wait_ms / 600);
+        if (nmirrors) hlog(1, "gpu: pool mirrors: %.2f MB/frame copied in, render thread %.2f ms/frame on them", mirror_mb / 600, mirror_ms / 600);
+        mirror_mb = mirror_ms = 0;
+        static u64 dropped0;
+        u64 dropped = vk_presents_dropped();
+        hlog(1, "gpu: per frame: translating and submitting %.2f ms, presenting %.2f ms, waiting for the GPU %.2f ms; %llu of 600 not shown",
+             t_submit_ms / 600, t_present_ms / 600, t_wait_ms / 600, dropped - dropped0);
+        dropped0 = dropped;
         refresh_ms = refresh_mb = t_submit_ms = t_present_ms = t_wait_ms = 0;
     }
     for (int i = 0; frames % 600 == 0 && i < nskip_why; i++) hlog(1, "gpu:   %llu skipped: %s", skip_count[i], skip_why[i]);
@@ -3884,6 +4129,7 @@ static void env_init(void) {
     env.pipe_log = getenv("NX_PIPE_LOG") != NULL;
     env.no_discard = getenv("NX_NO_DISCARD") != NULL;
     env.refresh_pools = getenv("NX_REFRESH_POOLS") != NULL;
+    env.pool_mirror = !(e = getenv("NX_POOL_MIRROR")) || atoi(e);
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
@@ -3913,8 +4159,11 @@ void gpu_init(void) {
                                        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
         VKCHECK(vkCreateCommandPool(vk.dev, &pci, NULL, &slots[i].pool));
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = slots[i].pool,
-                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-        VKCHECK(vkAllocateCommandBuffers(vk.dev, &ai, &slots[i].cmd));
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2};
+        VkCommandBuffer two[2];
+        VKCHECK(vkAllocateCommandBuffers(vk.dev, &ai, two));
+        slots[i].cmd = two[0];
+        slots[i].pre = two[1];
         vk_buffer(STAGING_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &slots[i].staging);
     }
