@@ -113,6 +113,30 @@ of collected while playing) and a faster lift/compile (first-run time, now 20-40
 Risks: exceptions (V1) and the size of the build are the unknowns MK8 didn't have; NVN coverage is the largest amount
 of work; online code paths must fail as on a console with no internet, not crash.
 
+## Next (written 2026-10-20)
+
+Where things stand: Mesagoza uncapped ~170-190 fps (was 128-141 on 2026-10-19), 1% lows ~7 ms; a frame is the
+render thread's translation (~2.5 ms) plus what is left of the GPU's work. Details under Status, "Performance".
+In order:
+
+1. **Measure the dip when spawning / loading** (~80 fps for a second). Log around loads how long goes to
+   pipeline creation (`vkCreateGraphicsPipelines` in gpu.c `pipeline_get`, synchronous on the render thread at a
+   pipeline's first draw), image creation and uploads, and shader JIT waits (`gpu: waited N ms for shader`, level
+   1). Tonight's scripted runs had no JIT waits at all in Mesagoza, so pipelines are the first suspect.
+2. **Keep the pipeline cache between sessions.** gpu.c creates `pcache` empty every run (`vkCreatePipelineCache`
+   with no initial data) and never saves it. Load it from a file under `build/` at start (check the cache header's
+   vendor/device/UUID, else start empty) and write it back at exit and every few minutes. The AMD driver has its
+   own disk cache too, so measure before and after (item 1's log).
+3. **Extract every shader up front** (the "unpacker", also a V8 prerequisite): walk the shader archives in
+   `dump/romfs/arc/data.trpfs` (8 GB) instead of collecting shaders as the game creates them (`build/shaders`,
+   5,488 so far), and translate them all ahead of time. First learn the trpfs layout and its compression; if it
+   is a proprietary compressor, prefer running the game's own lifted loading code in a tool mode over writing a
+   decoder. Gains: no translation stall the first time an area is reached, a complete shader set, and no Python
+   needed during play. It will not raise the frame rate in areas already visited.
+4. **Keep the shader JIT as a fallback** after item 3 (gpu.c `jit_request`, NX_SHADER_JIT): anything not found
+   in the archives (DLC, generated shaders) still gets translated. Removing Python entirely means porting
+   `translate.py` to C, which belongs with V8 (packaging), not here.
+
 ## Status (2026-10-18)
 
 - The three NSPs are identified; every NCA decrypts with the shared `../keys` (key generations 14, 15, 17).
