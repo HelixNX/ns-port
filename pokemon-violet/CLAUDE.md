@@ -115,9 +115,10 @@ of work; online code paths must fail as on a console with no internet, not crash
 
 ## Next (written 2026-10-20)
 
-Where things stand: Mesagoza uncapped ~170-190 fps (was 128-141 on 2026-10-19), 1% lows ~7 ms; a frame is the
-render thread's translation (~2.5 ms) plus what is left of the GPU's work. Details under Status, "Performance".
-In order:
+Where things stand: Mesagoza uncapped ~170-190 fps on the RX 7800 XT (was 128-141 on 2026-10-19), 1% lows ~7 ms;
+a frame is the render thread's translation (~2.5 ms) plus what is left of the GPU's work. GTX 1650 Ti laptop: 23-29
+-> 75-78 fps (2026-10-20: pools mirrored in video memory, presents on their own thread); the AMD run with those
+changes is still to do (Status, "Performance", GTX 1650 Ti entry). In order:
 
 1. **Measure the dip when spawning / loading** (~80 fps for a second). Log around loads how long goes to
    pipeline creation (`vkCreateGraphicsPipelines` in gpu.c `pipeline_get`, synchronous on the render thread at a
@@ -388,6 +389,35 @@ In order:
     (2026-10-19): cutscenes look right at 80-90 fps; at 120+ characters sometimes teleport (so it grows with frame
     rate). Also seen: small cyan-white streaks hanging in the air in Mesagoza (frames/frame_14699.ppm; particles?).
     A new game for tests: `violetrecomp.exe --save <empty dir>` with `NX_INPUT='300-1000000/60:A'`.
+  - GTX 1650 Ti laptop (2026-10-20, Mesagoza garden, 1080p, uncapped): 23-29 -> 75-78 fps. It was GPU-bound
+    (96% busy) but starved: one 367 MB CPU_UNCACHED|GPU_CACHED pool holds every mesh, index and uniform buffer,
+    and the GPU read it from host memory over the laptop's PCIe 3.0 x8 (`nvidia-smi dmon -s ut`: rx 2-3.5 GB/s,
+    VRAM controller 4%). The G-buffer pass took 19-24 ms (AMD: 2.2). Now gpu.c mirrors pools >= 8 MB that are
+    GPU_CACHED and CPU-accessible in video memory (Mirror; NX_POOL_MIRROR=0 off): draws read vertex, index and
+    uniform buffers from the mirror; pages the CPU wrote (write watch, scanned on a thread started at each guest
+    submit, ~0.5 ms per 367 MB whatever is dirty) are copied in by a `pre` command buffer before each submission
+    (~1.6 MB/frame); GPU copies, clears and small writes go to both; ranges written by storage buffers (shaders with
+    SHC_GLOBAL) or transform feedback are read from host memory from then on (Mirror.bad). G-buffer 19 -> 1.0 ms,
+    GPU work 32-38 -> 8.7 ms per frame, PCIe rx ~0.6 GB/s. Not measured on AMD yet (its earlier CPU_NO_ACCESS
+    experiment saw no change; the 0x022 pool was not tried there).
+    Then the frame rate sat at 59: the panel is 60 Hz on the Intel GPU (Optimus), and NVIDIA's vkQueuePresentKHR
+    blocked the render thread ~4-5 ms a frame in every present mode. Presents now run on a thread of their own
+    (vk.c, sw_lock): on the family's second queue where there is one (NVIDIA), else sharing vk.queue under
+    queue_lock (AMD's graphics family has one queue; every submission goes through vk_submit). Uncapped, a frame
+    that arrives while the last is still being presented is not shown (mailbox behaviour; the 600-frame log says
+    how many).
+    AMD (RX 7800 XT, display on the dGPU, PCIe 4.0 x16), not yet run: no Optimus stall there, so the present thread
+    should change little. The mirror should still cut the G-buffer's host reads; its costs are a helper thread
+    scanning ~0.4 ms per guest submit (the page walk, whatever is dirty or the output size) and a wait at the first
+    flush if that scan is slower than translating the first 250 draws, logged as "pool mirrors: ... render thread
+    X ms/frame". First run there: compare uncapped fps and NX_GPU_PROF=1's G-buffer pass with NX_POOL_MIRROR=0
+    and 1 (with the same NX_TIME). Also: the alpha test is a
+    specialization constant (ALPHA_FUNC, PipeKey.alpha_func) so draws without one have no discard (early depth);
+    no measurable change here. NX_TIME=<posix seconds> pins the guest clock: the day/night cycle follows the real
+    clock and moved the GPU cost run to run (19 -> 24 ms G-buffer within 30 minutes).
+    Open: GPU 8.7-9.9 ms (pass 1920x1080 c0:122 with 22 passes/frame 2.3 ms, G-buffer 1.9, ~172 barriers 1.2),
+    render thread translating ~7 ms, 1% lows ~38 ms. Validation shows 3x VUID-RuntimeSpirv-Location-06272 and 1x
+    OpEntryPoint-08743 on NVIDIA (shader interfaces, not from these changes).
   - Lift and build: a64lift lifts in worker processes (NX_LIFT_PROCS; default by free memory, ~3 GB each: 129 ->
     59 s here, output identical); LIFT_JOBS=0 (default) = min(logical cores, RAM / 2 GB) compiles: a full build
     ~6 -> 4.4 min on this machine (16 threads, 31 GB). Changing a64lift.py invalidates build/modcache (it is keyed
