@@ -348,7 +348,10 @@ of work; online code paths must fail as on a console with no internet, not crash
     shows nothing new. Then stage_ubos pushes only the uniform slots a shader declares (ShaderCode.slots_used,
     from the SPIR-V's cbN bindings; was all 16 per stage) and pool_find tries the last pool hit first: 150-152 ->
     167-195 fps, translation 2.5-2.7 ms, and the GPU wait shrank too (1.6-2.2 ms): the 32 push descriptors a draw
-    cost GPU time as well (the even per-draw GPU cost NX_GPU_PROF=2 showed). DMB/DSB: load- or store-only barriers lift as compiler barriers, full ones as
+    cost GPU time as well (the even per-draw GPU cost NX_GPU_PROF=2 showed). Then descset_use skips draws whose
+    texture / image handles, entries (DescSet.gen) and images are as the last call's in the same frame, and
+    vertex buffers are bound for the used streams and 31 only: no change in 2 x 600-frame windows here, but the
+    user saw ~160 -> ~170 average and better frame rates after loads (2026-10-20). DMB/DSB: load- or store-only barriers lift as compiler barriers, full ones as
     `lock or (%rsp)` instead of MFENCE (a64insn.py, a64rt.h FENCE / FENCE_ORDER): CPU-bound (NX_GPU_SKIP=1)
     287-296 -> 297-304 fps. The game pins main and the render thread to core 0, workers 5a/5b to cores 1/2
     (as on the console), so more emulated cores would not help without breaking per-core data. Main's profile is
