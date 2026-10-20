@@ -117,13 +117,14 @@ of work; online code paths must fail as on a console with no internet, not crash
 
 Where things stand: Mesagoza uncapped ~170-190 fps on the RX 7800 XT (was 128-141 on 2026-10-19), 1% lows ~7 ms;
 a frame is the render thread's translation (~2.5 ms) plus what is left of the GPU's work. GTX 1650 Ti laptop: 23-29
--> 75-78 fps (2026-10-20: pools mirrored in video memory, presents on their own thread); the AMD run with those
-changes is still to do (Status, "Performance", GTX 1650 Ti entry). In order:
+-> 75-78 fps (2026-10-20: pools mirrored in video memory, presents on their own thread); on the RX 7800 XT the
+mirror costs fps (155-205 off vs 137-167 on, in the benchmark save's scene; Status, "Performance", GTX 1650 Ti
+entry). In order:
 
-1. **Measure the dip when spawning / loading** (~80 fps for a second). Log around loads how long goes to
-   pipeline creation (`vkCreateGraphicsPipelines` in gpu.c `pipeline_get`, synchronous on the render thread at a
-   pipeline's first draw), image creation and uploads, and shader JIT waits (`gpu: waited N ms for shader`, level
-   1). Tonight's scripted runs had no JIT waits at all in Mesagoza, so pipelines are the first suspect.
+1. **Measure the dip when spawning / loading** (~80 fps for a second). The logging is in: NX_HITCH_MS=20 logs
+   each slow frame split into shader loads, JIT waits, pipeline builds, images, uploads, slot waits and the rest
+   (Status, "Performance", "Lows"). Run it on the benchmark save (`build/save-bench`). In that scene the lows
+   follow new pipelines and images (1% lows ~7-10 ms without, 10-49 ms with).
 2. **Keep the pipeline cache between sessions.** gpu.c creates `pcache` empty every run (`vkCreatePipelineCache`
    with no initial data) and never saves it. Load it from a file under `build/` at start (check the cache header's
    vendor/device/UUID, else start empty) and write it back at exit and every few minutes. The AMD driver has its
@@ -406,12 +407,34 @@ changes is still to do (Status, "Performance", GTX 1650 Ti entry). In order:
     queue_lock (AMD's graphics family has one queue; every submission goes through vk_submit). Uncapped, a frame
     that arrives while the last is still being presented is not shown (mailbox behaviour; the 600-frame log says
     how many).
-    AMD (RX 7800 XT, display on the dGPU, PCIe 4.0 x16), not yet run: no Optimus stall there, so the present thread
-    should change little. The mirror should still cut the G-buffer's host reads; its costs are a helper thread
-    scanning ~0.4 ms per guest submit (the page walk, whatever is dirty or the output size) and a wait at the first
-    flush if that scan is slower than translating the first 250 draws, logged as "pool mirrors: ... render thread
-    X ms/frame". First run there: compare uncapped fps and NX_GPU_PROF=1's G-buffer pass with NX_POOL_MIRROR=0
-    and 1 (with the same NX_TIME). Also: the alpha test is a
+    AMD (RX 7800 XT, display on the dGPU, PCIe 4.0 x16), run 2026-10-20 from the benchmark save (below), 2-minute
+    runs, NX_TIME=1792494000: **the mirror loses there.** Uncapped, after loading: NX_POOL_MIRROR=0 155-205 fps
+    (translating 2.3-2.9 ms, GPU wait 1.6-2.6 ms), =1 137-167 fps (translating 3.1-4.2 ms, GPU wait 0.8-1.7 ms).
+    The mirror's own log claims 0.07 ms/frame of render-thread time, so the extra ~1 ms of translating is
+    unexplained (the wait at the first flush for the scan thread is the suspect). With =1 the title screen also
+    had 18-66 ms spikes that =0 did not. NX_GPU_PROF=1: G-buffer (1920x1080 c1:43 c2:37 c3:37 c4:122 ds:130)
+    1.0-1.5 ms with the mirror vs 1.7-2.3 ms without at the scene's start, ~1.3-1.45 both later; copies outside
+    passes 0.36 vs 0.23 ms (the copy-in); whole GPU frame 4.6-6.3 vs 3.7-6.8 ms (overlapping). So on a desktop
+    card with a fast bus the host-memory reads were never the problem (G-buffer was 2.2 ms before). Open: turn
+    the mirror on only where it pays (the user's call, not changed yet); AMD runs use NX_POOL_MIRROR=0 for now.
+    Present thread on AMD: presenting 0.2-0.4 ms/frame, 0 frames not shown; no switch to compare the old path.
+    - Benchmark save (2026-10-20): `build/save-bench` (a copy of build/save from 2026-10-19; the user sends it
+      over, it is never committed: it is game data). Loading it starts a scripted scene that takes input away
+      for ~5 minutes, so every run renders the same thing, with content streaming in as it goes. Runs copy it to a
+      throwaway folder first so the game never saves over it: copy `build/save-bench` to `build/save-bench-run`,
+      then `violetrecomp.exe --log 1 --save <that folder>` with NX_NOPACE=1, NX_TIME=1792494000,
+      NX_INPUT='300-900/60:A;1000-1600/90:B'. The scene runs on game time, so at different frame rates a
+      600-frame window covers a different part of it: compare whole runs, not window by window. These numbers are
+      not comparable with Mesagoza's.
+    - Lows (2026-10-20, AMD, that scene): 600-frame windows with no new pipelines or images had 1% lows of
+      6.7-10.3 ms (mirror off); windows with them 9.9-48.9 ms, worst frames up to 146 ms. So the spikes come with
+      new content. NX_HITCH_MS=<ms> (gpu.c, `hf`) now logs each frame longer than that, present to present: the
+      render thread's translating / presenting / GPU wait / the rest (game code, waits for a core), and in them
+      the time and count of shader loads, JIT waits (base shaders and integer-input variants; variants are not
+      made by `translate.py --spv` and their wait was not logged before), pipeline builds (graphics and compute),
+      image creation, uploads, waits for a free command slot and the mirror copy-in. Built, not run yet: run the
+      benchmark save with NX_HITCH_MS=20 and NX_POOL_MIRROR=0 to pick between Next items 2 and 3.
+    Also: the alpha test is a
     specialization constant (ALPHA_FUNC, PipeKey.alpha_func) so draws without one have no discard (early depth);
     no measurable change here. NX_TIME=<posix seconds> pins the guest clock: the day/night cycle follows the real
     clock and moved the GPU cost run to run (19 -> 24 ms G-buffer within 30 minutes).
