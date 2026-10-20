@@ -345,7 +345,10 @@ of work; online code paths must fail as on a console with no internet, not crash
   - CPU side (2026-10-20): the render thread spent ~23% in the AMD driver, from ~40 vkCmdSet / bind calls a draw.
     draw() now records only state that differs from the last draw in the same command buffer (gpu.c `rec`,
     DynState): 128-141 -> 150-152 fps uncapped, translation 3.7-4.1 -> 3.3-3.4 ms, 1% lows 8-9.5 ms; validation
-    shows nothing new. DMB/DSB: load- or store-only barriers lift as compiler barriers, full ones as
+    shows nothing new. Then stage_ubos pushes only the uniform slots a shader declares (ShaderCode.slots_used,
+    from the SPIR-V's cbN bindings; was all 16 per stage) and pool_find tries the last pool hit first: 150-152 ->
+    167-195 fps, translation 2.5-2.7 ms, and the GPU wait shrank too (1.6-2.2 ms): the 32 push descriptors a draw
+    cost GPU time as well (the even per-draw GPU cost NX_GPU_PROF=2 showed). DMB/DSB: load- or store-only barriers lift as compiler barriers, full ones as
     `lock or (%rsp)` instead of MFENCE (a64insn.py, a64rt.h FENCE / FENCE_ORDER): CPU-bound (NX_GPU_SKIP=1)
     287-296 -> 297-304 fps. The game pins main and the render thread to core 0, workers 5a/5b to cores 1/2
     (as on the console), so more emulated cores would not help without breaking per-core data. Main's profile is
