@@ -1561,6 +1561,7 @@ typedef struct DescSet {
     Image **img;                        /* ... and the image written (NULL: the dummy) */
     u8 *intv;                           /* texture entries: read through integer views (HANDLE_INT) */
     u64 epoch, synced;
+    u64 gen;                            /* bumped whenever an entry's image may change (res set or cleared) */
     struct DescSet *next;
 } DescSet;
 enum { DS_TEX, DS_SMP, DS_IMG };
@@ -1761,6 +1762,7 @@ static void descset_resolve(DescSet *d, u32 i) {
     }
     if (im) image_upload(im);
     d->res[i] = 1;
+    d->gen++;
     if (d->kind == DS_TEX) {
         d->img[i] = tex_write(d->set, i, im, &v);
         d->intv[i] = d->img[i] && tex_is_int(d->img[i], &v);
@@ -1779,10 +1781,20 @@ static void descset_resolve(DescSet *d, u32 i) {
 
 static void descset_use(DescSet *d, const u64 *tex, u32 n) {
     if (!d) return;
+    /* draws mostly use the textures the last one did: in the same frame, with the same entries and images, the
+     * images are already touched (n <= 32; one record per handle array: each stage's textures and images) */
+    static struct { const u64 *tex; const DescSet *d; u64 gen, frame, epoch; u64 h[32]; } seen[8];
+    int e = 0;
+    while (e < 8 && seen[e].tex && seen[e].tex != tex) e++;
+    if (e == 8) e = (int)(((uintptr_t)tex >> 4) & 7);
+    if (seen[e].tex == tex && seen[e].d == d && seen[e].gen == d->gen && seen[e].frame == frame_no &&
+        seen[e].epoch == image_epoch && n <= 32 && !memcmp(seen[e].h, tex, n * sizeof *tex))
+        return;
     for (int pass = 0; pass < 4; pass++) {
         if (d->epoch != image_epoch) {          /* images were destroyed: the pointers may be stale */
             memset(d->res, 0, d->count);
             d->epoch = image_epoch;
+            d->gen++;
         }
         for (u32 k = 0; k < n; k++) {
             u32 h = (u32)tex[k], id = h & 0xfffff;
@@ -1793,7 +1805,15 @@ static void descset_use(DescSet *d, const u64 *tex, u32 n) {
             image_touch(im);
             if (d->kind == DS_IMG) im->gpu_written = true;      /* shaders may store into it */
         }
-        if (d->epoch == image_epoch) return;   /* else resolving destroyed an image (a container took it over) */
+        if (d->epoch == image_epoch) break;    /* else resolving destroyed an image (a container took it over) */
+    }
+    if (n <= 32) {
+        seen[e].tex = tex;
+        seen[e].d = d;
+        seen[e].gen = d->gen;
+        seen[e].frame = frame_no;
+        seen[e].epoch = image_epoch;
+        memcpy(seen[e].h, tex, n * sizeof *tex);
     }
 }
 
@@ -1810,7 +1830,7 @@ static void descset_sync(DescSet *d) {
         u32 want = magic == (d->kind == DS_SMP ? SDESC_MAGIC : TDESC_MAGIC) ? x : ~0u;
         if (want == d->idx[i]) continue;
         d->idx[i] = want;
-        if (d->kind != DS_SMP) { d->res[i] = 0; continue; }
+        if (d->kind != DS_SMP) { d->res[i] = 0; d->gen++; continue; }
         if (want == ~0u) continue;
         memset(&infos[n], 0, sizeof infos[n]);
         infos[n].sampler = sampler_get(want);
@@ -2571,7 +2591,11 @@ static void set_vertex_input(VkCommandBuffer c) {
     }
     if (all || memcmp(bufs, rec.bufs, sizeof bufs) || memcmp(offs, rec.offs, sizeof offs) ||
         memcmp(sizes, rec.sizes, sizeof sizes)) {
-        vkCmdBindVertexBuffers2(c, 0, 32, bufs, offs, sizes, NULL);
+        u32 top = 0;                    /* streams 0..top-1 in use, and 31: the zero source */
+        for (u32 s = 0; s < 31; s++)
+            if (used[s]) top = s + 1;
+        if (top) vkCmdBindVertexBuffers2(c, 0, top, bufs, offs, sizes, NULL);
+        vkCmdBindVertexBuffers2(c, 31, 1, &bufs[31], &offs[31], &sizes[31], NULL);
         memcpy(rec.bufs, bufs, sizeof bufs);
         memcpy(rec.offs, offs, sizeof offs);
         memcpy(rec.sizes, sizes, sizeof sizes);
