@@ -26,6 +26,7 @@ static bool gpu_ready;
 static struct {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror;
     int gpu_skip, flush_draws;
+    double hitch_ms;
     long trace_lo, trace_hi;
     u64 watch, dump_draws, dump_ssbo, dump_tex;
     const char *skip_shaders, *trace_ubo, *trace_fubo, *trace_filter;
@@ -201,6 +202,13 @@ static void prof_report(u64 frames) {
 /* the render thread's time per frame in our code, for the report every 600 frames */
 static double t_submit_ms, t_present_ms, t_wait_ms;
 
+/* NX_HITCH_MS=<ms>: each frame longer than that (present to present) is logged with where the render thread's time
+ * went in it (gpu_present), to tell which work makes the frame-time spikes */
+static struct {
+    double submit, present, wait, shader, jit, pipe, image, upload, slot, mirror;
+    u32 nshader, njit, npipe, nimage, nupload;
+} hf;
+
 static double ms_now(void) {
     LARGE_INTEGER c, f;
     QueryPerformanceCounter(&c);
@@ -222,8 +230,9 @@ static void slot_open(void) {
     if (s->value) {
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                   .pSemaphores = &timeline, .pValues = &s->value};
-        double t0 = prof_on ? ms_now() : 0;
+        double t0 = ms_now();
         VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+        hf.slot += ms_now() - t0;
         if (prof_on) prof_slot_wait_ms += ms_now() - t0;
     }
     if (prof_on) {
@@ -818,7 +827,7 @@ static Image *image_get(const TexInfo *t) {
     return im;
 }
 
-static Image *image_create(const TexInfo *t, u32 h) {
+static Image *image_make(const TexInfo *t, u32 h) {
     VkFormat fmt = usable_format(t->format);
     if (fmt == VK_FORMAT_UNDEFINED) {
         static u32 warned[8];
@@ -910,6 +919,14 @@ static Image *image_create(const TexInfo *t, u32 h) {
     if (++nimages % 500 == 0) hlog(1, "gpu: %d images", nimages);
     hlog(2, "gpu: image %ux%ux%u fmt %u target %u levels %u at %llx", t->width, t->height, t->depth, t->format,
          t->target, t->levels, t->addr);
+    return im;
+}
+
+static Image *image_create(const TexInfo *t, u32 h) {
+    double t0 = ms_now();
+    Image *im = image_make(t, h);
+    hf.image += ms_now() - t0;
+    hf.nimage++;
     return im;
 }
 
@@ -1039,8 +1056,7 @@ static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
     barrier();
 }
 
-static void image_upload(Image *im) {
-    if (im->valid) return;
+static void image_upload_do(Image *im) {
     im->valid = true;
     TexLayout L;
     tex_layout(&im->info, &L);
@@ -1086,6 +1102,14 @@ static void image_upload(Image *im) {
     end_rendering();
     vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
     barrier();
+}
+
+static void image_upload(Image *im) {
+    if (im->valid) return;
+    double t0 = ms_now();
+    image_upload_do(im);
+    hf.upload += ms_now() - t0;
+    hf.nupload++;
 }
 
 /* ---------------------------------------------------------------------------------------------- state */
@@ -2113,9 +2137,7 @@ void gpu_shader_created(ShaderCode *s) {
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) s->jit_seq = jit_request(s->hash);
 }
 
-static VkShaderModule shader_module(ShaderCode *s) {
-    if (s->module) return s->module;
-    if (s->missing) return NULL;
+static VkShaderModule shader_load(ShaderCode *s) {
     char path[MAX_PATH + 32];
     spv_path(path, sizeof path, s->hash);
     FILE *f = fopen(path, "rb");
@@ -2125,6 +2147,8 @@ static VkShaderModule shader_module(ShaderCode *s) {
             u64 t0 = GetTickCount64();
             while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
             hlog(1, "gpu: waited %llu ms for shader %016llx", GetTickCount64() - t0, s->hash);
+            hf.jit += (double)(GetTickCount64() - t0);
+            hf.njit++;
             f = fopen(path, "rb");
         }
         if (!f) {
@@ -2180,6 +2204,16 @@ static VkShaderModule shader_module(ShaderCode *s) {
     return m;
 }
 
+static VkShaderModule shader_module(ShaderCode *s) {
+    if (s->module) return s->module;
+    if (s->missing) return NULL;
+    double t0 = ms_now();
+    VkShaderModule m = shader_load(s);
+    hf.shader += ms_now() - t0;
+    hf.nshader++;
+    return m;
+}
+
 /* A vertex shader fed integer vertex formats (8/16-bit UINT/SINT; 32-bit ones are fetched as float, which keeps
  * the bits) needs those inputs declared uvec4 / ivec4: a variant translated with that mask (translate.py
  * <hash>:<mask>, 2 bits per location: 1 unsigned, 2 signed), loaded or translated on first use */
@@ -2197,6 +2231,7 @@ static VkShaderModule shader_variant(ShaderCode *s, u32 mask) {
     v->mask = mask;
     v->next = *b;
     *b = v;
+    double t0 = ms_now();
     char path[MAX_PATH + 48];
     spv_path(path, sizeof path, s->hash);
     snprintf(path + strlen(path) - 4, 16, "_%08x.spv", mask);
@@ -2204,7 +2239,10 @@ static VkShaderModule shader_variant(ShaderCode *s, u32 mask) {
     if (!f) {
         u64 seq = jit_request_variant(s->hash, mask);
         if (seq) {
+            double tj = ms_now();
             while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
+            hf.jit += ms_now() - tj;
+            hf.njit++;
             f = fopen(path, "rb");
         }
     }
@@ -2220,6 +2258,8 @@ static VkShaderModule shader_variant(ShaderCode *s, u32 mask) {
         free(code);
     }
     v->missing = !v->m;
+    hf.shader += ms_now() - t0;
+    hf.nshader++;
     hlog(1, "gpu: shader %016llx with integer inputs %08x%s", s->hash, mask,
          v->missing ? ": no translation, using the float one" : "");
     return v->missing ? base : v->m;
@@ -2325,7 +2365,10 @@ static VkPipeline pipeline_get(const PipeKey *k) {
              !k->depth || dp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "" : "(not renderable)",
              k->stencil, k->samples, k->logic_op);
     }
+    double t0 = ms_now();
     VkResult r = vkCreateGraphicsPipelines(vk.dev, pcache, 1, &ci, NULL, &pipe);
+    hf.pipe += ms_now() - t0;
+    hf.npipe++;
     if (r != VK_SUCCESS) hlog(0, "gpu: vkCreateGraphicsPipelines: %d", r);
     Pipe *p = calloc(1, sizeof *p);
     p->key = *k;
@@ -3207,7 +3250,11 @@ static void dispatch(u32 op, const u8 *pay) {
                       vk.warp32 & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp32 : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                       .module = m, .pName = "main"}, .layout = layout_gfx};
         if (env.pipe_log) hlog(0, "gpu: compute pipeline: cs %016llx", cs->hash);
-        if (vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, &cp->pipe) != VK_SUCCESS)
+        double t0 = ms_now();
+        VkResult r = vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, &cp->pipe);
+        hf.pipe += ms_now() - t0;
+        hf.npipe++;
+        if (r != VK_SUCCESS)
             hlog(0, "gpu: compute pipeline for %016llx failed", cs->hash);
         else if (env.pipe_log) hlog(0, "gpu: compute pipeline %p: cs %016llx", (void *)cp->pipe, cs->hash);
         cp->next = cpipes;
@@ -3526,6 +3573,7 @@ void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     static u64 submits;
     if (++submits == 1) hlog(1, "gpu: first submission");
     t_submit_ms += ms_now() - t0;
+    hf.submit += ms_now() - t0;
     LeaveCriticalSection(&gpu_cs);
 }
 
@@ -3563,6 +3611,7 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     double tw = ms_now();
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
     t_wait_ms += ms_now() - tw;
+    hf.wait += ms_now() - tw;
     if (prof_on > 0) {
         double ms = ms_now() - t0;
         u32 k = back == 0 ? 0 : back == 1 ? 1 : back < 10 ? 2 : 3;
@@ -4020,6 +4069,7 @@ static bool mirror_sync(VkCommandBuffer pre) {
         VKCHECK(vkEndCommandBuffer(pre));
     }
     mirror_ms += ms_now() - t0;
+    hf.mirror += ms_now() - t0;
     return begun;
 }
 
@@ -4112,7 +4162,20 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     /* lower-left origin: row 0 is the bottom of the picture */
     u64 v = submitted;
     vk_present(im ? im->image : NULL, w->crop[0], w->crop[1], cw, ch, window_origin == 0, timeline, v);
-    t_present_ms += ms_now() - t_present0;
+    double t_end = ms_now();
+    t_present_ms += t_end - t_present0;
+    hf.present += t_end - t_present0;
+    static double last_end;
+    double frame = last_end ? t_end - last_end : 0;
+    if (env.hitch_ms > 0 && frame > env.hitch_ms)
+        hlog(0, "gpu: slow frame %llu: %.1f ms = translating %.1f + presenting %.1f + waiting for the GPU %.1f + the rest "
+                "(game code, waits for a core) %.1f; in them: shaders %.1f ms (%u), JIT waits %.1f ms (%u), pipelines "
+                "%.1f ms (%u), images %.1f ms (%u), uploads %.1f ms (%u), slot waits %.1f ms, pool mirrors %.1f ms",
+             frames, frame, hf.submit, hf.present, hf.wait, frame - hf.submit - hf.present - hf.wait, hf.shader,
+             hf.nshader, hf.jit, hf.njit, hf.pipe, hf.npipe, hf.image, hf.nimage, hf.upload, hf.nupload, hf.slot,
+             hf.mirror);
+    memset(&hf, 0, sizeof hf);
+    last_end = t_end;
     LeaveCriticalSection(&gpu_cs);
     return v;
 }
@@ -4133,6 +4196,7 @@ static void env_init(void) {
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
+    env.hitch_ms = (e = getenv("NX_HITCH_MS")) ? atof(e) : 0;
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;
     env.trace_hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : env.trace_lo;
