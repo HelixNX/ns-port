@@ -95,7 +95,14 @@ static u32 recip_estimate(u32 a) {           /* a in 256..511 */
     u32 b = (1u << 19) / a;
     return (b + 1) / 2;
 }
-static u32 rsqrt_estimate(u32 a) {           /* a in 128..511 */
+static u32 rsqrt_estimate_slow(u32 a);
+static u32 rsqrt_estimate(u32 a) {           /* a in 128..511; the search below is slow (hot in Violet's threads) */
+    static volatile u16 memo[512];           /* 0: not yet (estimates are 256..511); racing fills write the same */
+    u32 e = memo[a & 511];
+    if (!e) memo[a & 511] = (u16)(e = rsqrt_estimate_slow(a));
+    return e;
+}
+static u32 rsqrt_estimate_slow(u32 a) {
     if (a < 256) a = a * 2 + 1;
     else { a = (a >> 1) << 1; a = (a + 1) * 2; }
     u32 b = 512;

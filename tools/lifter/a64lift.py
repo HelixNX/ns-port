@@ -16,9 +16,12 @@ Instruction semantics live in a64insn.py (integer, branches, loads and stores, s
 Usage:
     python a64lift.py cover <module> [...]                 coverage statistics, nothing written
     python a64lift.py lift  <outdir> [--only mod:0xOFF,...] lift every module into <outdir>
+Lifting runs in NX_LIFT_PROCS worker processes (default: by free memory, ~3 GB each, at most 8); 1 lifts in this one.
 Modules are read from <dump>/elf/<module>.elf and <analysis>/<module>_ida.json (game.json).
 """
 import collections
+import concurrent.futures
+import ctypes
 import io
 import json
 import os
@@ -772,8 +775,53 @@ def cmd_cover(names):
             print('  unresolved:', ', '.join(sorted(env.unresolved)[:20]))
 
 
+# ----------------------------------------------------------------------------- parallel lifting
+# Functions lift independently (Env only collects names), so workers lift chunks of them in their own Program
+# (~2.6 GB each for Violet) and the files are put together here in the same order: the output is the same.
+LIFT_CHUNK = 1000
+_worker_prog = None
+
+
+def lift_procs():
+    if os.environ.get('NX_LIFT_PROCS'):
+        return max(1, int(os.environ['NX_LIFT_PROCS']))
+    avail_gb = 8.0
+    if os.name == 'nt':
+        class MemStatus(ctypes.Structure):
+            _fields_ = [('len', ctypes.c_uint32), ('load', ctypes.c_uint32), ('total', ctypes.c_uint64),
+                        ('avail', ctypes.c_uint64), ('pf_total', ctypes.c_uint64), ('pf_avail', ctypes.c_uint64),
+                        ('virt_total', ctypes.c_uint64), ('virt_avail', ctypes.c_uint64), ('ext', ctypes.c_uint64)]
+        ms = MemStatus(len=ctypes.sizeof(MemStatus))
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            avail_gb = ms.avail / 2**30
+    return max(1, min(8, os.cpu_count() or 1, int((avail_gb - 4) / 3)))   # 4 GB: this process and its results
+
+
+def _lift_worker_init(overrides):
+    global _worker_prog
+    _worker_prog = Program(overrides=overrides)
+
+
+def _lift_chunk(job, prog=None):
+    """Lift functions of one module: their sources, and what their Env and statistics collected."""
+    n, offs, sec = job
+    prog = prog or _worker_prog
+    if not hasattr(prog.mods[n], 'sec_entries'):
+        secondary_entries(prog.mods[n])     # sets mod.sec_entries, which env_is_entry reads
+    env = Env(prog, prog.mods[n])
+    stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
+    srcs = [lift_function(env, off, sec.get(off, ()), stats) for off in offs]
+    return srcs, env.extra, env.ext_callees, env.unresolved, stats
+
+
 def cmd_lift(outdir, only=None, per_file=40000):
-    prog = Program(overrides=load_overrides())
+    overrides = load_overrides()
+    prog = Program(overrides=overrides)
+    procs = 1 if only else lift_procs()
+    pool = None
+    if procs > 1:
+        print('lifting in %d processes' % procs)
+        pool = concurrent.futures.ProcessPoolExecutor(procs, initializer=_lift_worker_init, initargs=(overrides,))
     os.makedirs(outdir, exist_ok=True)
     stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
     all_entries = {}
@@ -799,14 +847,24 @@ def cmd_lift(outdir, only=None, per_file=40000):
                 files.append(path)
                 buf, count = [], 0
 
-        for off in todo:
-            src = lift_function(env, off, sec.get(off, ()), stats)
-            done.add(mod.base + off)
-            done.update(mod.base + e for e in sec.get(off, ()))
-            buf.append(src)
-            count += src.count('\n') + 1
-            if count >= per_file:
-                flush()
+        jobs = [(n, todo[i:i + LIFT_CHUNK], {o: sec[o] for o in todo[i:i + LIFT_CHUNK] if o in sec})
+                for i in range(0, len(todo), LIFT_CHUNK)]
+        results = pool.map(_lift_chunk, jobs) if pool else (_lift_chunk(j, prog) for j in jobs)
+        for job, (srcs, extra, callees, unres, st) in zip(jobs, results):
+            env.extra |= extra
+            env.ext_callees |= callees
+            env.unresolved.update(unres)
+            stats['ok'] += st['ok']
+            stats['bad'].update(st['bad'])
+            for k, v in st['example'].items():
+                stats['example'].setdefault(k, v)
+            for off, src in zip(job[1], srcs):
+                done.add(mod.base + off)
+                done.update(mod.base + e for e in sec.get(off, ()))
+                buf.append(src)
+                count += src.count('\n') + 1
+                if count >= per_file:
+                    flush()
         # branch targets in no function, and anything the pre-pass missed: trap if ever entered
         for a in sorted(({mod.base + o for o in orphans} | env.extra) - done):
             buf.append('void f_%x(Ctx *c) { guest_trap(c, "entry outside every function", 0x%xull); }' % (a, a))
@@ -821,6 +879,8 @@ def cmd_lift(outdir, only=None, per_file=40000):
         if env.unresolved:
             print('%s: %d unresolved imports, e.g. %s' % (n, len(env.unresolved), ', '.join(sorted(env.unresolved)[:8])))
         print('%s: %d files, %d functions' % (n, len(files), len(done)))
+    if pool:
+        pool.shutdown()
     defined = {'f_%x' % e for es in all_entries.values() for e in es}
     with Out(os.path.join(outdir, 'funcs.h')) as f:
         f.write('/* generated by a64lift.py */\n#pragma once\n')

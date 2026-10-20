@@ -286,12 +286,64 @@ void thread_set_core(KThread *t, s32 core, u64 mask) {
 }
 
 /* ---------------------------------------------------------------------------------------------- waiting */
+/* NX_PROFILE's thread: time it spends blocked, by wait kind and guest call chain (its frame records: x30, then the
+ * return addresses through x29), reported with the CPU statistics (who it waits for, and from where) */
+#define WAITPROF_CHAIN 5
+typedef struct { int kind; u64 chain[WAITPROF_CHAIN]; double ms; u64 n; } WaitProf;
+static WaitProf waitprof[512];
+static int nwaitprof;
+static const KThread *waitprof_thread;
+
+static void waitprof_add(const KThread *t, int kind, double ms) {
+    WaitProf w = {kind};
+    const Ctx *c = t->ctx;
+    w.chain[0] = c->x[30];
+    u64 fp = c->x[29];
+    for (int i = 1; i < WAITPROF_CHAIN; i++) {
+        if (!fp || fp & 15 || fp < c->x[31] || fp + 16 > t->stack_top) break;
+        w.chain[i] = *(const u64 *)(uintptr_t)(fp + 8);
+        fp = *(const u64 *)(uintptr_t)fp;
+    }
+    for (int i = 0; i < nwaitprof; i++)
+        if (waitprof[i].kind == w.kind && !memcmp(waitprof[i].chain, w.chain, sizeof w.chain)) {
+            waitprof[i].ms += ms;
+            waitprof[i].n++;
+            return;
+        }
+    if (nwaitprof < 512) { w.ms = ms; w.n = 1; waitprof[nwaitprof++] = w; }
+}
+
+static int waitprof_cmp(const void *a, const void *b) {
+    double d = ((const WaitProf *)b)->ms - ((const WaitProf *)a)->ms;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+static void waitprof_report(double wall) {
+    if (!waitprof_thread || !nwaitprof || wall <= 0) return;
+    static const char *kinds[] = {"none", "sync", "mutex", "condvar", "arbiter", "sleep"};
+    qsort(waitprof, nwaitprof, sizeof *waitprof, waitprof_cmp);
+    hlog(0, "profile: %s blocked, by guest call chain (%% of wall time):", waitprof_thread->name);
+    for (int i = 0; i < nwaitprof && i < 12; i++) {
+        const WaitProf *w = &waitprof[i];
+        char line[1024], b[160];
+        int n = snprintf(line, sizeof line, "  %5.1f%% %6.1f/s %-7s", w->ms / 10.0 / wall, w->n / wall,
+                         kinds[w->kind >= 0 && w->kind < 6 ? w->kind : 0]);
+        for (int k = 0; k < WAITPROF_CHAIN && w->chain[k] && n < (int)sizeof line - 170; k++)
+            n += snprintf(line + n, sizeof line - n, " < %s", describe_addr(w->chain[k], b, sizeof b));
+        hlog(0, "profile: %s", line);
+    }
+    nwaitprof = 0;
+}
+
 /* Sleep until end_wait (klock held on entry and exit), without the core. Returns the wait result, or R_TIMED_OUT
  * if the deadline passed first; the caller then takes the thread off whatever it waits on. */
 static u32 block(KThread *t, s64 timeout_ns) {
     ULONGLONG deadline = 0;
     if (timeout_ns > 0) deadline = GetTickCount64() + (ULONGLONG)((timeout_ns + 999999) / 1000000);
     core_release(t);
+    LARGE_INTEGER q0, q1, qf;
+    int kind = t->wait;                 /* end_wait clears it */
+    if (t == waitprof_thread) QueryPerformanceCounter(&q0);
     u32 r;
     for (;;) {
         if (t->woken) { r = t->wait_result; break; }
@@ -307,6 +359,11 @@ static u32 block(KThread *t, s64 timeout_ns) {
             ms = (DWORD)(deadline - now);
         }
         SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, ms, 0);
+    }
+    if (t == waitprof_thread) {
+        QueryPerformanceCounter(&q1);
+        QueryPerformanceFrequency(&qf);
+        waitprof_add(t, kind, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
     }
     core_acquire(t);
     return r;
@@ -721,7 +778,8 @@ void kernel_report_cpu(u64 frames) {
     }
     const char *pn = getenv("NX_PROFILE");                /* NX_PROFILE: dispatch.c */
     for (KThread *t = threads; pn && t; t = t->next)
-        if (!strcmp(t->name, pn) && t->host) profile_start(t->host);
+        if (!strcmp(t->name, pn) && t->host) { profile_start(t->host); waitprof_thread = t; }
+    waitprof_report(wall);                              /* its table is written under klock */
     ReleaseSRWLockShared(&klk);
     profile_report();
     if (wall > 0) {
