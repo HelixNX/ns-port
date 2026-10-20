@@ -35,9 +35,10 @@ void h_fps_speed_base(Ctx *c) {
     c->x[8] = nx_flag_fps ? NS_30 : *(u64 *)(uintptr_t)(c->x[8] + (c->x[20] << 3));
 }
 
-/* main+b92784: a timer's step, the frame duration, kept at 30 fps in scene kind 2 */
+/* main+b92784: a timer's step (animations follow it), the frame duration in scene kind 2 and 33.3 ms in the
+ * others; fixed only in kind 2 had animations run with the frame rate (2026-10-19) */
 void h_fps_timer_step(Ctx *c) {
-    c->x[1] = nx_flag_fps && scene_kind == 2 ? NS_30 : *(u64 *)(uintptr_t)(c->x[8] + 8);
+    c->x[1] = nx_flag_fps && scene_kind != 2 ? NS_30 : *(u64 *)(uintptr_t)(c->x[8] + 8);
 }
 
 /* main+2936584 */
