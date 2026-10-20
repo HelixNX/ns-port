@@ -154,6 +154,7 @@ typedef struct Window {
     u32 count, interval, next;
     s32 crop[4];
     s64 last;
+    u64 presented[8];               /* per texture: the timeline value its last present waited for */
 } Window;
 typedef struct Sync { u64 value; bool fenced; } Sync;  /* value: the queue timeline value that signals it */
 
@@ -214,8 +215,9 @@ void gpu_flush(u64 queue);
 void gpu_finish(u64 queue);
 u64 gpu_fence(u64 queue);                               /* a timeline value signalled after the work so far */
 bool gpu_wait(u64 value, u64 timeout_ns);               /* true once reached */
+extern __declspec(thread) u64 gpu_wait_site;           /* NX_GPU_PROF: the guest caller of a wait (+1: Finish) */
 u64 gpu_completed(void);
-void gpu_present(u64 queue, Window *w, u32 index);
+u64 gpu_present(u64 queue, Window *w, u32 index);    /* the timeline value the present waits for */
 void gpu_pool_created(Pool *p);
 void gpu_pool_destroyed(Pool *p);
 void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *r, const void *data,

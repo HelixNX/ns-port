@@ -79,7 +79,11 @@ DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 #undef DEF_MEM
 static inline v128 LDQ(u64 a) { v128 v; memcpy(&v, (const void *)(uintptr_t)a, 16); return v; }
 static inline void STQ(u64 a, v128 v) { memcpy((void *)(uintptr_t)a, &v, 16); }
-#define FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+/* DMB/DSB. A full barrier: a locked no-op on the stack, the same ordering for normal memory as MFENCE at a fraction
+ * of the cost on Zen. Load-only and store-only barriers (ISHLD, ISHST, ...) need no instruction under x86's ordering:
+ * they only keep the compiler from moving memory accesses across */
+#define FENCE() __asm__ volatile("lock orl $0, (%%rsp)" ::: "memory", "cc")
+#define FENCE_ORDER() __atomic_signal_fence(__ATOMIC_SEQ_CST)
 
 /* STXR: store only if the monitor still covers this address and memory still holds what LDXR read.
  * Returns the status register value (0 = success). */

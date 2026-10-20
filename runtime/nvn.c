@@ -298,7 +298,7 @@ static void queue_submit(Ctx *c) {
     core_enter();
 }
 static void queue_flush(Ctx *c) { gpu_flush(A(0)); }
-static void queue_finish(Ctx *c) { gpu_finish(A(0)); }
+static void queue_finish(Ctx *c) { gpu_wait_site = c->x[30] + 1; gpu_finish(A(0)); }
 
 /* ---------------------------------------------------------------------------------------------- sync */
 static void sync_initialize(Ctx *c) { obj_new(A(0), T_SYNC, sizeof(Sync)); RET(1); }
@@ -315,6 +315,7 @@ static void sync_wait(Ctx *c) {
     Sync *s = obj_get(A(0), T_SYNC);
     if (!s || !s->fenced || gpu_completed() >= s->value) { RET(0); return; }
     core_leave();
+    gpu_wait_site = c->x[30];
     bool ok = gpu_wait(s->value, A(1));
     core_enter();
     RET(ok ? 1 : 2);
@@ -1452,12 +1453,18 @@ static void win_initialize(Ctx *c) {
     RET(1);
 }
 static void win_finalize(Ctx *c) { obj_free(A(0)); }
-/* acquire the next texture in turn; it is free once the presents before have read it */
+/* acquire the next texture in turn; it is free once its last present has read it, i.e. once the work that present
+ * waited for is done (the copy to the swapchain is queued before any later work). Not all work so far: waiting on
+ * that kept the game from building a frame while the GPU drew the one before */
 static void win_acquire(Ctx *c) {
     Window *w = obj_get(A(0), T_WINDOW);
     Sync *s = obj_get(A(1), T_SYNC);
-    if (s) { s->value = gpu_fence(0); s->fenced = true; }
-    if (!w || !w->count) { RET(1); return; }
+    if (!w || !w->count) {
+        if (s) { s->value = gpu_fence(0); s->fenced = true; }
+        RET(1);
+        return;
+    }
+    if (s) { s->value = w->presented[w->next]; s->fenced = true; }
     if (A(2)) ST32(A(2), w->next);
     w->next = (w->next + 1) % w->count;
     RET(0);
@@ -1514,7 +1521,7 @@ static void queue_present(Ctx *c) {
     u32 index = (u32)A(2);
     if (index < w->count) {
         core_leave();                           /* as for queue_submit */
-        gpu_present(A(0), w, index);
+        w->presented[index] = gpu_present(A(0), w, index);
         core_enter();
     }
     LARGE_INTEGER f, now;

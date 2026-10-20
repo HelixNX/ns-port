@@ -331,7 +331,7 @@ def branch_sys(fn, w, pc):
     if w & 0xfffff0ff == 0xd503305f:                                  # CLREX
         return 'c->ex_addr = ~0ull;'
     if w & 0xfffff09f == 0xd503309f:                                  # DSB, DMB
-        return 'FENCE();'
+        return 'FENCE();' if bits(w, 9, 8) == 3 else 'FENCE_ORDER();'   # CRm<1:0>: 1 loads only, 2 stores only
     if w & 0xfffff0ff == 0xd50330df:                                  # ISB
         return ';'
     if w & 0xfff00000 in (0xd5300000, 0xd5100000):                   # MRS, MSR (register)

@@ -138,6 +138,7 @@ typedef struct KThread {
     u64 wait_addr, cv_key;
     u32 tag;
     KObj *wake_obj;
+    s64 wake_qpc;                   /* when its wait was ended (NX_PROFILE's thread only) */
     void *cv;                       /* CONDITION_VARIABLE */
     struct KThread *next;           /* all threads */
     char name[32];

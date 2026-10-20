@@ -22,13 +22,41 @@
 #include <process.h>
 
 static SRWLOCK klk = SRWLOCK_INIT;
+
+/* Threads to wake are woken once klk is released: woken under it, a thread only wakes to wait for klk. A spurious
+ * or late wake is harmless (every sleeper re-checks what it waits for under klk). */
+#define MAX_WAKES 64
+static __declspec(thread) CONDITION_VARIABLE *wakes[MAX_WAKES];
+static __declspec(thread) int nwakes;
+
+static void wake_later(KThread *t) {
+    if (nwakes < MAX_WAKES) wakes[nwakes++] = (CONDITION_VARIABLE *)t->cv;
+    else WakeConditionVariable((CONDITION_VARIABLE *)t->cv);
+}
+
+static void wake_flush(void) {
+    for (int i = 0; i < nwakes; i++) WakeConditionVariable(wakes[i]);
+    nwakes = 0;
+}
+
 void klock(void) { AcquireSRWLockExclusive(&klk); }
-void kunlock(void) { ReleaseSRWLockExclusive(&klk); }
+void kunlock(void) {
+    ReleaseSRWLockExclusive(&klk);
+    wake_flush();
+}
+
+/* sleep on t's condition variable, klk released meanwhile; the wakes queued so far go first (still under klk,
+ * but it is released right after) */
+static void ksleep(KThread *t, DWORD ms) {
+    wake_flush();
+    SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, ms, 0);
+}
 
 __declspec(thread) KThread *cur_thread;
 static KThread *threads;            /* all threads, under klock */
 static u64 next_thread_id = 0x50;   /* thread ids as the guest sees them */
 static u64 wait_seq;
+static const KThread *waitprof_thread;    /* NX_PROFILE's thread (see waitprof_add) */
 
 /* ---------------------------------------------------------------------------------------------- objects */
 void kobj_init(KObj *o, KType type, void (*destroy)(KObj *), bool (*signaled)(KObj *)) {
@@ -68,7 +96,12 @@ static void end_wait(KThread *t, u32 result) {
     t->woken = true;
     t->wait_result = result;
     t->wait = W_NONE;
-    WakeConditionVariable((CONDITION_VARIABLE *)t->cv);
+    if (t == waitprof_thread) {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        t->wake_qpc = q.QuadPart;
+    }
+    wake_later(t);
 }
 
 void kobj_notify(KObj *o) {
@@ -148,7 +181,7 @@ static void core_assign(KThread *t, int c) {
         t->preempted = false;
         ResumeThread((HANDLE)t->host);
     } else {
-        WakeConditionVariable((CONDITION_VARIABLE *)t->cv);
+        wake_later(t);
     }
 }
 
@@ -227,7 +260,7 @@ static void core_acquire(KThread *t) {
     for (;;) {
         int r = core_try_place(t);
         if (r == 1 || t->cur_core >= 0) break;
-        SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, r < 0 ? 1 : INFINITE, 0);
+        ksleep(t, r < 0 ? 1 : INFINITE);
         if (t->cur_core >= 0) break;
     }
     QueryPerformanceCounter(&q1);
@@ -287,15 +320,17 @@ void thread_set_core(KThread *t, s32 core, u64 mask) {
 
 /* ---------------------------------------------------------------------------------------------- waiting */
 /* NX_PROFILE's thread: time it spends blocked, by wait kind and guest call chain (its frame records: x30, then the
- * return addresses through x29), reported with the CPU statistics (who it waits for, and from where) */
+ * return addresses through x29), reported with the CPU statistics (who it waits for, and from where); and for the
+ * waits something ended, how long from that to the thread holding klk again (the host's wake-up) and to it owning
+ * a core */
 #define WAITPROF_CHAIN 5
-typedef struct { int kind; u64 chain[WAITPROF_CHAIN]; double ms; u64 n; } WaitProf;
+typedef struct { int kind; u64 chain[WAITPROF_CHAIN]; double ms, wake_us, core_us; u64 n, nwoken; } WaitProf;
 static WaitProf waitprof[512];
 static int nwaitprof;
-static const KThread *waitprof_thread;
 
-static void waitprof_add(const KThread *t, int kind, double ms) {
+static void waitprof_add(const KThread *t, int kind, double ms, double wake_us, double core_us) {
     WaitProf w = {kind};
+    bool woken = wake_us >= 0;
     const Ctx *c = t->ctx;
     w.chain[0] = c->x[30];
     u64 fp = c->x[29];
@@ -308,9 +343,15 @@ static void waitprof_add(const KThread *t, int kind, double ms) {
         if (waitprof[i].kind == w.kind && !memcmp(waitprof[i].chain, w.chain, sizeof w.chain)) {
             waitprof[i].ms += ms;
             waitprof[i].n++;
+            if (woken) { waitprof[i].wake_us += wake_us; waitprof[i].core_us += core_us; waitprof[i].nwoken++; }
             return;
         }
-    if (nwaitprof < 512) { w.ms = ms; w.n = 1; waitprof[nwaitprof++] = w; }
+    if (nwaitprof < 512) {
+        w.ms = ms;
+        w.n = 1;
+        if (woken) { w.wake_us = wake_us; w.core_us = core_us; w.nwoken = 1; }
+        waitprof[nwaitprof++] = w;
+    }
 }
 
 static int waitprof_cmp(const void *a, const void *b) {
@@ -322,12 +363,14 @@ static void waitprof_report(double wall) {
     if (!waitprof_thread || !nwaitprof || wall <= 0) return;
     static const char *kinds[] = {"none", "sync", "mutex", "condvar", "arbiter", "sleep"};
     qsort(waitprof, nwaitprof, sizeof *waitprof, waitprof_cmp);
-    hlog(0, "profile: %s blocked, by guest call chain (%% of wall time):", waitprof_thread->name);
+    hlog(0, "profile: %s blocked, by guest call chain (%% of wall time; waits/s; after a wake: us to klk, us to a core):",
+         waitprof_thread->name);
     for (int i = 0; i < nwaitprof && i < 12; i++) {
         const WaitProf *w = &waitprof[i];
         char line[1024], b[160];
-        int n = snprintf(line, sizeof line, "  %5.1f%% %6.1f/s %-7s", w->ms / 10.0 / wall, w->n / wall,
-                         kinds[w->kind >= 0 && w->kind < 6 ? w->kind : 0]);
+        double nw = w->nwoken ? (double)w->nwoken : 1;
+        int n = snprintf(line, sizeof line, "  %5.1f%% %6.1f/s %6.1f %6.1f %-7s", w->ms / 10.0 / wall, w->n / wall,
+                         w->wake_us / nw, w->core_us / nw, kinds[w->kind >= 0 && w->kind < 6 ? w->kind : 0]);
         for (int k = 0; k < WAITPROF_CHAIN && w->chain[k] && n < (int)sizeof line - 170; k++)
             n += snprintf(line + n, sizeof line - n, " < %s", describe_addr(w->chain[k], b, sizeof b));
         hlog(0, "profile: %s", line);
@@ -358,14 +401,22 @@ static u32 block(KThread *t, s64 timeout_ns) {
             }
             ms = (DWORD)(deadline - now);
         }
-        SleepConditionVariableSRW((CONDITION_VARIABLE *)t->cv, &klk, ms, 0);
+        ksleep(t, ms);
     }
     if (t == waitprof_thread) {
         QueryPerformanceCounter(&q1);
         QueryPerformanceFrequency(&qf);
-        waitprof_add(t, kind, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
     }
     core_acquire(t);
+    if (t == waitprof_thread) {
+        LARGE_INTEGER q2;
+        QueryPerformanceCounter(&q2);
+        double us = 1e6 / (double)qf.QuadPart;
+        bool ended = r != R_TIMED_OUT && t->wake_qpc;
+        waitprof_add(t, kind, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart,
+                     ended ? (double)(q1.QuadPart - t->wake_qpc) * us : -1, (double)(q2.QuadPart - q1.QuadPart) * us);
+        t->wake_qpc = 0;
+    }
     return r;
 }
 
