@@ -312,7 +312,20 @@ of work; online code paths must fail as on a console with no internet, not crash
     no frame time; NX_GPU_PROF's 1.9 ms for it is the drain after the barrier before each capture).
   - Uncapped runs crashed in h_fps_speed_base (the frame duration's page set back to read-only raced another
     thread's write); the page now stays writable. Sticks are clamped to the unit circle (WASD diagonals were 1.41x).
-  - Next: the CPU side (render thread ~60% of a core, main and 5a 40-50%): `NX_PROFILE='main'`.
+  - Animations ran with the frame rate: the timer at `main+b92784` (fps.c h_fps_timer_step) was fixed at 33.3 ms
+    in scene kind 2 only; the Dynamic FPS patch fixes it in every kind except 2, and with that animations play at
+    normal speed at 120 fps (user-checked 2026-10-19). Tried and not needed: its `2b7a874` patch (`add w1, w20,
+    #1` -> 1: whole ticks per animation update; `2b7a7f0` turns the frame duration into a level 0-3, `2b7c540`
+    is the distance LOD). One room looked jittery with that patch; not checked with the timer fix alone.
+  - CPU side (2026-10-19): FRSQRTE's estimate searched up to ~500 steps per instruction (a64rt.c, now memoised:
+    was 2.5-6.5% of main and 5a). NX_PROFILE now also reports the profiled thread's blocked time by wait kind and
+    guest call chain: main and 5a spend 44-47% waiting at `main+b47d18` (a condvar in the job system's thread
+    loop, ~3,000 waits a second), 5a another 20% at `main+d64f14`. Next: our kernel's wake-up latency (signal ->
+    woken thread running) on those waits.
+  - Lift and build: a64lift lifts in worker processes (NX_LIFT_PROCS; default by free memory, ~3 GB each: 129 ->
+    59 s here, output identical); LIFT_JOBS=0 (default) = min(logical cores, RAM / 2 GB) compiles: a full build
+    ~6 -> 4.4 min on this machine (16 threads, 31 GB). Changing a64lift.py invalidates build/modcache (it is keyed
+    on the file's mtime): the next lift re-runs the analysis.
 - **Second machine set-up (2026-10-18, AMD RX 7800 XT)**: set up from the NSPs alone, analysis with Ghidra
   instead of IDA:
   - `tools/ghidra/` (`ghidra_export.ps1`, `GhidraExport.java`, `GhidraOptions.java`): writes the same
