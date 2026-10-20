@@ -286,8 +286,9 @@ of work; online code paths must fail as on a console with no internet, not crash
   - Found with Fl4sh's Violet 4.0.0 "60 FPS" and "Dynamic FPS (ASM)" pchtxt patches (gamebanana) as a map, in
     `pokemon-violet/mods-ref/` (text only, not in git; the zips are at the workspace root). pchtxt addresses equal
     our main.elf addresses (no 0x100 shift); their build id is ours (709BFD66...). Not ported yet from the
-    dynamic patch: its scaling of a movement value at `cce37c` (stutter when walking) and a removed store at
-    `1526d64`; the purpose of the 60.0 at `170c408` and the 100000.0 at `20a8d3c` is not known.
+    dynamic patch: its scaling of a movement value at `cce37c` (stutter when walking). Its NOP at `1526d64` is
+    housekeeping for its code cave: that `stp` stores the address of the game's function at `1760ec8` (a callback),
+    where the patch writes its own code, so we do not need it. The purpose of the 60.0 at `170c408` and the 100000.0 at `20a8d3c` is not known.
 - **Performance (2026-10-19, RX 7800 XT, Mesagoza at 1080p, uncapped):** ~85 -> 103-120 fps. Uncapped runs:
   `$env:NX_NOPACE='1'` (= `NX_FRAMERATE=0`; presents with IMMEDIATE above 60 when there is no MAILBOX: with FIFO
   a visible window is held to 60).
@@ -321,7 +322,42 @@ of work; online code paths must fail as on a console with no internet, not crash
     was 2.5-6.5% of main and 5a). NX_PROFILE now also reports the profiled thread's blocked time by wait kind and
     guest call chain: main and 5a spend 44-47% waiting at `main+b47d18` (a condvar in the job system's thread
     loop, ~3,000 waits a second), 5a another 20% at `main+d64f14`. Next: our kernel's wake-up latency (signal ->
-    woken thread running) on those waits.
+    woken thread running) on those waits. Measured (NX_PROFILE's table: after a wake, µs to klk and to a core):
+    5.4 µs and 0.2 µs at `main+b47d18` (~1,700/s at 120 fps), ~1% of the thread: the blocked time is idle workers,
+    not wake latency; spinning or host primitives are not worth it (a wait still has to give its emulated core up).
+    Wakes are now sent after klk is released (kernel.c wake_later / ksleep).
+  - GPU-bound (2026-10-19, ~130 fps uncapped): the game keeps one frame in flight. Its render thread (5c) waits
+    (`main+cd0eb4`, nvnSyncWait) for frame N-1's fence (`cd1c54`, fenced right after submitting at `cd1a74`)
+    before submitting frame N, so a frame is ~the GPU's work (~5.7 ms, NX_GPU_PROF) plus the start of translation
+    before the first flush: NX_FLUSH_DRAWS=1000 -> 93 fps (GPU starts late), 60 = 250. NX_GPU_PROF now names the
+    guest callers of GPU waits. nvnWindowAcquireTexture's sync now waits for that texture's last present only (was
+    all work so far; no measurable change). Biggest GPU items: the G-buffer pass (1080p, 4 colour + depth, 2.2 ms,
+    split in 2), 23 passes a frame on one 1080p target (0.96 ms), 9 on another (0.69 ms), ~165 passes a frame.
+    Ruled out (each measured in Mesagoza, uncapped, no change from ~130 fps / ~5.7 ms GPU, then removed): image
+    format lists (DCC), skipping the barrier at every pass end (NX_PASS_BARRIER experiment: also corrupts lighting),
+    CPU_NO_ACCESS pools in video memory (582 MB moved), staging in Resizable-BAR video memory. RGP captures lose
+    the device the moment the trace starts (any trace size, early or late; RDTS 2026-10-02 and the 2025-07-01
+    suite matched to the user's driver, Adrenalin 25.9.2, which they keep for stability: both in `.tools/`);
+    Windows' GPU engine counters show 0% for us (AMD submits past them). Stable clocks (1295 MHz GPU / 750 MHz memory, ~-40%) cost only ~13% (117 fps). With every draw
+    skipped (NX_GPU_SKIP=1) the game runs ~290 fps, translation 0.6 ms (4.0 normally): main 75%, 5a/5b 62-70%,
+    5c waits for a core 11%. Pools (Mesagoza): 3,314 CPU_NO_ACCESS (367 MB), one 350 MB CPU_UNCACHED pool, a
+    268 MB compressible one (render targets), 98 MB CPU/GPU uncached.
+  - CPU side (2026-10-20): the render thread spent ~23% in the AMD driver, from ~40 vkCmdSet / bind calls a draw.
+    draw() now records only state that differs from the last draw in the same command buffer (gpu.c `rec`,
+    DynState): 128-141 -> 150-152 fps uncapped, translation 3.7-4.1 -> 3.3-3.4 ms, 1% lows 8-9.5 ms; validation
+    shows nothing new. DMB/DSB: load- or store-only barriers lift as compiler barriers, full ones as
+    `lock or (%rsp)` instead of MFENCE (a64insn.py, a64rt.h FENCE / FENCE_ORDER): CPU-bound (NX_GPU_SKIP=1)
+    287-296 -> 297-304 fps. The game pins main and the render thread to core 0, workers 5a/5b to cores 1/2
+    (as on the console), so more emulated cores would not help without breaking per-core data. Main's profile is
+    flat (hottest: nn::os::SignalLightEvent, 2.2%). gpu.c's NX_* switches are read once in env_init().
+  - Open, parked (user, 2026-10-19: minor next to frame rate): cutscenes (and maybe the top-of-screen
+    notifications) run fast above 30 fps. Scene kind (`main+2936584`, setter `29364c8`, a vtable method) stays 0 on
+    the title, the new-game screens, the opening and Mesagoza, so it does not mark cutscenes; `b926f0` posts one
+    global step (timer 2, from the main loop at `main+27b04`) that we force to 33.3 ms in kind 0. Likely a cutscene
+    clock uses that step without the speed factor. Not ported from the Dynamic patch yet: `cce37c`. User
+    (2026-10-19): cutscenes look right at 80-90 fps; at 120+ characters sometimes teleport (so it grows with frame
+    rate). Also seen: small cyan-white streaks hanging in the air in Mesagoza (frames/frame_14699.ppm; particles?).
+    A new game for tests: `violetrecomp.exe --save <empty dir>` with `NX_INPUT='300-1000000/60:A'`.
   - Lift and build: a64lift lifts in worker processes (NX_LIFT_PROCS; default by free memory, ~3 GB each: 129 ->
     59 s here, output identical); LIFT_JOBS=0 (default) = min(logical cores, RAM / 2 GB) compiles: a full build
     ~6 -> 4.4 min on this machine (16 threads, 31 GB). Changing a64lift.py invalidates build/modcache (it is keyed
