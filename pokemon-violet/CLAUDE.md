@@ -113,29 +113,68 @@ of collected while playing) and a faster lift/compile (first-run time, now 20-40
 Risks: exceptions (V1) and the size of the build are the unknowns MK8 didn't have; NVN coverage is the largest amount
 of work; online code paths must fail as on a console with no internet, not crash.
 
-## Next (written 2026-10-20)
+## Next (written 2026-10-22)
 
-Where things stand: Mesagoza uncapped ~170-190 fps on the RX 7800 XT (was 128-141 on 2026-10-19), 1% lows ~7 ms;
-a frame is the render thread's translation (~2.5 ms) plus what is left of the GPU's work. GTX 1650 Ti laptop: 23-29
--> 75-78 fps (2026-10-20: pools mirrored in video memory, presents on their own thread); on the RX 7800 XT the
-mirror costs fps (155-205 off vs 137-167 on, in the benchmark save's scene; Status, "Performance", GTX 1650 Ti
-entry). In order:
+Where things stand (2026-10-22, RX 7800 XT + Ryzen 7 7800X3D, stand-still benchmark below): ~170 fps uncapped,
+5.8-6.0 ms a frame, 1% lows ~9 ms. The goal is to get much closer to what the hardware allows. Rough scaling from a
+docked Switch (Violet uses its whole 33 ms on both sides): the CPU is ~12-15x per thread (5.0 vs 1.02 GHz, ~2.5-3x
+IPC over the A57), the GPU ~50x (37 TFLOPS with dual issue, ~19 without, vs 0.39), memory bandwidth ~24x. So game
+logic should fit in ~2.2-2.8 ms (350-450 fps) and the GPU's work in ~0.7 ms. Measured: CPU ~4.1-4.3 ms (55-65% of
+that, normal for a static recompilation, room left), GPU ~5.5 ms (**~8x off: the outlier, and what holds the frame
+rate now**).
 
-1. **Measure the dip when spawning / loading** (~80 fps for a second). The logging is in: NX_HITCH_MS=20 logs
-   each slow frame split into shader loads, JIT waits, pipeline builds, images, uploads, slot waits and the rest
-   (Status, "Performance", "Lows"). Run it on the benchmark save (`build/save-bench`). In that scene the lows
-   follow new pipelines and images (1% lows ~7-10 ms without, 10-49 ms with).
-2. **Keep the pipeline cache between sessions.** gpu.c creates `pcache` empty every run (`vkCreatePipelineCache`
-   with no initial data) and never saves it. Load it from a file under `build/` at start (check the cache header's
-   vendor/device/UUID, else start empty) and write it back at exit and every few minutes. The AMD driver has its
-   own disk cache too, so measure before and after (item 1's log).
-3. **Extract every shader up front** (the "unpacker", also a V8 prerequisite): walk the shader archives in
+- **Stand-still benchmark** (use this for frame-rate work; the cutscene save is for hitches): copy `build/save` to
+  `build/save-idle-run`, then `violetrecomp.exe --log 1 --save build\save-idle-run` with NX_NOPACE=1,
+  NX_TIME=1792494000, NX_INPUT='300-900/60:A' and no input after that (keep hands off the window). The title and
+  load run ~16,700 frames at ~880 fps, then two windows of load hitches; average the `nvn: frame time` windows after
+  those (24+ windows in 105 s). Run to run spread ~0.2 ms a frame.
+- What a frame is (2026-10-22): with rendering, the render thread (5c) translates ~3.4 ms (~2,000 draws, ~1.7 us a
+  draw; Savage Wind's is 2.4) and waits ~1.6-2.8 ms for the GPU; main runs only ~40% (waits on 5c). With every draw
+  skipped (NX_GPU_SKIP=1): 235-244 fps (4.1-4.3 ms), main 73% running, blocked ~27% (~21% on one condition
+  variable, main+b47d18, ~11 waits a frame: its jobs on 5a/5b, each ~57% busy), translation 0.8 ms. Main's samples
+  then: lifted code ~60% (flat: the hottest function 2.3%), our runtime ~8% (`call_ind` / `jump_ind` ~5%).
+- Ruled out (2026-10-22): lifted code at -O2 (NX_LIFT_OPT in nxrecomp.cmake; 5 min full build): CPU-only 235 -> 244
+  fps (~3%, inside the noise), with rendering 172 vs 165 (noise). The default stays -O1. Decompiling the game
+  (IDA / Ghidra) to recompile it natively: not worth it (output does not compile, silently wrong functions, years
+  of work), and the CPU side is not what holds the frame rate. Hand-written overrides of single hot functions are
+  the way, once a profile has hot spots (it has none now).
+- Ruled out (2026-10-22): render targets sampled by the draw that renders into them (what Savage Wind, the BotW
+  recompilation in `ref/SavageWindRecomp`, needed feedback loops for). NX_FEEDBACK_LOG=1 logs each case once
+  (gpu.c `feedback_check`; slots read come from the SPIR-V's access chains into cb2). In the benchmark save and the
+  stand-still scene only two are undefined: fs `3614c5d014241256` reads and writes the same 1x1 f46 target (slot 1,
+  every frame; likely exposure / luminance adaptation: **a lead for the too-bright glows**, untested) and fs
+  `8f2c86b8511ac03b` samples the 1920x1080 depth buffer with depth writes on. Every other case is depth read with
+  depth writes off (defined). Fixing those two (copy the target first) is cheap.
+
+In order:
+
+1. **GPU profile of the stand-still scene** (NX_GPU_PROF=1, then 2): how much of the ~5.5 ms is work and how much
+   is gaps around ~165 passes and ~170 barriers a frame (2026-10-19 Mesagoza: ~172 barriers 1.2 ms, G-buffer 2.2
+   ms, 23 passes on one 1080p target 0.96 ms). NX_GPU_PROF's timestamps slow the GPU, so compare its shares, not
+   totals. Then: barriers per image (and only where a later pass reads what an earlier wrote) instead of full ones,
+   and merging consecutive passes on the same targets. NX_PASS_BARRIER (skip every pass-end barrier) corrupted
+   lighting: too blunt, not proof that barriers are needed everywhere.
+2. **Lifted calls: the register save / reload.** Every call between lifted functions stores ~20 guest registers to
+   `Ctx` and loads them back (the SAVE / LOAD macros at each call). Measure its share first (count calls a frame or
+   sample around them), then try passing / keeping the argument and callee-saved registers in host registers
+   (lifter change in nxrecomp/tools/lifter).
+3. **Indirect calls** (`call_ind` / `jump_ind`, ~5% of main): a per-call-site cache of the last target, or a direct
+   table lookup.
+4. **Take translation off the render thread** (Savage Wind's ASYNC_EXEC): only pays after items 1-3, since the
+   GPU wait follows it anyway.
+5. **Measure the dip when spawning / loading** (~80 fps for a second). NX_HITCH_MS=20 logs each slow frame split
+   into shader loads, JIT waits, pipeline builds, images, uploads, slot waits and the rest (Status, "Performance",
+   "Lows"). Run it on the benchmark save (`build/save-bench`). In that scene the lows follow new pipelines and
+   images (1% lows ~7-10 ms without, 10-49 ms with). The pipeline cache is now kept between sessions
+   (`build/pipelines.bin`, or `pipelines.bins` with VK_KHR_pipeline_binary), and `pipelines.list` is prebuilt on
+   worker threads at start; their effect on hitches is not measured yet.
+6. **Extract every shader up front** (the "unpacker", also a V8 prerequisite): walk the shader archives in
    `dump/romfs/arc/data.trpfs` (8 GB) instead of collecting shaders as the game creates them (`build/shaders`,
    5,488 so far), and translate them all ahead of time. First learn the trpfs layout and its compression; if it
    is a proprietary compressor, prefer running the game's own lifted loading code in a tool mode over writing a
    decoder. Gains: no translation stall the first time an area is reached, a complete shader set, and no Python
    needed during play. It will not raise the frame rate in areas already visited.
-4. **Keep the shader JIT as a fallback** after item 3 (gpu.c `jit_request`, NX_SHADER_JIT): anything not found
+7. **Keep the shader JIT as a fallback** after item 6 (gpu.c `jit_request`, NX_SHADER_JIT): anything not found
    in the archives (DLC, generated shaders) still gets translated. Removing Python entirely means porting
    `translate.py` to C, which belongs with V8 (packaging), not here.
 

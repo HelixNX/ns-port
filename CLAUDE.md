@@ -27,7 +27,7 @@ behaviour only: our own implementation, never copied code.
 | `keys/` | `prod.keys`, `title.keys`; `.switch/` holds copies for nstool (see Tool notes) |
 | `firmware/` | `Firmware_22.5.0.zip` and its contents in `22.5.0/` (NCAs; `keys/prod.keys` covers it). MiiModel is `99d7c22f….nca`; find others with `nstool <nca>` (ProgID) and extract with `nstool -x / <dir> <nca>` |
 | `deps/` | `SDL3/SDL3-3.4.18` (VC), `Vulkan-Headers` (v1.4.341), `glslang` (16.6.0 release), `suyu` (sparse Eden checkout, `src/core/hle/service/mii` only; widen it with `git -C deps/suyu sparse-checkout add <dir>` for service or shader references) |
-| `ref/` | `ssbu-recomp` (reference only) |
+| `ref/` | `SavageWindRecomp` (BotW 1.8.2 recompilation on LAS Recomp, MIT, cloned 2026-10-22; notes in Spanish in `docs/SAVAGE-WIND.md`; reference only) |
 | `.tools/` | `nstool.exe`, `ida-mcp` (headless IDA for REA) |
 | `.claude/`, `.mcp.json` | Claude Code settings, REA MCP config |
 
