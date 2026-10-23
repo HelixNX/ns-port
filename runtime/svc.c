@@ -29,6 +29,8 @@ static const char *svc_name(u32 n) {
     return n < 0x80 && names[n] ? names[n] : "?";
 }
 
+void gpu_save_pipelines(void);         /* gpu.c: at ExitProcess */
+
 u64 system_resource_size;
 
 static KThread *get_thread(u32 h) { return (KThread *)handle_get(h, KO_THREAD); }
@@ -92,6 +94,7 @@ void svc_dispatch(Ctx *c, u32 n) {
     }
     case 0x07:
         hlog(1, "ExitProcess");
+        gpu_save_pipelines();
         ExitProcess(0);
     case 0x08: {
         s32 prio = (s32)x[4], core = (s32)x[5];

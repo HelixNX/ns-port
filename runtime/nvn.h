@@ -139,6 +139,8 @@ typedef struct ShaderCode {
     u32 xfb_stride[4];                  /* transform feedback: bytes per vertex in each buffer (0: not captured) */
     u8 cb_of_slot[16];                  /* gpu.c: the c[i] in each push descriptor slot (translate.py: c[16] takes a free one) */
     u16 slots_used;                     /* gpu.c: the slots the shader declares (0: not known, all) */
+    u32 tex_slots;                      /* gpu.c, NX_FEEDBACK_LOG: the texture slots it reads from c[2] (bit k: 0x20 + 8k) */
+    bool tex_dyn;                       /* ... or it reads c[2] at offsets computed at run time (any slot) */
     bool missing;                       /* gpu.c: no SPIR-V, and none coming */
     u64 jit_seq;                        /* gpu.c: its translation request (gpu_shader_created), or 0 */
 } ShaderCode;

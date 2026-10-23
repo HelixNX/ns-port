@@ -49,11 +49,16 @@
     X(vkCmdSetPatchControlPointsEXT) X(vkCmdWriteTimestamp2) X(vkCmdBeginQuery) X(vkCmdEndQuery) \
     X(vkCmdCopyQueryPoolResults) X(vkCmdResetQueryPool) X(vkCmdPushDescriptorSetKHR) \
     X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT)
+/* optional: NULL without the extension */
+#define VK_DEVICE_OPT_FNS(X) \
+    X(vkCreatePipelineBinariesKHR) X(vkDestroyPipelineBinaryKHR) X(vkGetPipelineBinaryDataKHR) \
+    X(vkReleaseCapturedPipelineDataKHR)
 
 #define VK_DECLARE(f) extern PFN_##f f;
 VK_GLOBAL_FNS(VK_DECLARE)
 VK_INSTANCE_FNS(VK_DECLARE)
 VK_DEVICE_FNS(VK_DECLARE)
+VK_DEVICE_OPT_FNS(VK_DECLARE)
 #undef VK_DECLARE
 
 #define VKCHECK(call) do { VkResult r_ = (call); if (r_ < 0) fatal("%s failed: %d", #call, (int)r_); } while (0)
@@ -71,6 +76,8 @@ typedef struct Vk {
     u64 host_import_align;              /* minImportedHostPointerAlignment */
     u32 dyn_logic_op;                   /* extendedDynamicState2LogicOp (AMD has none: the logic op is in the pipeline) */
     VkShaderStageFlags warp32;          /* stages whose pipelines ask for 32-wide subgroups (Maxwell's warps) */
+    double pcie_gbps;                   /* the GPU's PCIe link in GB/s per direction (vk_pcie_link), 0 if unknown */
+    bool pipeline_binary;               /* VK_KHR_pipeline_binary: gpu.c keeps compiled pipelines itself */
 } Vk;
 
 /* chained into a pipeline stage that is in vk.warp32: the translated shaders' subgroup code assumes 32 lanes */

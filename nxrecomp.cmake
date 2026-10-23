@@ -53,8 +53,9 @@ message(STATUS "nxrecomp: Vulkan headers ${NX_VULKAN_INCLUDE}, SDL3 ${NX_SDL3_IN
 set(CMAKE_C_FLAGS_RELEASE "/MD" CACHE STRING "" FORCE)
 
 # lifted code: no FP contraction (the guest fuses only where it says so), no strict aliasing (guest memory is
-# untyped); -O1 keeps compile time reasonable for the very large generated functions
-set(NX_LIFT_FLAGS /clang:-O1 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-march=haswell
+# untyped); -O1 keeps compile time reasonable for the very large generated functions (NX_LIFT_OPT to compare)
+set(NX_LIFT_OPT "-O1" CACHE STRING "clang optimization level for lifted code")
+set(NX_LIFT_FLAGS /clang:${NX_LIFT_OPT} /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-march=haswell
                   /clang:-fbracket-depth=1024 /clang:-Wno-everything
                   /clang:-gline-tables-only /clang:-gcodeview)   # lines = guest offsets (a64lift #line)
 
@@ -142,7 +143,7 @@ function(nx_game)
     target_compile_definitions(${NX_NAME} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
     target_include_directories(${NX_NAME} PRIVATE "${NX_ROOT}/runtime" "${CMAKE_BINARY_DIR}"
                                "${NX_VULKAN_INCLUDE}" "${NX_SDL3_INCLUDE}")
-    target_link_libraries(${NX_NAME} PRIVATE lifted a64rt dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32
+    target_link_libraries(${NX_NAME} PRIVATE lifted a64rt dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
                           "${NX_SDL3_LIB}")
     add_custom_command(TARGET ${NX_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${NX_SDL3_DLL}" "$<TARGET_FILE_DIR:${NX_NAME}>")

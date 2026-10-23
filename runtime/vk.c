@@ -7,11 +7,18 @@
 #include <process.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
+#include <cfgmgr32.h>
+#include <initguid.h>
+#include <devpkey.h>
+#include <pciprop.h>
 
 #define VK_DEFINE(f) PFN_##f f;
 VK_GLOBAL_FNS(VK_DEFINE)
 VK_INSTANCE_FNS(VK_DEFINE)
 VK_DEVICE_FNS(VK_DEFINE)
+VK_DEVICE_OPT_FNS(VK_DEFINE)
 #undef VK_DEFINE
 
 Vk vk;
@@ -21,6 +28,7 @@ static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
 void gpu_capture_next(void);
+void gpu_save_pipelines(void);
 void overlay_toggle(void);
 static volatile LONG resized;
 
@@ -41,6 +49,7 @@ void window_loop(void *guest_main_thread) {
                 input_event(&e);
                 if (e.type == SDL_EVENT_QUIT) {
                     hlog(1, "window closed");
+                    gpu_save_pipelines();
                     fflush(stderr);
                     ExitProcess(0);
                 }
@@ -130,6 +139,62 @@ static const char *const device_exts[] = {
     VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
 };
 
+/* The GPU's PCIe link, for gpu.c's pool mirrors: the display kernel gives the PCI address of the adapter with
+ * Vulkan's LUID (VK_EXT_pci_bus_info would too, but AMD's Windows driver lacks it), and Windows' device tree has
+ * each PCIe device's link. Radeon cards put a switch of their own in front of the GPU
+ * whose links report full speed, so the slowest link from the GPU up to the root port counts. Each link's best
+ * speed and width (both ends' maxima) are used, not the current ones: GPUs drop to slower speeds while idle */
+static bool devnode_u32(DEVINST d, const DEVPROPKEY *k, u32 *v) {
+    DEVPROPTYPE t;
+    ULONG size = sizeof *v;
+    return CM_Get_DevNode_PropertyW(d, k, &t, (PBYTE)v, &size, 0) == CR_SUCCESS && t == DEVPROP_TYPE_UINT32;
+}
+
+static void pcie_link(void) {
+    VkPhysicalDeviceIDProperties idp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp};
+    vkGetPhysicalDeviceProperties2(vk.phys, &p2);
+    if (!idp.deviceLUIDValid) { hlog(1, "vk: PCIe link not known (no LUID)"); return; }
+    D3DKMT_OPENADAPTERFROMLUID oa = {0};
+    memcpy(&oa.AdapterLuid, idp.deviceLUID, sizeof oa.AdapterLuid);
+    if (D3DKMTOpenAdapterFromLuid(&oa)) { hlog(1, "vk: PCIe link not known (no adapter for the LUID)"); return; }
+    D3DKMT_ADAPTERADDRESS bus = {0};
+    D3DKMT_QUERYADAPTERINFO qi = {oa.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &bus, sizeof bus};
+    NTSTATUS st = D3DKMTQueryAdapterInfo(&qi);
+    D3DKMT_CLOSEADAPTER ca = {oa.hAdapter};
+    D3DKMTCloseAdapter(&ca);
+    if (st) { hlog(1, "vk: PCIe link not known (no adapter address)"); return; }
+    ULONG len = 0;
+    if (CM_Get_Device_ID_List_SizeW(&len, L"PCI", CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS) return;
+    WCHAR *ids = malloc(len * sizeof *ids);
+    DEVINST gpu = 0;
+    if (CM_Get_Device_ID_ListW(L"PCI", ids, len, CM_GETIDLIST_FILTER_ENUMERATOR) == CR_SUCCESS)
+        for (WCHAR *id = ids; *id && !gpu; id += wcslen(id) + 1) {
+            DEVINST d;
+            u32 busno, addr;
+            if (CM_Locate_DevNodeW(&d, id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+                devnode_u32(d, &DEVPKEY_Device_BusNumber, &busno) && devnode_u32(d, &DEVPKEY_Device_Address, &addr) &&
+                busno == bus.BusNumber && addr == (bus.DeviceNumber << 16 | bus.FunctionNumber))
+                gpu = d;
+        }
+    free(ids);
+    if (!gpu) { hlog(1, "vk: PCIe link not known (no PCI device at bus %u, device %u)", bus.BusNumber, bus.DeviceNumber); return; }
+    /* GB/s per lane by speed code (2.5, 5, 8, 16, 32, 64 GT/s; 8b/10b coding up to 5 GT/s, 128b/130b above) */
+    static const double lane[] = {0, 0.25, 0.5, 0.985, 1.969, 3.938, 7.563};
+    u32 speed = ~0u, width = ~0u;
+    for (DEVINST d = gpu, parent; ; d = parent) {
+        u32 s, w;
+        if (!devnode_u32(d, &DEVPKEY_PciDevice_MaxLinkSpeed, &s) || !devnode_u32(d, &DEVPKEY_PciDevice_MaxLinkWidth, &w))
+            break;
+        if (s && s < speed) speed = s;
+        if (w && w < width) width = w;
+        if (CM_Get_Parent(&parent, d, 0) != CR_SUCCESS) break;
+    }
+    if (speed == ~0u || width == ~0u) { hlog(1, "vk: PCIe link not known"); return; }
+    vk.pcie_gbps = lane[speed < 7 ? speed : 6] * width;
+    hlog(1, "vk: PCIe link gen %u x%u (%.1f GB/s)", speed, width, vk.pcie_gbps);
+}
+
 static VkPhysicalDevice pick_device(void) {
     u32 n = 0;
     vkEnumeratePhysicalDevices(vk.instance, &n, NULL);
@@ -161,6 +226,7 @@ void vk_init(void) {
     vk.phys = pick_device();
     vkGetPhysicalDeviceProperties(vk.phys, &vk.props);
     vkGetPhysicalDeviceMemoryProperties(vk.phys, &vk.mem);
+    if (vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pcie_link();
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostp = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostp};
@@ -253,7 +319,40 @@ void vk_init(void) {
         .descriptorBindingUniformBufferUpdateAfterBind = 0, .descriptorBindingStorageBufferUpdateAfterBind = 0};
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12,
         .shaderDrawParameters = 1};
-    VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
+    /* pipeline binaries (with maintenance5, which they need): compiled pipelines kept between sessions by gpu.c,
+     * where the driver's own caches do not keep them (AMD); NX_PIPELINE_BINARY=0 turns them off */
+    const char *exts[sizeof device_exts / sizeof *device_exts + 2];
+    u32 next = 0;
+    for (size_t i = 0; i < sizeof device_exts / sizeof *device_exts; i++) exts[next++] = device_exts[i];
+    u32 ne = 0;
+    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, NULL);
+    VkExtensionProperties *dext = malloc(ne * sizeof *dext);
+    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, dext);
+    VkPhysicalDevicePipelineBinaryFeaturesKHR hasbin = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+    VkPhysicalDeviceMaintenance5FeaturesKHR hasm5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &hasbin};
+    VkPhysicalDeviceFeatures2 hasf5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hasm5};
+    const char *pb = getenv("NX_PIPELINE_BINARY");
+    if ((!pb || atoi(pb)) && has_ext(dext, ne, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
+        has_ext(dext, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        vkGetPhysicalDeviceFeatures2(vk.phys, &hasf5);
+        vk.pipeline_binary = hasbin.pipelineBinaries && hasm5.maintenance5;
+    }
+    free(dext);
+    VkPhysicalDevicePipelineBinaryFeaturesKHR fbin = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR, &f11,
+                                                      .pipelineBinaries = 1};
+    VkPhysicalDeviceMaintenance5FeaturesKHR fm5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &fbin,
+                                                   .maintenance5 = 1};
+    if (vk.pipeline_binary) {
+        exts[next++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+        exts[next++] = VK_KHR_PIPELINE_BINARY_EXTENSION_NAME;
+        VkPhysicalDevicePipelineBinaryPropertiesKHR pbp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 pp2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pbp};
+        vkGetPhysicalDeviceProperties2(vk.phys, &pp2);
+        hlog(1, "vk: pipeline binaries (driver: internal cache %u, prefers it %u, precompiled %u)",
+             pbp.pipelineBinaryInternalCache, pbp.pipelineBinaryPrefersInternalCache,
+             pbp.pipelineBinaryPrecompiledInternalCache);
+    } else hlog(1, "vk: no pipeline binaries%s", pb && !atoi(pb) ? " (NX_PIPELINE_BINARY=0)" : "");
+    VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, vk.pipeline_binary ? (void *)&fm5 : &f11};
     f.features = (VkPhysicalDeviceFeatures){
         .robustBufferAccess = 1, .imageCubeArray = 1, .independentBlend = 1, .geometryShader = 1, .tessellationShader = 1,
         .sampleRateShading = 1, .dualSrcBlend = 1, .logicOp = 1, .multiDrawIndirect = 1, .drawIndirectFirstInstance = 1,
@@ -268,11 +367,15 @@ void vk_init(void) {
                                    .queueCount = family_queues >= 2 ? 2 : 1, .pQueuePriorities = prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f, .queueCreateInfoCount = 1,
                               .pQueueCreateInfos = &qci,
-                              .enabledExtensionCount = sizeof device_exts / sizeof *device_exts,
-                              .ppEnabledExtensionNames = device_exts};
+                              .enabledExtensionCount = next, .ppEnabledExtensionNames = exts};
     VKCHECK(vkCreateDevice(vk.phys, &dci, NULL, &vk.dev));
 #define VK_LOAD_D(f) if (!(f = (PFN_##f)vkGetDeviceProcAddr(vk.dev, #f))) fatal("Vulkan: no %s", #f);
     VK_DEVICE_FNS(VK_LOAD_D)
+#define VK_LOAD_OPT(f) f = (PFN_##f)vkGetDeviceProcAddr(vk.dev, #f);
+    VK_DEVICE_OPT_FNS(VK_LOAD_OPT)
+    if (vk.pipeline_binary && !(vkCreatePipelineBinariesKHR && vkDestroyPipelineBinaryKHR && vkGetPipelineBinaryDataKHR &&
+                                vkReleaseCapturedPipelineDataKHR))
+        vk.pipeline_binary = false;
     vkGetDeviceQueue(vk.dev, vk.family, 0, &vk.queue);
     vk.present_queue = vk.queue;
     if (qci.queueCount == 2) vkGetDeviceQueue(vk.dev, vk.family, 1, &vk.present_queue);

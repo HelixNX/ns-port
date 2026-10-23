@@ -24,7 +24,7 @@ static bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror;
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log;
     int gpu_skip, flush_draws;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -331,7 +331,8 @@ static void flush(void) {
  * video memory sat idle. The mirror follows guest memory: pages the CPU wrote (write watch) are copied in at each
  * submission before its commands run (mirror_sync), and the GPU's own copies, clears and small writes there go to
  * both. Storage buffers, transform feedback and indirect arguments stay on host memory; a range they write is read
- * from host memory from then on (Mirror.bad). NX_POOL_MIRROR=0 turns mirrors off */
+ * from host memory from then on (Mirror.bad). Mirrors are on for slow PCIe links (env_init); NX_POOL_MIRROR=0/1
+ * forces them off or on */
 typedef struct { u64 lo, hi; } Range;
 typedef struct Mirror { VkBuf b; bool fresh; Range *bad; int nbad, capbad; } Mirror;
 #define MIRROR_MIN (8ull << 20)         /* smaller pools are not worth a scan per submission */
@@ -1143,6 +1144,7 @@ typedef struct State {
     bool rendering;
     VkRect2D area;
     VkFormat rt_format[8], depth_format, stencil_format;     /* of the rendering in progress */
+    struct { u64 addr, size; u32 level, layer, nlayers; } rt_sub[9];    /* ... its targets (8: depth; size 0: none) */
     u32 samples;
     BufferRange xfb[4];                 /* transform feedback buffers, the bytes captured into each since bound */
     u64 xfb_written[4];
@@ -1203,16 +1205,18 @@ static void watch(const char *what, const TexRef *r) {
          r->t.height, r->t.depth, r->v.format, r->t.target, r->v.base_level, r->v.min_layer, r->v.num_layers);
 }
 
-/* a render target's view, its image, level and layer count (layered rendering: gl_Layer picks among them) */
-static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *layers) {
+/* a render target's view, its image, level, first layer and layer count (layered rendering: gl_Layer picks among
+ * them) */
+static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *first, u32 *layers) {
     watch("render target", r);
     ViewInfo v;
     Image *im = image_ref(r, &v);
     if (out) *out = im;
     if (level) *level = v.base_level;
     if (!im) return NULL;
-    u32 base;
-    if (layers) *layers = view_layers(im, &v, VIEW_ATTACHMENT, &base);
+    u32 base, n = view_layers(im, &v, VIEW_ATTACHMENT, &base);
+    if (layers) *layers = n;
+    if (first) *first = base;
     return image_view(im, &v, VIEW_ATTACHMENT);
 }
 
@@ -1221,15 +1225,18 @@ static bool begin_rendering(void) {
     VkRenderingAttachmentInfo color[8], depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     u32 w = ~0u, h = ~0u, layers = ~0u;
     memset(st.rt_format, 0, sizeof st.rt_format);
+    memset(st.rt_sub, 0, sizeof st.rt_sub);
     st.depth_format = st.stencil_format = VK_FORMAT_UNDEFINED;
     st.samples = 1;
     bool any = false;
     for (u32 i = 0; i < st.nrt; i++) {
         color[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         Image *im;
-        u32 l, nl;
-        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &nl) : NULL;
+        u32 l, l0, nl;
+        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &l0, &nl) : NULL;
         if (!v) continue;
+        st.rt_sub[i].addr = im->info.addr, st.rt_sub[i].size = im->size;
+        st.rt_sub[i].level = l, st.rt_sub[i].layer = l0, st.rt_sub[i].nlayers = nl;
         color[i].imageView = v;
         st.rt_format[i] = usable_format(st.rt[i].v.format) != VK_FORMAT_UNDEFINED ? usable_format(st.rt[i].v.format) : im->format;
         st.samples = im->info.samples > 1 ? im->info.samples : 1;
@@ -1248,9 +1255,11 @@ static bool begin_rendering(void) {
     bool has_d = false, has_s = false;
     if (st.has_depth) {
         Image *im;
-        u32 l, nl;
-        VkImageView v = rt_view(&st.depth, &im, &l, &nl);
+        u32 l, l0, nl;
+        VkImageView v = rt_view(&st.depth, &im, &l, &l0, &nl);
         if (v) {
+            st.rt_sub[8].addr = im->info.addr, st.rt_sub[8].size = im->size;
+            st.rt_sub[8].level = l, st.rt_sub[8].layer = l0, st.rt_sub[8].nlayers = nl;
             depth.imageView = v;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -1568,6 +1577,83 @@ static u32 window_origin, depth_mode;   /* NVN device modes (0: lower left, 0: n
 
 void gpu_device_modes(u32 origin, u32 depth) { window_origin = origin; depth_mode = depth; }
 
+/* The pipeline cache is kept between sessions in pipelines.bin next to the shaders (build/), so pipelines built
+ * once are not compiled again: pipeline builds were most of the stalls our side of a hitch (NX_HITCH_MS). A file
+ * from another device or driver (header: vendor, device, cache UUID) is ignored. Saved by a thread every minute
+ * after new builds and at exit (gpu_save_pipelines), written to a temporary file first so a killed process does
+ * not leave half a file */
+static char pcache_path[MAX_PATH];
+static volatile long pcache_builds;     /* pipelines built, against the count at the last save */
+static long pcache_saved;
+static SRWLOCK pcache_lock = SRWLOCK_INIT;
+
+/* a file in the build folder (the executable's parent folder) */
+static void build_file(char *path, size_t size, const char *name) {
+    char exe[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    char *slash = strrchr(exe, '\\');
+    if (slash) *slash = 0;
+    snprintf(path, size, "%s\\..\\%s", exe, name);
+}
+
+static void pcache_load(void) {
+    if (vk.pipeline_binary) return;     /* pipeline binaries instead (bins_load) */
+    build_file(pcache_path, sizeof pcache_path, "pipelines.bin");
+    void *data = NULL;
+    size_t size = 0;
+    FILE *f = fopen(pcache_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        size = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        data = malloc(size);
+        if (fread(data, 1, size, f) != size) size = 0;
+        fclose(f);
+    }
+    const VkPipelineCacheHeaderVersionOne *h = data;
+    const char *why = !f ? "none saved" : NULL;
+    if (!why && (size < sizeof *h || h->headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE)) why = "not a cache";
+    if (!why && (h->vendorID != vk.props.vendorID || h->deviceID != vk.props.deviceID ||
+                 memcmp(h->pipelineCacheUUID, vk.props.pipelineCacheUUID, VK_UUID_SIZE)))
+        why = "another device or driver";
+    VkPipelineCacheCreateInfo cci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                     .initialDataSize = why ? 0 : size, .pInitialData = why ? NULL : data};
+    VKCHECK(vkCreatePipelineCache(vk.dev, &cci, NULL, &pcache));
+    if (why) hlog(1, "gpu: pipeline cache %s: %s", pcache_path, why);
+    else hlog(1, "gpu: pipeline cache %s: loaded (%llu KB)", pcache_path, (unsigned long long)size >> 10);
+    free(data);
+}
+
+void gpu_save_pipelines(void) {
+    if (!pcache || pcache_builds == pcache_saved) return;
+    AcquireSRWLockExclusive(&pcache_lock);
+    long builds = pcache_builds;
+    size_t size = 0;
+    void *data = NULL;
+    if (vkGetPipelineCacheData(vk.dev, pcache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
+        vkGetPipelineCacheData(vk.dev, pcache, &size, data) == VK_SUCCESS) {
+        char tmp[MAX_PATH];
+        snprintf(tmp, sizeof tmp, "%s.tmp", pcache_path);
+        FILE *f = fopen(tmp, "wb");
+        bool ok = f && fwrite(data, 1, size, f) == size;
+        if (f && fclose(f)) ok = false;
+        if (ok && MoveFileExA(tmp, pcache_path, MOVEFILE_REPLACE_EXISTING)) {
+            pcache_saved = builds;
+            hlog(1, "gpu: pipeline cache saved (%llu KB)", (unsigned long long)size >> 10);
+        } else hlog(0, "gpu: pipeline cache: could not write %s", pcache_path);
+    }
+    free(data);
+    ReleaseSRWLockExclusive(&pcache_lock);
+}
+
+static unsigned __stdcall pcache_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(60000);
+        gpu_save_pipelines();
+    }
+}
+
 static void layouts_init(void) {
     VkDescriptorSetLayoutBinding ub[32];
     for (int i = 0; i < 32; i++)
@@ -1611,8 +1697,7 @@ static void layouts_init(void) {
         .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
         .maxSets = 64, .poolSizeCount = 2, .pPoolSizes = ps};
     VKCHECK(vkCreateDescriptorPool(vk.dev, &pci, NULL, &desc_pool));
-    VkPipelineCacheCreateInfo cci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    VKCHECK(vkCreatePipelineCache(vk.dev, &cci, NULL, &pcache));
+    pcache_load();
 }
 
 static VkDescriptorSet alloc_set(VkDescriptorSetLayout l, u32 count) {
@@ -2167,6 +2252,11 @@ static VkShaderModule shader_load(ShaderCode *s) {
     u8 cb_n[17];
     for (u32 k = 0; k < 16; k++) s->cb_of_slot[k] = (u8)k;
     s->slots_used = 0;
+    /* NX_FEEDBACK_LOG: the texture slots read, from the access chains into cb2 (cb2.d[i][j]: byte 16i + 4j) */
+    u32 cb2 = 0, bound = n >= 20 ? code[3] : 0;
+    u64 *cval = env.feedback_log && bound ? calloc(bound, sizeof *cval) : NULL;    /* OpConstant: 1 << 32 | value */
+    s->tex_slots = 0;
+    s->tex_dyn = false;
     for (long i = 5; i < n / 4;) {      /* what the shader touches: PhysicalStorageBufferAddresses, sampled images */
         u32 op = code[i] & 0xffff, wc = code[i] >> 16;
         if (op == 5 && wc >= 3 && ncb < 17) {                   /* OpName "cb<N>": c[N] */
@@ -2175,7 +2265,16 @@ static VkShaderModule shader_load(ShaderCode *s) {
                 u32 v = 0, k = 2;
                 while (nm[k] >= '0' && nm[k] <= '9' && k < 5) v = v * 10 + (u32)(nm[k++] - '0');
                 if (!nm[k] && v <= 16) { cb_id[ncb] = code[i + 1]; cb_n[ncb++] = (u8)v; }
+                if (!nm[k] && v == 2) cb2 = code[i + 1];
             }
+        }
+        if (cval && op == 43 && wc == 4 && code[i + 2] < bound) cval[code[i + 2]] = 1ull << 32 | code[i + 3];
+        if (cval && (op == 65 || op == 66) && wc >= 4 && cb2 && code[i + 3] == cb2) {  /* Op(InBounds)AccessChain */
+            const u32 *x = &code[i + 4];
+            if (wc == 7 && x[1] < bound && x[2] < bound && cval[x[1]] && cval[x[2]]) {
+                u32 off = (u32)cval[x[1]] * 16 + (u32)cval[x[2]] * 4;
+                if (off >= 0x20 && off < 0x120 && !(off & 7)) s->tex_slots |= 1u << ((off - 0x20) >> 3);
+            } else s->tex_dyn = true;
         }
         if (op == 71 && wc == 4 && code[i + 2] == 33)          /* OpDecorate Binding: its slot */
             for (u32 k = 0; k < ncb; k++)
@@ -2191,6 +2290,7 @@ static VkShaderModule shader_load(ShaderCode *s) {
         if (op == 25 && wc >= 9 && code[i + 7] == 2) s->caps |= SHC_IMAGE;     /* OpTypeImage, Sampled = 2: storage */
         i += wc ? wc : 1;
     }
+    free(cval);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)n, .pCode = code};
     VkShaderModule m;
     VkResult r = vkCreateShaderModule(vk.dev, &ci, NULL, &m);
@@ -2281,75 +2381,338 @@ static u32 int_attr_mask(void) {
 }
 
 /* ---- pipelines */
+/* Pipelines are keyed by shader hashes, not modules, so the keys mean the same in every session: each pipeline the
+ * game needs is recorded in pipelines.list (build/), and at start worker threads build the recorded ones before
+ * the game asks for them (pipelines_prebuild), in the order they were first needed. A draw needing one being built
+ * waits for it. Recorded pipelines whose SPIR-V is not on disk yet are left to the draws. Compute pipelines are
+ * keys too (compute = 1, the shader in vs). */
 typedef struct PipeKey {
-    VkShaderModule vs, fs;
+    u64 vs, fs;                         /* shader hashes (fs 0: none) */
+    u32 vs_mask;                        /* the vertex shader's integer inputs (shader_variant) */
     VkFormat color[8], depth, stencil;
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
     u32 alpha_func;                     /* NVN's alpha test (1-7; 0 = always passes): the fragment shader's ALPHA_FUNC */
+    u32 compute, pad;                   /* pad (0): no padding bytes in the key (memcmp, hashing, the file) */
 } PipeKey;
-typedef struct Pipe { PipeKey key; VkPipeline pipe; struct Pipe *next; } Pipe;
+enum { P_LISTED, P_BUILDING, P_READY };   /* recorded, not built / being built / built (pipe NULL: failed) */
+typedef struct Pipe { PipeKey key; VkPipeline pipe; volatile LONG state; bool listed; struct Pipe *next; } Pipe;
 #define PIPE_BUCKETS 1024
-static Pipe *pipes[PIPE_BUCKETS];
+static Pipe *pipes[PIPE_BUCKETS];       /* under pipes_lock */
+static SRWLOCK pipes_lock = SRWLOCK_INIT;
 static u32 npipes;
+static FILE *pipe_list;                 /* pipelines.list, appended to */
+#define PIPE_LIST_MAGIC 0x4c50584eu     /* "NXPL", then the version and the key size */
+#define PIPE_LIST_VERSION 1u
 /* NX_PIPE_LOG (env.pipe_log): log each pipeline's shaders before it is made (a driver that aborts while compiling one) */
 static u64 pipe_vs_hash, pipe_fs_hash;
 
-static VkPipeline pipeline_get(const PipeKey *k) {
+static u32 pipe_bucket(const PipeKey *k) {
     const u8 *b = (const u8 *)k;
     u32 h = 2166136261u;
     for (size_t i = 0; i < sizeof *k; i++) h = (h ^ b[i]) * 16777619u;
-    h %= PIPE_BUCKETS;
+    return h % PIPE_BUCKETS;
+}
+
+static Pipe *pipe_find(const PipeKey *k, u32 h) {
     for (Pipe *p = pipes[h]; p; p = p->next)
-        if (!memcmp(&p->key, k, sizeof *k)) return p->pipe;
-    /* the alpha test is a specialization constant, so a draw without one has no discard from it (early depth) */
-    VkSpecializationMapEntry sme = {0, 0, sizeof k->alpha_func};
-    VkSpecializationInfo spec = {1, &sme, sizeof k->alpha_func, &k->alpha_func};
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp32 : NULL,
-         .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->vs, .pName = "main"},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp32 : NULL,
-         .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->fs, .pName = "main", .pSpecializationInfo = &spec}};
-    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
-    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {
-        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = k->minus_one};
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, &dcc};
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
-    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples};
-    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    VkPipelineColorBlendAttachmentState att[8];
-    memset(att, 0, sizeof att);
-    for (int i = 0; i < 8; i++) att[i].colorWriteMask = 0xf;
-    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                                              .logicOp = (VkLogicOp)k->logic_op,
-                                              .attachmentCount = k->ncolor, .pAttachments = att};
-    static const VkDynamicState dyn[] = {   /* the logic op last: left out without a dynamic logic op */
-        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_LINE_WIDTH,
-        VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS,
-        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-        VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
-        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
-        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
-        VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT, VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
-        VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT, VK_DYNAMIC_STATE_SAMPLE_MASK_EXT,
-        VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT, VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,
-        VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
-        VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT, VK_DYNAMIC_STATE_LOGIC_OP_EXT};
-    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                                           .dynamicStateCount = sizeof dyn / sizeof *dyn - !vk.dyn_logic_op,
-                                           .pDynamicStates = dyn};
-    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor,
-        .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth, .stencilAttachmentFormat = k->stencil};
-    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri,
-        .stageCount = k->fs ? 2 : 1, .pStages = stages, .pInputAssemblyState = &ia, .pViewportState = &vp,
-        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
-        .pDynamicState = &dy, .layout = layout_gfx};
+        if (!memcmp(&p->key, k, sizeof *k)) return p;
+    return NULL;
+}
+
+/* the entry for k, added in state `add` if there is none; *claimed: the caller is to build it (it was added, or
+ * was P_LISTED and is now P_BUILDING) */
+static Pipe *pipe_claim(const PipeKey *k, LONG add, bool *claimed) {
+    u32 h = pipe_bucket(k);
+    *claimed = false;
+    AcquireSRWLockShared(&pipes_lock);
+    Pipe *p = pipe_find(k, h);
+    ReleaseSRWLockShared(&pipes_lock);
+    if (p && p->state != P_LISTED) return p;
+    AcquireSRWLockExclusive(&pipes_lock);
+    if (!(p = pipe_find(k, h))) {
+        p = calloc(1, sizeof *p);
+        p->key = *k;
+        p->state = add;
+        p->listed = add == P_LISTED;
+        p->next = pipes[h];
+        pipes[h] = p;
+        *claimed = add == P_BUILDING;
+    } else if (add == P_BUILDING && p->state == P_LISTED) {
+        p->state = P_BUILDING;
+        *claimed = true;
+    }
+    ReleaseSRWLockExclusive(&pipes_lock);
+    return p;
+}
+
+/* the pipeline for k, `next` chained into its create info (binaries, capture) */
+static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModule vs, VkShaderModule fs, VkPipeline *pipe) {
+    VkResult r;
+    if (k->compute) {
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, next,
+            .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                      vk.warp32 & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp32 : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                      .module = vs, .pName = "main"}, .layout = layout_gfx};
+        r = vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, pipe);
+    } else {
+        /* the alpha test is a specialization constant, so a draw without one has no discard from it (early depth) */
+        VkSpecializationMapEntry sme = {0, 0, sizeof k->alpha_func};
+        VkSpecializationInfo spec = {1, &sme, sizeof k->alpha_func, &k->alpha_func};
+        VkPipelineShaderStageCreateInfo stages[2] = {
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp32 : NULL,
+             .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp32 : NULL,
+             .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main", .pSpecializationInfo = &spec}};
+        VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                     .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+        VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {
+            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = k->minus_one};
+        VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, &dcc};
+        VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                     .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+        VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                   .rasterizationSamples = (VkSampleCountFlagBits)k->samples};
+        VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState att[8];
+        memset(att, 0, sizeof att);
+        for (int i = 0; i < 8; i++) att[i].colorWriteMask = 0xf;
+        VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                                  .logicOp = (VkLogicOp)k->logic_op,
+                                                  .attachmentCount = k->ncolor, .pAttachments = att};
+        static const VkDynamicState dyn[] = {   /* the logic op last: left out without a dynamic logic op */
+            VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_LINE_WIDTH,
+            VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+            VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+            VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+            VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT, VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
+            VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT, VK_DYNAMIC_STATE_SAMPLE_MASK_EXT,
+            VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT, VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,
+            VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+            VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT, VK_DYNAMIC_STATE_LOGIC_OP_EXT};
+        VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               .dynamicStateCount = sizeof dyn / sizeof *dyn - !vk.dyn_logic_op,
+                                               .pDynamicStates = dyn};
+        VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, next, .colorAttachmentCount = k->ncolor,
+            .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth, .stencilAttachmentFormat = k->stencil};
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri,
+            .stageCount = k->fs ? 2 : 1, .pStages = stages, .pInputAssemblyState = &ia, .pViewportState = &vp,
+            .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
+            .pDynamicState = &dy, .layout = layout_gfx};
+        r = vkCreateGraphicsPipelines(vk.dev, pcache, 1, &ci, NULL, pipe);
+    }
+    return r;
+}
+
+/* Pipeline binaries (vk.pipeline_binary): each pipeline compiled here is captured and its binaries appended to
+ * pipelines.bins (build/) under its key, and a pipeline whose key is there is made from them instead of compiled.
+ * The file belongs to one device, driver and shader translator version (its header); for another it starts over.
+ * Pipelines made from binaries or captured may not use a pipeline cache, so there is none then (pcache_load).
+ * A record: the key, the number of binaries, then each one's key size, key (32 bytes), data size and data. */
+typedef struct BinHdr { u32 magic, version, key_size, vendor, device, driver, translator; u8 uuid[VK_UUID_SIZE]; } BinHdr;
+typedef struct BinEnt { PipeKey key; const u8 *rec; struct BinEnt *next; } BinEnt;
+#define BINS_MAGIC 0x42505842u          /* "BXPB" */
+#define BINS_MAX 8                      /* binaries per pipeline (one per stage in practice) */
+static BinEnt *bins[PIPE_BUCKETS];      /* written before the prebuild threads start, read-only after */
+static u8 *bins_data;
+static FILE *bins_file;
+static SRWLOCK bins_lock = SRWLOCK_INIT;
+static volatile LONG bins_made, bins_compiled;
+
+static u32 translator_version(void) {
+    const char *t = strrchr(spv_dir, '\\');
+    return t ? (u32)strtoul(t + 1, NULL, 16) : 0;
+}
+
+static BinHdr bins_header(void) {
+    BinHdr h = {BINS_MAGIC, 1, sizeof(PipeKey), vk.props.vendorID, vk.props.deviceID, vk.props.driverVersion,
+                translator_version()};
+    memcpy(h.uuid, vk.props.pipelineCacheUUID, VK_UUID_SIZE);
+    return h;
+}
+
+/* the size of the record at q (after its key), 0 if it does not fit in the n bytes left */
+static size_t bins_record_size(const u8 *q, size_t n) {
+    u32 count, size;
+    if (n < 4) return 0;
+    memcpy(&count, q, 4);
+    if (!count || count > BINS_MAX) return 0;
+    size_t at = 4;
+    for (u32 i = 0; i < count; i++) {
+        if (n - at < 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 4) return 0;
+        memcpy(&size, q + at + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR, 4);
+        at += 8 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+        if (n - at < size) return 0;
+        at += size;
+    }
+    return at;
+}
+
+static void bins_load(void) {
+    char path[MAX_PATH];
+    build_file(path, sizeof path, "pipelines.bins");
+    BinHdr want = bins_header();
+    size_t size = 0, good = 0;
+    u32 n = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        size = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        bins_data = malloc(size + 1);
+        if (fread(bins_data, 1, size, f) != size) size = 0;
+        fclose(f);
+    }
+    if (size >= sizeof want && !memcmp(bins_data, &want, sizeof want)) {
+        good = sizeof want;
+        while (size - good >= sizeof(PipeKey)) {
+            size_t rs = bins_record_size(bins_data + good + sizeof(PipeKey), size - good - sizeof(PipeKey));
+            if (!rs) break;
+            BinEnt *e = malloc(sizeof *e);
+            memcpy(&e->key, bins_data + good, sizeof e->key);
+            e->rec = bins_data + good + sizeof(PipeKey);
+            u32 h = pipe_bucket(&e->key);
+            e->next = bins[h];
+            bins[h] = e;
+            good += sizeof(PipeKey) + rs;
+            n++;
+        }
+    }
+    if (good && good == size) bins_file = fopen(path, "ab");
+    else if ((bins_file = fopen(path, "wb")) != NULL) {    /* new, another device / driver / translator, or cut short */
+        if (good) fwrite(bins_data, 1, good, bins_file);
+        else fwrite(&want, sizeof want, 1, bins_file);
+        fflush(bins_file);
+    }
+    hlog(1, "gpu: %u pipelines' binaries in %s (%llu KB)%s", n, path, (unsigned long long)good >> 10,
+         size && !good ? ": another device, driver or translator, starting over" : "");
+}
+
+static const BinEnt *bins_find(const PipeKey *k) {
+    for (const BinEnt *e = bins[pipe_bucket(k)]; e; e = e->next)
+        if (!memcmp(&e->key, k, sizeof *k)) return e;
+    return NULL;
+}
+
+/* the pipeline made from e's binaries; false if the driver takes them no more */
+static bool bins_make(const PipeKey *k, const BinEnt *e, VkShaderModule vs, VkShaderModule fs, VkPipeline *pipe) {
+    VkPipelineBinaryKeyKHR keys[BINS_MAX];
+    VkPipelineBinaryDataKHR data[BINS_MAX];
+    VkPipelineBinaryKHR hs[BINS_MAX] = {0};
+    u32 count, size;
+    memcpy(&count, e->rec, 4);
+    const u8 *q = e->rec + 4;
+    for (u32 i = 0; i < count; i++) {
+        keys[i] = (VkPipelineBinaryKeyKHR){VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+        memcpy(&keys[i].keySize, q, 4);
+        memcpy(keys[i].key, q + 4, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+        memcpy(&size, q + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR, 4);
+        data[i] = (VkPipelineBinaryDataKHR){size, (void *)(q + 8 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR)};
+        q += 8 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + size;
+    }
+    VkPipelineBinaryKeysAndDataKHR kd = {count, keys, data};
+    VkPipelineBinaryCreateInfoKHR ci = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pKeysAndDataInfo = &kd};
+    VkPipelineBinaryHandlesInfoKHR hi = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR,
+                                         .pipelineBinaryCount = count, .pPipelineBinaries = hs};
+    VkResult r = vkCreatePipelineBinariesKHR(vk.dev, &ci, NULL, &hi);
+    if (r == VK_SUCCESS) {
+        VkPipelineBinaryInfoKHR bi = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR, NULL, count, hs};
+        r = pipeline_create(k, &bi, vs, fs, pipe);
+    }
+    for (u32 i = 0; i < count; i++)
+        if (hs[i]) vkDestroyPipelineBinaryKHR(vk.dev, hs[i], NULL);
+    return r == VK_SUCCESS;
+}
+
+/* append the binaries of pipe (created with CAPTURE_DATA) to pipelines.bins, then let the driver drop them */
+static void bins_capture(const PipeKey *k, VkPipeline pipe) {
+    VkPipelineBinaryCreateInfoKHR ci = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = pipe};
+    VkPipelineBinaryKHR hs[BINS_MAX] = {0};
+    VkPipelineBinaryHandlesInfoKHR hi = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+    if (bins_file && vkCreatePipelineBinariesKHR(vk.dev, &ci, NULL, &hi) == VK_SUCCESS && hi.pipelineBinaryCount &&
+        hi.pipelineBinaryCount <= BINS_MAX) {
+        hi.pPipelineBinaries = hs;
+        u32 count = hi.pipelineBinaryCount;
+        if (vkCreatePipelineBinariesKHR(vk.dev, &ci, NULL, &hi) == VK_SUCCESS) {
+            size_t cap = sizeof *k + 4 + count * (8 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR), at = sizeof *k + 4;
+            u8 *rec = malloc(cap);
+            bool ok = rec != NULL;
+            memcpy(rec, k, sizeof *k);
+            memcpy(rec + sizeof *k, &count, 4);
+            for (u32 i = 0; i < count && ok; i++) {
+                VkPipelineBinaryDataInfoKHR di = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR, .pipelineBinary = hs[i]};
+                VkPipelineBinaryKeyKHR bk = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+                size_t size = 0;
+                ok = vkGetPipelineBinaryDataKHR(vk.dev, &di, &bk, &size, NULL) == VK_SUCCESS && size < (1u << 31);
+                if (!ok) break;
+                cap += size;
+                u8 *grown = realloc(rec, cap);
+                if (!(ok = grown != NULL)) break;
+                rec = grown;
+                u32 ks = bk.keySize, ds = (u32)size;
+                memcpy(rec + at, &ks, 4);
+                memset(rec + at + 4, 0, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+                memcpy(rec + at + 4, bk.key, ks <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR ? ks : VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+                memcpy(rec + at + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR, &ds, 4);
+                at += 8 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+                ok = vkGetPipelineBinaryDataKHR(vk.dev, &di, &bk, &size, rec + at) == VK_SUCCESS && size == ds;
+                at += ds;
+            }
+            if (ok) {
+                AcquireSRWLockExclusive(&bins_lock);
+                fwrite(rec, 1, at, bins_file);
+                fflush(bins_file);
+                ReleaseSRWLockExclusive(&bins_lock);
+            }
+            free(rec);
+            for (u32 i = 0; i < count; i++)
+                if (hs[i]) vkDestroyPipelineBinaryKHR(vk.dev, hs[i], NULL);
+        }
+    }
+    VkReleaseCapturedPipelineDataInfoKHR ri = {VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR, .pipeline = pipe};
+    vkReleaseCapturedPipelineDataKHR(vk.dev, &ri, NULL);
+}
+
+/* the pipeline for k: from its binaries if they are kept, else compiled (and captured) */
+static VkPipeline pipeline_build(const PipeKey *k, VkShaderModule vs, VkShaderModule fs) {
     VkPipeline pipe = NULL;
-    if (env.pipe_log) {
+    VkResult r;
+    const BinEnt *e = vk.pipeline_binary ? bins_find(k) : NULL;
+    if (e && bins_make(k, e, vs, fs, &pipe)) {
+        InterlockedIncrement(&bins_made);
+        return pipe;
+    }
+    if (vk.pipeline_binary) {
+        VkPipelineCreateFlags2CreateInfoKHR fl = {VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+                                                  .flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR};
+        r = pipeline_create(k, &fl, vs, fs, &pipe);
+        if (r == VK_SUCCESS) bins_capture(k, pipe);
+        InterlockedIncrement(&bins_compiled);
+    } else r = pipeline_create(k, NULL, vs, fs, &pipe);
+    InterlockedIncrement(&pcache_builds);
+    if (r != VK_SUCCESS) {
+        hlog(0, "gpu: %s pipeline for %016llx / %016llx failed: %d", k->compute ? "compute" : "graphics", k->vs, k->fs, r);
+        pipe = NULL;
+    }
+    return pipe;
+}
+
+/* the render thread's pipeline for k, from modules it has loaded */
+static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModule fs) {
+    bool claimed;
+    Pipe *p = pipe_claim(k, P_BUILDING, &claimed);
+    if (!claimed) {
+        if (p->state == P_READY) return p->pipe;
+        double t0 = ms_now();                   /* a worker is building it */
+        while (p->state != P_READY) Sleep(1);
+        hf.pipe += ms_now() - t0;
+        hf.npipe++;
+        return p->pipe;
+    }
+    if (env.pipe_log && !k->compute) {
         char fb[256];
         int fn = 0;
         for (u32 i = 0; i < k->ncolor; i++) {
@@ -2361,22 +2724,111 @@ static VkPipeline pipeline_get(const PipeKey *k) {
         VkFormatProperties dp = {0};
         if (k->depth) vkGetPhysicalDeviceFormatProperties(vk.phys, k->depth, &dp);
         hlog(0, "gpu: pipeline %u: vs %016llx fs %016llx%s depth %d%s stencil %d samples %u logic op %u",
-             npipes + 1, pipe_vs_hash, pipe_fs_hash, fb, k->depth,
+             npipes + 1, k->vs, k->fs, fb, k->depth,
              !k->depth || dp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "" : "(not renderable)",
              k->stencil, k->samples, k->logic_op);
-    }
+    } else if (env.pipe_log) hlog(0, "gpu: compute pipeline: cs %016llx", k->vs);
     double t0 = ms_now();
-    VkResult r = vkCreateGraphicsPipelines(vk.dev, pcache, 1, &ci, NULL, &pipe);
+    VkPipeline pipe = pipeline_build(k, vs, fs);
     hf.pipe += ms_now() - t0;
     hf.npipe++;
-    if (r != VK_SUCCESS) hlog(0, "gpu: vkCreateGraphicsPipelines: %d", r);
-    Pipe *p = calloc(1, sizeof *p);
-    p->key = *k;
     p->pipe = pipe;
-    p->next = pipes[h];
-    pipes[h] = p;
+    InterlockedExchange(&p->state, P_READY);
+    if (pipe_list && !p->listed) {              /* only the render thread writes the list */
+        fwrite(k, sizeof *k, 1, pipe_list);
+        fflush(pipe_list);
+    }
     if (++npipes % 100 == 0) hlog(1, "gpu: %u pipelines", npipes);
     return pipe;
+}
+
+/* a module from the SPIR-V on disk (the variant with integer inputs `mask`), for the prebuild; NULL if not there */
+static VkShaderModule spv_module(u64 hash, u32 mask) {
+    char path[MAX_PATH + 48];
+    spv_path(path, sizeof path, hash);
+    if (mask) snprintf(path + strlen(path) - 4, 16, "_%08x.spv", mask);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    u32 *code = malloc(n);
+    size_t got = fread(code, 1, n, f);
+    fclose(f);
+    VkShaderModule m = NULL;
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)n, .pCode = code};
+    if (got != (size_t)n || vkCreateShaderModule(vk.dev, &ci, NULL, &m) != VK_SUCCESS) m = NULL;
+    free(code);
+    return m;
+}
+
+static PipeKey *pre_keys;               /* pipelines.list as loaded */
+static u32 pre_n;
+static volatile LONG pre_next, pre_built, pre_left;
+static double pre_t0;
+
+static unsigned __stdcall prebuild_thread(void *arg) {
+    (void)arg;
+    for (LONG i; (i = InterlockedIncrement(&pre_next) - 1) < (LONG)pre_n;) {
+        const PipeKey *k = &pre_keys[i];
+        VkShaderModule vs = spv_module(k->vs, k->vs_mask), fs = k->fs ? spv_module(k->fs, 0) : NULL;
+        bool claimed = false;
+        Pipe *p = vs && (!k->fs || fs) ? pipe_claim(k, P_BUILDING, &claimed) : NULL;
+        if (claimed) {
+            p->pipe = pipeline_build(k, vs, fs);
+            InterlockedExchange(&p->state, P_READY);
+            InterlockedIncrement(&pre_built);
+        }
+        if (vs) vkDestroyShaderModule(vk.dev, vs, NULL);
+        if (fs) vkDestroyShaderModule(vk.dev, fs, NULL);
+    }
+    if (!InterlockedDecrement(&pre_left))
+        hlog(1, "gpu: prebuilt %ld of %u recorded pipelines in %.1f s (%ld from binaries, %ld compiled)", pre_built,
+             pre_n, (ms_now() - pre_t0) / 1000, bins_made, bins_compiled);
+    return 0;
+}
+
+static void pipelines_prebuild(void) {
+    char path[MAX_PATH];
+    build_file(path, sizeof path, "pipelines.list");
+    const u32 hdr[3] = {PIPE_LIST_MAGIC, PIPE_LIST_VERSION, sizeof(PipeKey)};
+    u32 got[3] = {0};
+    long size = 0;
+    FILE *f = fopen(path, "rb");
+    bool ok = f && fread(got, sizeof got, 1, f) == 1 && !memcmp(got, hdr, sizeof hdr);
+    if (ok) {
+        fseek(f, 0, SEEK_END);
+        size = ftell(f) - (long)sizeof hdr;
+        fseek(f, sizeof hdr, SEEK_SET);
+        pre_n = (u32)(size / sizeof(PipeKey));
+        pre_keys = malloc(pre_n * sizeof *pre_keys + 1);
+        pre_n = (u32)fread(pre_keys, sizeof *pre_keys, pre_n, f);
+    }
+    if (f) fclose(f);
+    if (ok && size == (long)(pre_n * sizeof(PipeKey))) pipe_list = fopen(path, "ab");
+    else if ((pipe_list = fopen(path, "wb")) != NULL) {    /* new, an older layout, or a key cut short (killed) */
+        fwrite(hdr, sizeof hdr, 1, pipe_list);
+        fwrite(pre_keys, sizeof *pre_keys, pre_n, pipe_list);
+        fflush(pipe_list);
+    }
+    if (!pipe_list) hlog(0, "gpu: could not open %s: pipelines are not recorded", path);
+    for (u32 i = 0; i < pre_n; i++) {
+        bool claimed;
+        pipe_claim(&pre_keys[i], P_LISTED, &claimed);
+    }
+    if (!pre_n) { hlog(1, "gpu: no recorded pipelines (%s)", path); return; }
+    DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    u32 n = cpus > 3 ? cpus - 2 : 1;
+    pre_left = (LONG)n;
+    pre_t0 = ms_now();
+    hlog(1, "gpu: prebuilding %u recorded pipelines on %u threads", pre_n, n);
+    for (u32 i = 0; i < n; i++) {
+        HANDLE t = (HANDLE)_beginthreadex(NULL, 0, prebuild_thread, NULL, 0, NULL);
+        if (t) {
+            SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(t);
+        } else InterlockedDecrement(&pre_left);
+    }
 }
 
 /* ---- NVN state -> Vulkan */
@@ -2960,6 +3412,61 @@ typedef struct IndLog { u64 draw, vs, fs, addr; bool arrays; } IndLog;
 static IndLog ind_log[IND_LOG_MAX];
 static u32 nind_log;
 
+/* NX_FEEDBACK_LOG: draws that sample a texture they render into (each shader, slot and target once). Vulkan leaves
+ * such reads undefined (a vendor may show the old texel, the new one or garbage) unless the subresources differ or
+ * the target is not written (write mask 0, no depth writes); the log says which. */
+static void feedback_check(DescSet *ts) {
+    static struct { u64 hash; u32 slot; } seen[1024];
+    static u32 nseen;
+    if (!ts) return;
+    for (u32 stage = ST_VERTEX; stage <= ST_FRAGMENT; stage++) {
+        const ShaderCode *s = st.program->stage[stage];
+        if (!s || !(s->caps & SHC_TEXTURE)) continue;
+        u32 used = s->tex_dyn ? ~0u : s->tex_slots;
+        for (u32 k = 0; k < 32; k++) {
+            u32 id = (u32)st.tex[stage][k] & 0xfffff;
+            if (!(used >> k & 1) || !st.tex[stage][k] || id >= ts->count || !ts->res[id] || !ts->img[id]) continue;
+            Image *im = ts->img[id];
+            for (u32 t = 0; t < 9; t++) {
+                const u64 lo = st.rt_sub[t].addr, hi = lo + st.rt_sub[t].size;
+                if (!st.rt_sub[t].size || im->info.addr >= hi || im->info.addr + im->size <= lo) continue;
+                bool written = t < 8 ? (st.mask.mask >> (4 * t) & 0xf) != 0 : (st.ds.flags & 2) != 0;
+                /* the sampled view's levels and layers (same image only: an alias numbers them its own way) */
+                const TexDesc *td = ts->idx[id] != ~0u ? tdesc_get(ts->idx[id]) : NULL;
+                ViewInfo v = {0};
+                u32 l0 = 0, nl = 0, y0 = 0, ny = 0;
+                bool same = im->info.addr == lo && td;
+                if (same) {
+                    TexRef tr = {td->t, td->v};
+                    if (image_ref(&tr, &v) != im) same = false;
+                }
+                if (same) {
+                    l0 = v.base_level < im->levels ? v.base_level : im->levels - 1;
+                    nl = v.num_levels && l0 + v.num_levels <= im->levels ? v.num_levels : im->levels - l0;
+                    ny = view_layers(im, &v, VIEW_SAMPLED, &y0);
+                    if (st.rt_sub[t].level < l0 || st.rt_sub[t].level >= l0 + nl ||
+                        st.rt_sub[t].layer + st.rt_sub[t].nlayers <= y0 || y0 + ny <= st.rt_sub[t].layer)
+                        continue;                       /* another level or layer: defined */
+                }
+                u32 key = stage << 12 | k << 4 | t, i;
+                for (i = 0; i < nseen && (seen[i].hash != s->hash || seen[i].slot != key); i++) {}
+                if (i < nseen || nseen == 1024) continue;
+                seen[nseen].hash = s->hash;
+                seen[nseen++].slot = key;
+                char tgt[8];
+                if (t < 8) snprintf(tgt, sizeof tgt, "c%u", t);
+                else snprintf(tgt, sizeof tgt, "depth");
+                hlog(0, "gpu: feedback: frame %llu draw %llu %s %016llx slot %u samples %s (%ux%u f%u at %llx%s, "
+                     "rendering level %u layers %u+%u, sampling levels %u+%u layers %u+%u)%s", frame_no + 1, draws,
+                     stage == ST_VERTEX ? "vs" : "fs", s->hash, k, tgt, im->info.width, tex_height(&im->info),
+                     im->info.format, im->info.addr, same ? "" : ", overlapping memory", st.rt_sub[t].level,
+                     st.rt_sub[t].layer, st.rt_sub[t].nlayers, l0, nl, y0, ny,
+                     written ? "" : "; target not written (defined)");
+            }
+        }
+    }
+}
+
 static void draw_one(u32 op, const void *payload) {
     draws++;
     work_unflushed++;
@@ -2968,7 +3475,8 @@ static void draw_one(u32 op, const void *payload) {
     if (op == OP_DRAW_TEXTURE || op == OP_DRAW_XFB || op == OP_MULTI_DRAW_INDIRECT) { skip_draw("DrawTexture / transform feedback / multi-draw"); return; }
     if (!pr || !pr->stage[ST_VERTEX]) { skip_draw("no vertex shader"); return; }
     if (pr->mask & ~(1u << ST_VERTEX | 1u << ST_FRAGMENT)) { skip_draw("geometry or tessellation shaders"); return; }
-    VkShaderModule vs = shader_variant(pr->stage[ST_VERTEX], int_attr_mask());
+    u32 vs_mask = int_attr_mask();
+    VkShaderModule vs = shader_variant(pr->stage[ST_VERTEX], vs_mask);
     VkShaderModule fs = pr->stage[ST_FRAGMENT] ? shader_module(pr->stage[ST_FRAGMENT]) : NULL;
     if (!vs || (pr->stage[ST_FRAGMENT] && !fs)) { skip_draw("shader not translated"); return; }
     pipe_vs_hash = pr->stage[ST_VERTEX]->hash;
@@ -2998,11 +3506,13 @@ static void draw_one(u32 op, const void *payload) {
         descset_use(is, st.img[ST_FRAGMENT], 8);
     }
     if (!begin_rendering()) { skip_draw("no render targets"); return; }
+    if (env.feedback_log) feedback_check(ts);
     VkCommandBuffer c = cmd();
     PipeKey k;
     memset(&k, 0, sizeof k);
-    k.vs = vs;
-    k.fs = fs;
+    k.vs = pipe_vs_hash;
+    k.vs_mask = vs_mask;
+    k.fs = pipe_fs_hash;
     k.ncolor = st.nrt;
     memcpy(k.color, st.rt_format, sizeof k.color);
     k.depth = st.depth_format;
@@ -3011,7 +3521,7 @@ static void draw_one(u32 op, const void *payload) {
     k.minus_one = depth_mode == 0;
     if (!vk.dyn_logic_op) k.logic_op = st.color.logic_op & 15;
     if (fs && st.color.alpha_test >= 1 && st.color.alpha_test <= 7) k.alpha_func = st.color.alpha_test;
-    VkPipeline pipe = pipeline_get(&k);
+    VkPipeline pipe = pipeline_get(&k, vs, fs);
     if (!pipe) { skip_draw("pipeline creation failed"); return; }
     if (trace_frame()) {
         const CmdDraw *d = payload;
@@ -3189,8 +3699,6 @@ static void draw_one(u32 op, const void *payload) {
 
 /* ---- compute */
 static u64 pr_hash(void) { return st.bound[ST_COMPUTE] ? st.bound[ST_COMPUTE]->hash : 0; }
-typedef struct CPipe { VkShaderModule m; VkPipeline pipe; struct CPipe *next; } CPipe;
-static CPipe *cpipes;
 
 static void dispatch(u32 op, const u8 *pay) {
     dispatches++;
@@ -3240,27 +3748,12 @@ static void dispatch(u32 op, const u8 *pay) {
     VkShaderModule m = shader_module(cs);
     mirror_bad_ssbos(st.ssbo[ST_COMPUTE], cs);
     if (!m) { skip_draw("shader not translated"); return; }
-    CPipe *cp;
-    for (cp = cpipes; cp && cp->m != m; cp = cp->next) {}
-    if (!cp) {
-        cp = calloc(1, sizeof *cp);
-        cp->m = m;
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                      vk.warp32 & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp32 : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                      .module = m, .pName = "main"}, .layout = layout_gfx};
-        if (env.pipe_log) hlog(0, "gpu: compute pipeline: cs %016llx", cs->hash);
-        double t0 = ms_now();
-        VkResult r = vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, &cp->pipe);
-        hf.pipe += ms_now() - t0;
-        hf.npipe++;
-        if (r != VK_SUCCESS)
-            hlog(0, "gpu: compute pipeline for %016llx failed", cs->hash);
-        else if (env.pipe_log) hlog(0, "gpu: compute pipeline %p: cs %016llx", (void *)cp->pipe, cs->hash);
-        cp->next = cpipes;
-        cpipes = cp;
-    }
-    if (!cp->pipe) return;
+    PipeKey k;
+    memset(&k, 0, sizeof k);
+    k.vs = cs->hash;
+    k.compute = 1;
+    VkPipeline cpipe = pipeline_get(&k, m, NULL);
+    if (!cpipe) return;
     DescSet *ts = descset_get(&st.texpool, DS_TEX), *ss = descset_get(&st.smppool, DS_SMP);
     descset_sync(ts);
     descset_sync(ss);
@@ -3272,7 +3765,7 @@ static void dispatch(u32 op, const u8 *pay) {
     }
     end_rendering();
     VkCommandBuffer c = cmd();
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
     VkWriteDescriptorSet w[16];
     VkDescriptorBufferInfo bi[16];
     int nw = stage_ubos(ST_COMPUTE, 0, cs, w, bi);
@@ -4192,11 +4685,18 @@ static void env_init(void) {
     env.pipe_log = getenv("NX_PIPE_LOG") != NULL;
     env.no_discard = getenv("NX_NO_DISCARD") != NULL;
     env.refresh_pools = getenv("NX_REFRESH_POOLS") != NULL;
-    env.pool_mirror = !(e = getenv("NX_POOL_MIRROR")) || atoi(e);
+    /* Mirrors pay where the GPU reads host memory slowly (the GTX 1650 Ti laptop's x8 link: ~3 GB/s of pool reads
+     * at 25 fps) and cost fps where it reads it fast (RX 7800 XT: 155-205 fps off vs 137-167 on). So they are on for
+     * discrete GPUs on links under 20 GB/s (PCIe 4.0 x16 is 31.5) or whose link is not known; integrated GPUs read
+     * host memory as their own */
+    bool slow = vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && (!vk.pcie_gbps || vk.pcie_gbps < 20);
+    env.pool_mirror = (e = getenv("NX_POOL_MIRROR")) ? atoi(e) != 0 : slow;
+    hlog(1, "gpu: pool mirrors %s%s", env.pool_mirror ? "on" : "off", e ? " (NX_POOL_MIRROR)" : "");
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
     env.hitch_ms = (e = getenv("NX_HITCH_MS")) ? atof(e) : 0;
+    env.feedback_log = getenv("NX_FEEDBACK_LOG") != NULL;
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;
     env.trace_hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : env.trace_lo;
@@ -4239,6 +4739,11 @@ void gpu_init(void) {
     empty_img = alloc_set(set_img, TEXPOOL_MAX);
     descset_fill(empty_tex, false, TEXPOOL_MAX);
     descset_fill(empty_smp, true, SMPPOOL_MAX);
+    _beginthreadex(NULL, 0, pcache_thread, NULL, 0, NULL);
+    char spv[MAX_PATH + 32];
+    spv_path(spv, sizeof spv, 0);               /* sets spv_dir before the prebuild threads read it */
+    if (vk.pipeline_binary) bins_load();
+    pipelines_prebuild();
     gpu_ready = true;
     hlog(1, "gpu: ready");
 }
