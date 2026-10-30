@@ -28,6 +28,7 @@ static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
 void gpu_capture_next(void);
+void gpu_reload_textures(void);
 void gpu_save_pipelines(void);
 void overlay_toggle(void);
 static volatile LONG resized;
@@ -55,6 +56,7 @@ void window_loop(void *guest_main_thread) {
                 }
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F11 && !e.key.repeat) gpu_reload_textures();
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F5 && !e.key.repeat) nx_framerate_cycle();
             } while (SDL_PollEvent(&e));

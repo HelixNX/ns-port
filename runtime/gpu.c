@@ -29,6 +29,7 @@ static struct {
     double hitch_ms;
     long trace_lo, trace_hi;
     u64 watch, dump_draws, dump_ssbo, dump_tex;
+    u64 dump_draws_list[4];
     const char *skip_shaders, *trace_ubo, *trace_fubo, *trace_filter;
     char dump[256];
 } env;
@@ -928,6 +929,22 @@ static Image *image_create(const TexInfo *t, u32 h) {
     Image *im = image_make(t, h);
     hf.image += ms_now() - t0;
     hf.nimage++;
+    /* another image over the same memory start with the same size that could not be shared (the game reuses
+     * memory in other formats): its contents and this one's drift apart (log the first few) */
+    static int overlaps;
+    if (im && overlaps < 40)
+        for (int j = byaddr_lower(im->info.addr); j < nbyaddr && byaddr[j]->info.addr == im->info.addr; j++) {
+            const Image *o = byaddr[j];
+            if (o == im || o->info.width != im->info.width || tex_height(&o->info) != tex_height(&im->info)) continue;
+            overlaps++;
+            u32 b1, b2, bw, bh;
+            format_info(o->info.format, &b1, &bw, &bh);
+            format_info(im->info.format, &b2, &bw, &bh);
+            hlog(1, "gpu: image %ux%u f%u bh%u at %llx made next to %ux%u f%u bh%u%s (not shared: %s)", im->info.width,
+                 tex_height(&im->info), im->info.format, im->info.block_height, im->info.addr, o->info.width,
+                 tex_height(&o->info), o->info.format, o->info.block_height, o->gpu_written ? ", rendered" : "",
+                 b1 != b2 ? "texel sizes differ" : "layout differs");
+        }
     return im;
 }
 
@@ -2881,6 +2898,9 @@ static VkPrimitiveTopology topology(u32 mode) {
 static volatile LONG capture_request;      /* F12 (vk.c): dump and trace the next whole frame */
 static u64 capture_frame;
 void gpu_capture_next(void) { InterlockedExchange(&capture_request, 1); }
+/* F11 (vk.c): upload every texture again from guest memory at the next present (are copies stale?) */
+static volatile LONG reload_request;
+void gpu_reload_textures(void) { InterlockedExchange(&reload_request, 1); }
 
 static bool trace_frame(void) {
     if (capture_frame && frame_no + 1 == capture_frame) return true;
@@ -3340,26 +3360,29 @@ static bool xfb_hazard(u32 op, const void *payload) {
 }
 
 static void draw_one(u32 op, const void *payload);
-static void dump_image(Image *im, const char *name, bool raw);
+static void dump_image_as(Image *im, const char *name, bool raw, VkFormat fmt);
 
-/* NX_DUMP_DRAWS=<hex address>: in a traced frame (F12, NX_TRACE), the render target at that address after every
- * draw into it, as frames/frame_<frame>_draw_<draw>_<fragment shader>.ppm (which draw makes an artifact) */
+/* NX_DUMP_DRAWS=<hex address>[,<hex address>...]: in a traced frame (F12, NX_TRACE), the render targets at those
+ * addresses after every draw into them, as frames/frame_<frame>_draw_<draw>_rt<i>_f<format>_<address>_<fragment
+ * shader>.ppm (+ .raw), decoded in the format the draw used (which draw makes an artifact) */
 static void dump_after_draw(void) {
-    u64 want = env.dump_draws;
-    if (!want || !trace_frame()) return;
-    bool hit = false;
-    for (u32 i = 0; i < st.nrt; i++) hit |= st.rt[i].t.addr == want;
-    if (!hit) return;
-    for (int bkt = 0; bkt < IMAGE_BUCKETS; bkt++)
-        for (Image *im = buckets[bkt]; im; im = im->next)
-            if (im->info.addr == want && im->info.samples <= 1) {
-                const ShaderCode *fs = st.program ? st.program->stage[ST_FRAGMENT] : NULL;
-                char name[128];
-                snprintf(name, sizeof name, "frame_%llu_draw_%07llu_fs_%016llx", frame_no + 1, draws,
-                         fs ? fs->hash : 0ull);
-                dump_image(im, name, false);
-                return;
-            }
+    if (!env.dump_draws_list[0] || !trace_frame()) return;
+    for (u32 i = 0; i < st.nrt; i++) {
+        u64 a = st.rt[i].t.addr;
+        bool want = false;
+        for (int k = 0; k < 4 && env.dump_draws_list[k]; k++) want |= a == env.dump_draws_list[k];
+        if (!want) continue;
+        /* the image bound there (other images may share the address: the game reuses render target memory) */
+        u32 ly, lv;
+        Image *im = image_find(&st.rt[i].t, &ly, &lv);
+        if (!im || im->info.samples > 1) continue;
+        VkFormat vf = usable_format(st.rt[i].t.format);
+        const ShaderCode *fs = st.program ? st.program->stage[ST_FRAGMENT] : NULL;
+        char name[160];
+        snprintf(name, sizeof name, "frame_%llu_draw_%07llu_rt%u_f%u_%llx_fs_%016llx", frame_no + 1, draws, i,
+                 st.rt[i].t.format, a, fs ? fs->hash : 0ull);
+        dump_image_as(im, name, true, vf != VK_FORMAT_UNDEFINED ? vf : im->format);
+    }
 }
 
 /* Traced frames (F12, NX_TRACE): an occlusion query around each Vulkan draw, its samples logged at present: a
@@ -4266,10 +4289,11 @@ static u32 format_bytes(VkFormat f) {
     }
 }
 
-static void dump_image(Image *im, const char *name, bool raw) {
+/* fmt: the format to decode the pixels as (a view's, which may differ from the image's); raw: also the bytes */
+static void dump_image_as(Image *im, const char *name, bool raw, VkFormat fmt) {
     u8 probe[3], zero[16] = {0};
-    if (!decode_pixel(im->format, zero, probe) || im->info.samples > 1) return;
-    u32 w = im->info.width, h = tex_height(&im->info), bpp = format_bytes(im->format);
+    if (!decode_pixel(fmt, zero, probe) || im->info.samples > 1 || format_bytes(fmt) != format_bytes(im->format)) return;
+    u32 w = im->info.width, h = tex_height(&im->info), bpp = format_bytes(fmt);
     VkBuf b;
     vk_buffer((u64)w * h * bpp, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &b);
@@ -4288,8 +4312,7 @@ static void dump_image(Image *im, const char *name, bool raw) {
         const float *v = (const float *)b.a.map;
         for (u32 i = 0; i < w * h; i++) hlog(0, "gpu: %s texel %u = %g %g %g %g", name, i, v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
     }
-    if (raw && (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT ||
-                im->format == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+    if (raw) {
         snprintf(path, sizeof path, "%s\\..\\frames\\%s.raw", exe, name);  /* float targets: exact values too */
         FILE *rf = fopen(path, "wb");
         if (rf) { fwrite(b.a.map, 1, (size_t)w * h * bpp, rf); fclose(rf); }
@@ -4301,13 +4324,20 @@ static void dump_image(Image *im, const char *name, bool raw) {
         const u8 *px = b.a.map;
         u8 *row = malloc(w * 3);
         for (u32 y = 0; y < h; y++) {
-            for (u32 x = 0; x < w; x++) decode_pixel(im->format, px + ((u64)y * w + x) * bpp, row + 3 * x);
+            for (u32 x = 0; x < w; x++) decode_pixel(fmt, px + ((u64)y * w + x) * bpp, row + 3 * x);
             fwrite(row, 1, w * 3, f);
         }
         free(row);
         fclose(f);
     }
     vk_buffer_free(&b);
+}
+
+static void dump_image(Image *im, const char *name, bool raw) {
+    /* raw bytes for the float targets only (exact values) */
+    bool fl = im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+              im->format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    dump_image_as(im, name, raw && fl, im->format);
 }
 
 static void dump_frame(Image *win, u64 frame) {
@@ -4615,6 +4645,13 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     double t_present0 = ms_now();
     EnterCriticalSection(&gpu_cs);
     refresh_cpu_textures();
+    if (InterlockedExchange(&reload_request, 0)) {
+        int n = 0;
+        for (int b = 0; b < IMAGE_BUCKETS; b++)
+            for (Image *ri = buckets[b]; ri; ri = ri->next)
+                if (ri->valid && !ri->gpu_written && ri->size && ri->info.addr >= AS_BASE) { ri->valid = false; image_upload(ri); n++; }
+        hlog(0, "gpu: F11: %d textures uploaded again from guest memory", n);
+    }
     Image *im = image_get(&w->info[index]);
     if (im) image_upload(im);
     flush();
@@ -4702,6 +4739,11 @@ static void env_init(void) {
     env.trace_hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : env.trace_lo;
     env.watch = (e = getenv("NX_WATCH")) ? strtoull(e, NULL, 16) : 0;
     env.dump_draws = (e = getenv("NX_DUMP_DRAWS")) ? strtoull(e, NULL, 16) : 0;
+    for (int k = 0; e && *e && k < 4; k++) {
+        char *end;
+        env.dump_draws_list[k] = strtoull(e, &end, 16);
+        e = *end == ',' ? end + 1 : end + strlen(end);
+    }
     env.dump_ssbo = (e = getenv("NX_DUMP_SSBO")) ? strtoull(e, NULL, 16) : 0;
     env.dump_tex = (e = getenv("NX_DUMP_TEX")) ? strtoull(e, NULL, 16) : 0;
     env.skip_shaders = getenv("NX_SKIP_SHADERS");
