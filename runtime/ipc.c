@@ -1,5 +1,8 @@
 /* HIPC framing, CMIF and TIPC requests, sessions and domains, and the service manager (sm:). */
 #include "ipc.h"
+#ifdef NX_NETPLAY
+#include "net/net.h"
+#endif
 #include <stdlib.h>
 #include <windows.h>
 
@@ -176,6 +179,13 @@ void services_init(const char *game_dir, const char *save_dir) {
     set_register();
     nifm_register();
     friends_register();
+#ifdef NX_NETPLAY
+    /* in a room (net/browser.c): local wireless and sockets on its network; otherwise both stay unavailable */
+    if (room_joined()) {
+        ldn_net_register();
+        bsd_register();
+    } else
+#endif
     ldn_register();
     bcat_register();
     system_register();

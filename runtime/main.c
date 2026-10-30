@@ -12,6 +12,9 @@
 #include "vk.h"
 #include "audio_dsp.h"
 #include "game_config.h"
+#ifdef NX_NETPLAY
+#include "net/net.h"
+#endif
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
@@ -111,6 +114,9 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: " NX_NAME " [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
+#ifdef NX_NETPLAY
+    netplay_startup(save_dir, game_dir);                /* the room browser, before anything else opens */
+#endif
     mem_init();
     kernel_init();
     dispatch_init();
