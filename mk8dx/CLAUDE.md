@@ -107,6 +107,29 @@ Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
    c[0]/c[2], all dynamic state is set per draw, global barriers around every transfer, texture pools rescanned
    per submit, imported host memory is read over PCIe). Measure before optimising.
 
+### Netplay (2026-10-31: local play over community rooms)
+
+- The user's call: multiplayer through the community room servers Eden/yuzu/Citra use (a bridge for LDN), MK8
+  only (`nx_game(... NETPLAY)` in `mk8recomp/CMakeLists.txt`; Violet does not build it). Our own code, compatible
+  on the wire with Eden so both meet in the same rooms; Eden's sources (`../deps/suyu`: `src/network`,
+  `src/core/hle/service/ldn`, `src/core/internal_network/socket_proxy.cpp`) were read for the protocol only.
+- Libraries (the user approved both downloads): `../deps/enet` (lsalzman/enet v1.3.18, the rooms' transport) and
+  `../deps/zstd` (v1.5.6, `lib/` only: Eden zstd-compresses every proxy payload), built from source by
+  `nxrecomp.cmake` (`nx_netplay_libs`).
+- Start-up (`runtime/net/browser.c`): a Win32 "Public Room Browser" (nickname, search, "<game> only" by title id:
+  the room's preferredGameId or a member's gameId, hide empty/full, refresh, member list, description, password
+  prompt, direct connect host[:port], Play Offline; closing quits). Settings in `build/save/netplay.ini`. Lobby:
+  `GET https://api.ynet-fun.xyz/lobby` (`net/lobby.c`; ids above 2^53, parsed as integers). `NX_NETPLAY=0` skips
+  the browser (test runs!), `NX_ROOM=host[:port[:password]]` + `NX_NICK` joins without it.
+- In a room: `services/ldn_net.c` (ldn:u: Scan/CreateNetwork/Connect/SyncNetwork as LDN packets via the room) and
+  `services/bsd.c` (bsd:u: UDP sockets as proxy packets from our fake 192.168.x.y address; TCP refused, as in
+  Eden). Offline both stay as before (ldn unavailable, bsd stubbed). `net/room.c` owns ENet on its own thread.
+- Verified: the browser lists the rooms (25 MK8 of 133); joining a real public room works (fake address assigned,
+  game info shown to the room). Not yet tested: a local-play session with a second player (two of our instances in
+  one room, or one of ours with an Eden player).
+- 2026-10-31: MK8 was re-lifted with the current lifter (the Violet-era lifter writes unresolved-import stubs into
+  `table.c`); `dump_v21` was rebuilt from the NSPs (`elf/` by `../nxrecomp/tools/nso2elf.py`).
+
 ### Runtime notes (`../nxrecomp/runtime`)
 
 - Run: `mk8recomp\run.ps1 [-Log 0-2] [-Timeout s] [-NoBuild]` builds, runs `build/cmake/mk8recomp.exe` and prints

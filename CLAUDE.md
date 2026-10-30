@@ -26,7 +26,7 @@ behaviour only: our own implementation, never copied code.
 | `nxrecomp/` | shared source, a git repo (split from MK8's on 2026-10-17, history kept): `runtime/` (kernel, SVCs, IPC and services, NVN on Vulkan, audio, input), `tools/` (lifter, image builder, shader translator, IDA export), `nxrecomp.cmake` (`nx_game`). A game's repo holds `game.json` (name, title, title id, modules with fixed bases, dump/analysis/build paths; see `tools/gamecfg.py`), an optional `overrides.txt` and a `CMakeLists.txt` calling `nx_game`; run the tools from inside the game's repo |
 | `keys/` | `prod.keys`, `title.keys`; `.switch/` holds copies for nstool (see Tool notes) |
 | `firmware/` | `Firmware_22.5.0.zip` and its contents in `22.5.0/` (NCAs; `keys/prod.keys` covers it). MiiModel is `99d7c22f….nca`; find others with `nstool <nca>` (ProgID) and extract with `nstool -x / <dir> <nca>` |
-| `deps/` | `SDL3/SDL3-3.4.18` (VC), `Vulkan-Headers` (v1.4.341), `glslang` (16.6.0 release), `suyu` (sparse Eden checkout, `src/core/hle/service/mii` only; widen it with `git -C deps/suyu sparse-checkout add <dir>` for service or shader references) |
+| `deps/` | `SDL3/SDL3-3.4.18` (VC), `Vulkan-Headers` (v1.4.341), `glslang` (16.6.0 release), `suyu` (sparse Eden checkout of the service, network and shader directories consulted so far; widen it with `git -C deps/suyu sparse-checkout add <dir>`), `enet` (v1.3.18) and `zstd` (v1.5.6, `lib/` only) for MK8's netplay |
 | `ref/` | `SavageWindRecomp` (BotW 1.8.2 recompilation on LAS Recomp, MIT, cloned 2026-10-22; notes in Spanish in `docs/SAVAGE-WIND.md`; reference only) |
 | `.tools/` | `nstool.exe`, `ida-mcp` (headless IDA for REA) |
 | `.claude/`, `.mcp.json` | Claude Code settings, REA MCP config |
