@@ -4,7 +4,8 @@
 #        .\bench.ps1 <name> -Summary                   the averages of an earlier run's log
 #        .\bench.ps1 <name> -Rgp 19000 [NAME=value ...] an RGP capture of that frame into build/<name>.rgp
 #                                                       (Adrenalin 26.10.2 and the RDTS in .tools/rdts)
-param([string]$Name, [switch]$Summary, [int]$Rgp = 0, [Parameter(ValueFromRemainingArguments)] [string[]]$Env = @())
+# $Name is the only positional parameter, so NAME=value pairs go to $Env, not -Rgp
+param([Parameter(Position = 0)] [string]$Name, [switch]$Summary, [int]$Rgp = 0, [Parameter(ValueFromRemainingArguments)] [string[]]$Env = @())
 $b = Join-Path (Split-Path -Parent $PSScriptRoot) 'build'
 $log = "$b\bench_$Name.log"
 if (-not $Summary) {
