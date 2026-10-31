@@ -222,11 +222,15 @@ rate now**).
      Compared 2026-11-01 (`deps/suyu` widened to all of src/shader_recompiler). Eden lifts to SSA IR, runs passes
      (constant propagation, texture tracking, global memory -> SSBO, structured control flow) and emits SPIR-V;
      we emit GLSL with no passes. Worth taking, as ideas (counts over the 4,437 translated shaders).
-     **a and b done (2026-11-01, uncommitted)**: translate.py `ix()` / the c[1] literals in `cbuf()`; vk.c enables
+     **a and b done (2026-11-01, nxrecomp `3f6dbc1`)**: translate.py `ix()` / the c[1] literals in `cbuf()`; vk.c enables
      shaderSampled/StorageImageArrayDynamicIndexing. All 4,433 shaders compile. GTX 1650 Ti: GPU busy 8.587 ->
      8.592 ms (no change, as expected on NVIDIA); the presented frame 3000 is byte-identical, 116 of 117 render
      targets too (the other: a 1024x1024 foliage depth map, differing at leaf edges, likely wind; not chased).
-     Still to measure on the RX 7800 XT.
+     RX 7800 XT (2026-10-31, one exe, translate.py swapped between `471f5c7` and `3f6dbc1`, old / new / new /
+     old): frame 6.581 / 6.509 / 6.253 / 6.207 ms, GPU busy 5.406 / 5.369 / 5.601 / 5.541 ms; averages old 6.394
+     / 5.474, new 6.381 / 5.485: **no change on AMD either** (NonUniform waterfalls were not the GPU's cost).
+     Drift between the pairs (~0.35 ms, either version) was bigger than the difference: a translator change
+     drops pipelines.bins, so the first runs built their pipelines again. Logs build/bench_nonuni_*.log.
      a. **No `nonuniformEXT` on handles read from c[2] at a fixed offset** (68,161 uses; TEX.B is unsupported, so
         that is every texture access). The value is uniform across the draw; Eden marks NonUniform only when the
         index isn't a constant. On AMD, NonUniform can turn each sample into a waterfall loop. Keep it for
