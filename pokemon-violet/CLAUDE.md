@@ -219,6 +219,33 @@ rate now**).
   4. **Shader quality** (translate.py's SPIR-V): compare one hot fragment shader (the G-buffer's, NX_GPU_PROF=2)
      against Eden's shader_recompiler for how it handles constant buffers, texture handles and control flow. Only
      after 1-3, which are cheaper to test.
+     Compared 2026-11-01 (`deps/suyu` widened to all of src/shader_recompiler). Eden lifts to SSA IR, runs passes
+     (constant propagation, texture tracking, global memory -> SSBO, structured control flow) and emits SPIR-V;
+     we emit GLSL with no passes. Worth taking, as ideas (counts over the 4,437 translated shaders).
+     **a and b done (2026-11-01, uncommitted)**: translate.py `ix()` / the c[1] literals in `cbuf()`; vk.c enables
+     shaderSampled/StorageImageArrayDynamicIndexing. All 4,433 shaders compile. GTX 1650 Ti: GPU busy 8.587 ->
+     8.592 ms (no change, as expected on NVIDIA); the presented frame 3000 is byte-identical, 116 of 117 render
+     targets too (the other: a 1024x1024 foliage depth map, differing at leaf edges, likely wind; not chased).
+     Still to measure on the RX 7800 XT.
+     a. **No `nonuniformEXT` on handles read from c[2] at a fixed offset** (68,161 uses; TEX.B is unsupported, so
+        that is every texture access). The value is uniform across the draw; Eden marks NonUniform only when the
+        index isn't a constant. On AMD, NonUniform can turn each sample into a waterfall loop. Keep it for
+        register handles (surface() without bit 51, TMML.B).
+     b. **Inline c[1] as literals** (86,891 UBO loads; fd87a85cf5d0fd96.frag has 93). c[1] is the shader's own
+        embedded constants (gpu.c binds `sc->const_addr`), so `sh.consts` + flit() give the values at translate
+        time. Eden does the same for bank 1 (FoldDriverConstBuffer). Keep the binding only for dynamic reads (cbr1, BRX).
+     c. **XMAD triples -> one multiply** (~4,000 XMADs). GLSLC builds 32-bit `a * b + c` from XMAD; XMAD.MRG;
+        XMAD.PSL.CBCC. Eden matches it in the IR (FoldXmadMultiplyAdd / FoldXmadMultiply); we can match the three
+        instructions in a block (same Ra/Rb, not written in between) and emit `a * b + c` at the third.
+        Skinning and index math use it.
+     d. **FSWZADD 0x99 / 0xA5 on a quad swap -> dFdxFine / dFdyFine** (722 FSWZADDs; Eden's FoldFSwizzleAdd,
+        matching the SHFL.BFLY before it). Native derivatives instead of subgroup lane math.
+     e. Correctness, not speed: Eden marks every FADD / FMUL / FFMA NoContraction (`precise`). We let the driver
+        fuse FMUL + FADD into an FMA, which the console doesn't do (depth pre-pass / G-buffer positions can
+        differ between shaders). Try it if z-fighting shows up; it costs some speed.
+     Not worth it for us: Eden's texture pass (reads handles at pipeline build and specializes; conflicts with
+     offline translation), global memory -> SSBO (our buffer_reference addresses are fine), and its structured
+     control flow (only 8 shaders loop; the `reached` flag DAG is something to look at only if RGP shows branch costs).
   Order: 1 (one switch, one run), then 2, then 3. Measure each with NX_GPU_TIMELINE busy, and check frames
   (NX_DUMP) as above.
 - **RGP on the stand-still scene (2026-10-31, Adrenalin 26.10.2; build/standstill*.rgp).** NX_GPU_LABELS=1
