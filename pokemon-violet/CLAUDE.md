@@ -216,6 +216,33 @@ rate now**).
      after 1-3, which are cheaper to test.
   Order: 1 (one switch, one run), then 2, then 3. Measure each with NX_GPU_TIMELINE busy, and check frames
   (NX_DUMP) as above.
+- **RGP on the stand-still scene (2026-10-31, Adrenalin 26.10.2; build/standstill*.rgp).** NX_GPU_LABELS=1
+  (vk.c enables VK_EXT_debug_utils; gpu.c labels each pass `pass WxH c<i>:<vk format> ds:<format> @<addr>`, each
+  draw `draw vs <hash> fs <hash>`, dispatches `compute <hash>`, barriers `barrier L<gpu.c line>`, `end pass
+  L<line>` for who ended a pass, `nvn barrier` for the game's). Line numbers are of the gpu.c that was captured.
+  - No DCC / depth decompress, fast-clear eliminate or FMask work at any barrier. Barriers 2.1-2.5% of the frame
+    directly, but ~230 a frame, every one a FULL stall that invalidated K / L0 / L1 / L2 / CB / DB and flushed
+    L2 / CB / DB. The driver also adds "Before / After CS color clear" barriers: some clears run as compute.
+  - The frame opens with the skinning chain: passes `1920x1080 c0:37 @12fad3a000` of transform-feedback draws
+    (no fragment shader; vs 44f2ec77be3a3fd3 and others), split every 1-5 draws by the game's NVN barriers (each
+    ends our pass, then a full barrier). Draws of 48-1,804 vertices take 5-20 us each and never overlap, also
+    inside one pass (AMD keeps transform feedback in order; the shader may be slow too). Its total length is not
+    measured yet (RGP's own pass grouping put ~2.1 ms at the frame start).
+  - Most expensive draw: a full-screen triangle on the lit scene buffer (`1920x1080 c0:122 ds:130 @12f5ee2000`,
+    vs 5250e040fae92a2c fs fd87a85cf5d0fd96), 236 us of work. The ~20 DrawIndexed(132) beside it (fs
+    8516272888b0f0c0, likely light volumes) do 1.5-10 us each; their ~217 us "duration" is waiting beside it.
+    Next: the G-buffer pass (`@12f80a2000`, 4 colour + depth), 8-21 us of work per draw.
+  - **Tried: narrower pass-end barriers (nxrecomp `471f5c7`): no change.** A pass with no colour or depth
+    writes (no rasterizing draw, no clear: gpu.c `pass_att_writes`) ends with a barrier naming only shader-store
+    and transform-feedback writes (`ACCESS_NO_ATTACHMENTS`); the xfb_hazard path no longer adds a second barrier
+    after end_rendering's. RGP: CB / DB flushes 234 -> 180 a frame, the skinning barriers flush only L2; still
+    FULL stalls. Two A/B rounds: frame 6.38 / 6.33 ms full (NX_FULL_BARRIERS=1) vs 6.28 / 6.40 narrow, GPU busy
+    5.73 / 5.68 vs 5.64 / 5.73: noise (both ~0.3 ms above the morning's, the RGP window was open). Kept (correct,
+    fewer flushes). So the cost is the stall (each barrier drains the GPU), not the flushes.
+  - Next: in a pass with no colour or depth writes, do not end the pass at the game's NVN barrier (the
+    transform-feedback data is already guarded by xfb_hazard), behind a switch; measure and check skinning in
+    NX_DUMP frames. Then the skinning chain's total time, `fs fd87a85cf5d0fd96`, and shaders against Eden's
+    shader_recompiler (the user's plan).
 
 In order:
 
@@ -504,7 +531,24 @@ In order:
     suite matched to the user's driver, Adrenalin 25.9.2, which they keep for stability: both in `.tools/`). Not
     ours: on 2026-10-31 a Frame capture of the SDK's vkcube hangs all of Windows too (the RX 7800 XT's screen
     goes black, the iGPU's monitor freezes, no TDR recovery, manual reset). RGP is out on this driver: don't
-    try it again;
+    try it again. The Panel must be running and connected before the program starts, or it is not listed.
+    **Planned (2026-10-31): try Adrenalin 26.10.2.** The user's earlier update trouble was Vulkan broken for an AI
+    workload (compute path), likely on an early 26.x driver; game rendering may be fine. Keep the 25.9.2 installer
+    and roll back cleanly (AMD Cleanup Utility or DDU in safe mode). Check in order, stop at the first failure:
+    (1) vkcube runs, (2) the stand-still benchmark (vs 6.1 ms frame / 5.4 ms GPU busy, NX_GPU_TIMELINE) and a clean
+    NX_VK_VALIDATION run, (3) the AI workload, (4) an RGP Frame capture of vkcube with an RDTS release of the same
+    period, (5) only then a capture of the game. Installed 2026-10-31 (RX 7800 XT 32.0.32015.7029; the iGPU got
+    32.0.21045.16010): (1) passes; (2) passes: 6.05 ms frame / 5.40 GPU busy (unchanged), validation only the
+    known interface mismatches (RuntimeSpirv-Location-06272, -OpEntryPoint-08743); (3) skipped (not needed);
+    (4) passes: vkcube captured, no hang. Capture from the command line, CLI first, then the program:
+    `.tools\rdts\RadeonDeveloperToolSuite-2026-10-02-1872\RadeonDeveloperPanelCLI.exe -m profiling -p <name>
+    --rgp-auto-capture=frame:N -o <file>.rgp` (N >= 5). Neither it nor the program exits after the capture:
+    stop both. (5) passes: the stand-still scene captured at frame 22,000 (build/standstill.rgp, 20.8 MB; the
+    scene starts near frame 13,000-17,000, so 20,000 can still be in the load). With the CLI attached but not
+    capturing, 6.36 ms a frame. **RGP works on 26.10.2: stay on it.** Captures since: NX_GPU_LABELS=1 (names
+    in RGP's user events, see Next), capture at frame 19,000 with `--rgp-sqtt-buffer-size high`, and wait for
+    the .rgp file to appear before stopping the game (a fixed 120 s cut two captures off mid-trace: "trace failed
+    with result: -2"). Findings are under Next;
     Windows' GPU engine counters show 0% for us (AMD submits past them). Stable clocks (1295 MHz GPU / 750 MHz memory, ~-40%) cost only ~13% (117 fps). With every draw
     skipped (NX_GPU_SKIP=1) the game runs ~290 fps, translation 0.6 ms (4.0 normally): main 75%, 5a/5b 62-70%,
     5c waits for a core 11%. Pools (Mesagoza): 3,314 CPU_NO_ACCESS (367 MB), one 350 MB CPU_UNCACHED pool, a
