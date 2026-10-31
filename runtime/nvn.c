@@ -202,12 +202,22 @@ static void pool_initialize(Ctx *c) {
         p->gpu = p->storage;
     }
     hlog(2, "nvn: pool %llx: storage %llx+%llx flags %x gpu %llx", A(0), p->storage, p->size, p->flags, p->gpu);
+    /* importing the pool's memory makes the driver pin it page by page (NtQueryVirtualMemory): long for big pools
+     * and not the console CPU's work, so the thread gives up its core meanwhile (MK8's loader thread held core 0
+     * through a track load, the main thread waiting for it half the time: 1-4 s frames). The pool is not the
+     * game's until this returns */
+    core_leave();
     gpu_pool_created(p);
+    core_enter();
     RET(1);
 }
 static void pool_finalize(Ctx *c) {
     Pool *p = obj_get(A(0), T_POOL);
-    if (p) gpu_pool_destroyed(p);
+    if (p) {
+        core_leave();
+        gpu_pool_destroyed(p);
+        core_enter();
+    }
     obj_free(A(0));
 }
 static void pool_map(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->storage : 0); }
