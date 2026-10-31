@@ -807,7 +807,7 @@ static VkFormat srgb_twin(VkFormat f) {
 /* The formats an image's views may use: its own, and the twins image_view picks (sampled, integer, storage,
  * sRGB / UNORM). Only an image with more than one is made MUTABLE_FORMAT, with these as its format list: a
  * mutable image without a list loses colour compression (DCC) on AMD. A guest view in any other format falls back
- * to the image's own (logged). NX_MUTABLE_ALL=1: every image mutable, no lists (as before 2026-11-01) */
+ * to the image's own (logged). NX_MUTABLE_ALL=1: every image mutable, no lists (as before 2026-10-31) */
 static void format_list(Image *im) {
     VkFormat f = im->format, c[5] = {sampled_format(f), uint_twin(f), srgb_twin(f),
         im->usage & VK_IMAGE_USAGE_STORAGE_BIT ? storage_format(f) : f, f};
