@@ -26,6 +26,7 @@ import io
 import json
 import os
 import pickle
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -376,6 +377,8 @@ class Program:
 
 # calls of these also set a host jump buffer in the caller's frame (a64rt.h GUEST_SETJMP); longjmp is an override
 SETJMP = {'setjmp', '_setjmp', '__setjmp'}
+# the LOAD statements of registers a call leaves as they were (see emit)
+KEPT_ACROSS_CALLS = re.compile(r'(X(19|2\d|30) = c->x\[|SP = c->x\[|V(8|9|1[0-5]) = c->v\[)')
 
 
 def mangle(sym):
@@ -456,12 +459,15 @@ class Fn:
         self.fk = None
         if self.mod.plt.get(target - self.mod.base) in SETJMP:
             return 'X30 = 0x%xull; SAVE; GUEST_SETJMP(%s); LOAD;' % (ret_addr, self.env.callee(target))
-        return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, self.env.callee(target))
+        name = self.env.callee(target)
+        if name.startswith('h_'):                      # host replacements may set any register
+            return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, name)
+        return 'X30 = 0x%xull; SAVEC; %s(c); LOADC;' % (ret_addr, name)
 
     def call_ind(self, expr, ret_addr):
         self.wx.add(30)
         self.fk = None
-        return '{ u64 t = %s; X30 = 0x%xull; SAVE; call_ind(c, t); LOAD; }' % (expr, ret_addr)
+        return '{ u64 t = %s; X30 = 0x%xull; SAVEC; call_ind_fast(c, t); LOADC; }' % (expr, ret_addr)
 
     def jump(self, target):
         """Unconditional direct branch."""
@@ -481,12 +487,12 @@ class Fn:
                 if ta in self.addrs:
                     self.labels.add(ta)
                     out.append('case 0x%xull: goto L_%x;' % (ta, ta))
-            out.append('default: c->pc = JT; SAVE; MUSTTAIL return jump_ind(c); } }')
+            out.append('default: c->pc = JT; SAVE; MUSTTAIL return jump_ind_fast(c); } }')
             return ' '.join(out)
-        return '{ c->pc = %s; SAVE; MUSTTAIL return jump_ind(c); }' % expr
+        return '{ c->pc = %s; SAVE; MUSTTAIL return jump_ind_fast(c); }' % expr
 
     def ret(self, expr):
-        return '{ SAVE; return; }'
+        return '{ SAVEC; return; }'
 
     def svc(self, n):
         self.fk = None
@@ -722,11 +728,18 @@ def emit(fn, lines, entries=None):
     save += ['c->v[%d] = V%d;' % (n, n) for n in sorted(fn.wv)]
     load = ['%s = c->x[%d];' % (regname(n), n) for n in used_x]
     load += ['V%d = c->v[%d];' % (n, n) for n in used_v]
+    # Calls (BL, BLR) and returns follow the AAPCS64: NZCV is not passed or kept, and the callee keeps x19-x30, sp
+    # and the low halves of v8-v15 (the caller's own values are kept in its locals), so SAVEC leaves the flags out
+    # and LOADC reloads only what a call may change. Every register still goes to the Ctx before a call, so a
+    # callee that spills one (and anything reading those spills) sees the current value.
+    savec, loadc = list(save), [s for s in load if not KEPT_ACROSS_CALLS.match(s)]
     if fn.flags:
         save.append('c->nf = NF; c->zf = ZF; c->cf = CF; c->vf = VF;')
         load.append('NF = c->nf; ZF = c->zf; CF = c->cf; VF = c->vf;')
     out.append('#define SAVE do { %s } while (0)' % ' '.join(save))
     out.append('#define LOAD do { %s } while (0)' % ' '.join(load))
+    out.append('#define SAVEC do { %s } while (0)' % ' '.join(savec))
+    out.append('#define LOADC do { %s } while (0)' % ' '.join(loadc))
     if multi:
         out.append('  switch (c->entry) { %s}' % ''.join('case %d: goto L_%x; ' % (i, e) for i, e in enumerate(entries)
                                                           if i or fn.order[0] != e))
@@ -743,6 +756,8 @@ def emit(fn, lines, entries=None):
             out.append('  ' + stmt)
     out.append('#undef SAVE')
     out.append('#undef LOAD')
+    out.append('#undef SAVEC')
+    out.append('#undef LOADC')
     out.append('}')
     if multi:
         for i, e in enumerate(entries):

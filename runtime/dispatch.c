@@ -17,13 +17,27 @@ static int ntables;
 static struct { const char *name; GuestFn fn; } hostcalls[HOSTCALL_MAX];
 static int nhostcalls;
 
+/* every module's slots in one table from the lowest module to the end of the highest text (a64rt.h guest_fn_fast):
+ * the gaps between texts are never written, so their pages stay untouched */
+GuestFn *fn_flat;
+u64 fn_flat_base, fn_flat_span;
+
 void dispatch_init(void) {
+    u64 lo = ~0ull, hi = 0;
+    for (const ModInfo *m = lifted_modules; m->name; m++) {
+        if (m->base < lo) lo = m->base;
+        if (m->text_end > hi) hi = m->text_end;
+    }
+    fn_flat_base = lo;
+    fn_flat_span = hi - lo;
+    fn_flat = VirtualAlloc(NULL, fn_flat_span / 4 * sizeof(GuestFn), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!fn_flat) fatal("no memory for the function table (%llx bytes of text)", (unsigned long long)fn_flat_span);
     for (const ModInfo *m = lifted_modules; m->name; m++) {
         FnTable *t = &tables[ntables++];
         t->base = m->base;
         t->span = m->text_end - m->base;
         t->name = m->name;
-        t->tab = calloc(t->span / 4, sizeof(GuestFn));
+        t->tab = fn_flat + (m->base - fn_flat_base) / 4;
         for (const FnEntry *e = m->entries; e->fn; e++) {
             t->tab[(e->addr - m->base) / 4] = e->fn;
             u64 h = (u64)(uintptr_t)e->fn;
@@ -494,9 +508,51 @@ static void prof_table(const char *title, const u64 *rips, long n, int show) {
     free(e);
 }
 
+/* lifted code's samples by the kind of guest instruction behind them (the line tables give the guest pc). A call's
+ * line covers its SAVE, the host call and its LOAD; "entry" is a function's own loads of the Ctx before its first
+ * guest line. Per report window */
+enum { PK_ENTRY, PK_BL, PK_BLR, PK_RET, PK_BR, PK_BRANCH, PK_EXCL, PK_BARRIER, PK_SVC, PK_LDST, PK_LDST_SIMD,
+       PK_SIMD, PK_INT, PK_NK };
+static const char *const pk_names[PK_NK] = {"entry (Ctx loads)", "bl (SAVE, call, LOAD)", "blr (call_ind)", "ret (SAVE)",
+    "br (jump_ind / switch)", "b, b.cond, cbz, tbz", "exclusive / acquire / release", "dmb / dsb", "svc",
+    "load / store", "load / store (FP/SIMD)", "FP / SIMD", "integer"};
+static long pk_count[PK_NK], pk_total;
+
+static int pk_kind(u32 w) {
+    if ((w & 0xfc000000u) == 0x94000000u) return PK_BL;
+    if ((w & 0xfffffc1fu) == 0xd63f0000u) return PK_BLR;
+    if ((w & 0xfffffc1fu) == 0xd65f0000u) return PK_RET;
+    if ((w & 0xfffffc1fu) == 0xd61f0000u) return PK_BR;
+    if ((w & 0xfc000000u) == 0x14000000u || (w & 0xff000010u) == 0x54000000u || (w & 0x7e000000u) == 0x34000000u ||
+        (w & 0x7e000000u) == 0x36000000u) return PK_BRANCH;
+    if ((w & 0x3f000000u) == 0x08000000u) return PK_EXCL;
+    if ((w & 0xfffff09fu) == 0xd503309fu) return PK_BARRIER;
+    if ((w & 0xffe0001fu) == 0xd4000001u) return PK_SVC;
+    if ((w & 0x0a000000u) == 0x08000000u) return w & 0x04000000u ? PK_LDST_SIMD : PK_LDST;
+    if ((w & 0x0e000000u) == 0x0e000000u) return PK_SIMD;
+    return PK_INT;
+}
+
 void profile_report(void) {
     long n = prof_n;
     if (!prof_thread || n < 100) return;
+    for (long i = 0; i < n; i++) {
+        u64 r = prof_top[i];
+        if (r < lifted_lo || r >= lifted_hi) continue;
+        u64 g = guest_pc_of(r);
+        pk_count[g ? pk_kind(*(const u32 *)(uintptr_t)g) : PK_ENTRY]++;
+        pk_total++;
+    }
+    if (pk_total) {
+        char b[512];
+        int o = snprintf(b, sizeof b, "profile: lifted samples by guest instruction (%ld):", pk_total);
+        for (int k = 0; k < PK_NK; k++)
+            if (pk_count[k] && o < (int)sizeof b)
+                o += snprintf(b + o, sizeof b - o, " %s %.1f%%;", pk_names[k], 100.0 * pk_count[k] / pk_total);
+        hlog(0, "%s", b);
+        memset(pk_count, 0, sizeof pk_count);
+        pk_total = 0;
+    }
     long lifted = 0, runtime = 0, other = 0;
     for (long i = 0; i < n; i++) {
         u64 r = prof_top[i];

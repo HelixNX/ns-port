@@ -48,6 +48,26 @@ typedef struct { const char *name; u64 base, text_end, size; const FnEntry *entr
 /* provided by the runtime */
 void call_ind(Ctx *c, u64 addr);         /* BLR: call the lifted function at addr */
 void jump_ind(Ctx *c);                   /* BR (tail position): jump to c->pc */
+
+/* the lifted function at a guest text address, from one table over all modules (dispatch.c), or NULL; the
+ * lifted code looks targets up here first and leaves host calls and bad addresses to call_ind / jump_ind */
+extern GuestFn *fn_flat;
+extern u64 fn_flat_base, fn_flat_span;
+static inline GuestFn guest_fn_fast(u64 a) {
+    u64 off = a - fn_flat_base;
+    return off < fn_flat_span && !(off & 3) ? fn_flat[off / 4] : NULL;
+}
+static inline void call_ind_fast(Ctx *c, u64 a) {
+    GuestFn f = guest_fn_fast(a);
+    c->pc = a;
+    if (f) f(c);
+    else call_ind(c, a);
+}
+static inline void jump_ind_fast(Ctx *c) {
+    GuestFn f = guest_fn_fast(c->pc);
+    if (f) MUSTTAIL return f(c);
+    MUSTTAIL return jump_ind(c);
+}
 void guest_trap(Ctx *c, const char *what, u64 pc);
 void guest_unimpl(Ctx *c, u64 pc, u32 insn, const char *what);
 void guest_svc(Ctx *c, u32 imm);

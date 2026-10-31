@@ -362,6 +362,8 @@ def write_c(cases, funcs, envs, mem_init):
 
 
 HARNESS = r'''
+GuestFn *fn_flat;
+u64 fn_flat_base, fn_flat_span;                /* empty: every indirect branch goes to the stubs below */
 void call_ind(Ctx *c, u64 a) { c->pc = a; c->branched = 1; }
 void jump_ind(Ctx *c) { c->branched = 1; }
 void guest_trap(Ctx *c, const char *w, u64 pc) { c->pc = 0xdead0000ull; c->branched = 1; }
