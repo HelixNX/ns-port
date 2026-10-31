@@ -502,8 +502,8 @@ In order:
     CPU_NO_ACCESS pools in video memory (582 MB moved), staging in Resizable-BAR video memory. RGP captures lose
     the device the moment the trace starts (any trace size, early or late; RDTS 2026-10-02 and the 2025-07-01
     suite matched to the user's driver, Adrenalin 25.9.2, which they keep for stability: both in `.tools/`). Not
-    ours: on 2026-10-31 a Frame capture of the SDK's vkcube hung the driver too (the RX 7800 XT's screen goes
-    black, the iGPU's monitor stayed up or froze, no TDR recovery, manual reset). RGP is out on this driver: don't
+    ours: on 2026-10-31 a Frame capture of the SDK's vkcube hangs all of Windows too (the RX 7800 XT's screen
+    goes black, the iGPU's monitor freezes, no TDR recovery, manual reset). RGP is out on this driver: don't
     try it again;
     Windows' GPU engine counters show 0% for us (AMD submits past them). Stable clocks (1295 MHz GPU / 750 MHz memory, ~-40%) cost only ~13% (117 fps). With every draw
     skipped (NX_GPU_SKIP=1) the game runs ~290 fps, translation 0.6 ms (4.0 normally): main 75%, 5a/5b 62-70%,
