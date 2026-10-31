@@ -143,7 +143,13 @@ rate now**).
   ~24 reloads, spills). Now calls follow the AAPCS64 (a64lift SAVEC / LOADC: no flags, x19-x30 / sp / v8-v15 not
   reloaded; everything still stored first): CPU-only **4.41 -> 3.99 ms (228 -> 252 fps)**, ~40 windows each.
   Indirect calls look up one flat table inline (a64rt.h `call_ind_fast` / `jump_ind_fast`): main's runtime share
-  9.6 -> 3.1%, **no frame-time change**. a64test passes (18,163 + 17,355 cases; run it with `py -3.12`, the
+  9.6 -> 3.1%, **no frame-time change**. Stack accesses (2026-10-31, nxrecomp after `3f6dbc1`): the lifter emits
+  loads/stores with SP as the base as a64rt.h `LDS` / `STS` (22% of all loads/stores in main_003.c), volatile
+  unless built with `-DNX_STACK_PLAIN=ON`. CPU-only ABBA (bench.ps1 NX_GPU_SKIP=1): plain 4.109 / 4.002 ms,
+  volatile 3.992 / 4.003: **no change** (the game's compiler already left only needed stack traffic; calls force
+  reloads anyway). The first run after swapping exes is ~0.08-0.1 ms slow (two rounds): don't count it.
+  Main then (NX_PROFILE=main): ~2.9 ms computing, ~0.95 ms a frame blocked at `main+b47d18` (~12 joins a frame,
+  workers 5a/5b 54-63% busy). a64test passes (18,163 + 17,355 cases; run it with `py -3.12`, the
   Python that has capstone and unicorn).
 - Why CPU-only stays ~250 fps (2026-10-30): not one thread's speed. Main runs ~70%, blocked ~20% at the job join
   (main+b47d18, ~11 waits a frame, ~6 us to wake); 5a is idle ~35% waiting for jobs at the same condvar (~16 waits
@@ -322,6 +328,41 @@ In order:
 3. **CPU-only hand-offs** (only matters without rendering): a short spin after giving up the emulated core,
    before sleeping, at the job condvar; measure with NX_PROFILE's wake columns. Lifted calls are done (Status
    above); passing arguments in host registers is the remaining step there (a big lifter rewrite, ~5-10% at most).
+   **Where this stands (2026-10-31): park it until the GPU work is done.** Main computes ~2.9 ms a frame against
+   ~2.2-2.8 ms estimated for native code, the rest of CPU-only's 4.0 ms is the job hand-offs (the game's design),
+   and with rendering the frame is GPU-bound (busy 5.5 of 6.4 ms), so this shows only in CPU-only runs. Stack
+   accesses without volatile: no change (Status, "Lifted calls"). C vs C++ for the generated code: no difference
+   (same LLVM backend; Eden's speed is dynarmic, a JIT, not its language).
+   Register-argument design, checked on clang-cl 19.1.5 (scratch test, not committed):
+   - `__attribute__((preserve_none))` passes Ctx + 11 u64 in registers on Windows x64; musttail and calls through
+     pointers work. A 16-byte struct return goes through memory (and adds /GS cookies): return x0 only.
+   - Signature `NXCC u64 f_X(Ctx *c, u64 x0..x8, u64 sp, u64 x30)`; v0-v7 stay in the Ctx. At `bl` / `blr`, store
+     only the written x19-x29 (the unwinder and longjmp read them off the guest stack) and X1 (tlsdesc-style callees
+     keep x1-x17 without writing them), then `X0 = f(...)` and reload X1 and the V registers. Callers keep
+     x2-x18 (AAPCS64; tlsdesc keeps them). `ret`: store written x1, x19-x29 and V registers, `return X0`.
+   - Live-in per function: direct calls to one that reads x9-x18 before writing them (IDA chunks such as main
+     `f_7100041998`) keep the full SAVE. `b` to another function and `br` / jump tables stay fully synced.
+   - Host functions keep `void (Ctx *)` (~390 in nvn.c, hostcalls, `h_*`, trace, movie, fps.c) behind a
+     macro-generated thunk array; runtime -> guest through one `guest_enter`. Files: a64lift.py (call / ret /
+     jump / emit, funcs.h, table.c, stubs, multi-entry wrappers), a64rt.h, dispatch.c, hos.h, nvn.c, a64test.py.
+   - Afterwards: hand-decompile 5-10 of main's hottest functions with the Ghidra project
+     (`build/analysis/ghidra`), build them at -O2 and compare with the lifted x86, to list what is still worse.
+   GPU next, in its place: keep the render pass open across the game's NVN barriers in passes with no colour or
+   depth writes (the skinning chain; RGP section in Status), behind a switch.
+   **For the GTX 1650 Ti laptop (to do there):** CPU changes that gave nothing on the Ryzen 7 7800X3D (96 MB of
+   L3, which may hide costs another CPU feels). Measure them with drawing off: `violetrecomp\bench.ps1 <name>
+   NX_GPU_SKIP=1`, A / B / B / A. The first run after swapping exes is ~0.1 ms slow, so do one throwaway run first.
+   The last run holds the exe for a few seconds after it ends: retry the copy. Note the CPU-only baseline first
+   (7800X3D: 4.00 ms, ~250 fps).
+   1. Plain stack accesses: configure with `-DNX_STACK_PLAIN=ON` and rebuild (no re-lift; the lifted C already
+      has LDS / STS). Run cmake from a shell where `nxrecomp\tools\vcenv.bat` ran, or ninja isn't found.
+      7800X3D: no change.
+   2. Lifted code at -O2: `-DNX_LIFT_OPT=-O2` (~5 min full build). 7800X3D (2026-10-22): CPU-only 235 -> 244
+      fps, ~3%, inside the noise then.
+   3. The AAPCS64 calls and the inline indirect-call table (nxrecomp `cf5f543` and after) are already in every
+      build: no switch to compare. On the 7800X3D the calls helped (4.41 -> 3.99 ms), the table did not.
+   The shader changes (no nonuniformEXT on c[2] handles, c[1] literals) are GPU work and mean nothing with
+   drawing off; they were measured there already (no change, above).
 4. **Measure the dip when spawning / loading** (~80 fps for a second). Polling waits make it worse: a draw
    waiting for a pipeline a worker builds, and JIT waits, poll with Sleep(1) (gpu.c pipeline_get, the jit waits):
    each rounds up to >= 1 ms; make them events or condition variables. NX_HITCH_MS=20 logs each slow frame split
