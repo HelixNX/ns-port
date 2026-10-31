@@ -169,6 +169,27 @@ In order:
    lighting: too blunt, not proof that barriers are needed everywhere.
 2. **Render thread translation** (3.8 ms a frame, what holds real play now): cheaper translation, then take it off
    the render thread (Savage Wind's ASYNC_EXEC); the GPU wait follows it, so pair it with item 1.
+   - What "translation" is: NVN calls never reach a driver. Recording (nvn.c, on whichever thread records) writes
+     each command in our own encoding (nvn.h) into the game's command memory: cheap. At nvnQueueSubmitCommands
+     (nvn.c `queue_submit` -> gpu.c `gpu_submit`, on 5c, emulated core given up) gpu.c replays that stream into
+     Vulkan: state tracking, pipeline lookup / build, uniform staging and push descriptors (stage_ubos,
+     descset_use), vertex / index binds, render-target changes and barriers, the image cache (deswizzle on a
+     first read), then the vkCmd* calls. ~2,000 draws at ~1.7 us. On the console this is the GPU front end's work
+     (the command buffer holds GPU methods) and costs the CPU nothing at submit. Shader translation (Maxwell ->
+     SPIR-V, tools/shader/translate.py) is separate: once per shader, cached, a hitch cost, not per frame.
+   - Cheaper per draw: earlier rounds took it ~6 -> ~3.4 ms (Status, "Performance"). Sample 5c
+     (`NX_PROFILE='thread 5c'`) for what is left before picking.
+   - Off the render thread (Savage Wind: `ref/SavageWindRecomp/runtime/nvn/objects.c`, "the submission queue",
+     SAVAGEWIND_ASYNC_EXEC / SAVAGEWIND_QUEUE_AHEAD): submits, queue fences, presents and texture / sync
+     finalizes go in order to one host thread that replays them, and the guest returns at once. The guest waits
+     only where it would wait for the GPU on the console (nvnSyncWait, nvnQueueFinish): first for the queue to get
+     past that fence, then for the GPU. Replays read guest memory when they run, as the GPU does; the game fences
+     its CPU writes to memory in use. Cap how many presents may be queued (Savage Wind defaults to 1).
+   - For us: Violet's 5c already waits for frame N-1's fence (`main+cd0eb4`, nvnSyncWait) before submitting frame
+     N (Status, "GPU-bound"), so the gain is 5c recording frame N+1 while frame N replays. To check first:
+     everything in nvn.c / gpu.c that reads GPU-side results or gpu.c state synchronously (queries and reports,
+     nvnSyncWait / GetStatus, nvnWindowAcquireTexture, texture / pool / sync finalize, CPU texture writes and the
+     CPU-written texture check, the pool mirror's copy-in), and gpu_cs, the one lock over gpu.c.
 3. **CPU-only hand-offs** (only matters without rendering): a short spin after giving up the emulated core,
    before sleeping, at the job condvar; measure with NX_PROFILE's wake columns. Lifted calls are done (Status
    above); passing arguments in host registers is the remaining step there (a big lifter rewrite, ~5-10% at most).
