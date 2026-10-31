@@ -218,6 +218,7 @@ void gpu_flush(u64 queue);
 void gpu_finish(u64 queue);
 u64 gpu_fence(u64 queue);                               /* a timeline value signalled after the work so far */
 bool gpu_wait(u64 value, u64 timeout_ns);               /* true once reached */
+void gpu_wait_core_back(void);                          /* NX_GPU_TIMELINE: a waiter has its emulated core again */
 extern __declspec(thread) u64 gpu_wait_site;           /* NX_GPU_PROF: the guest caller of a wait (+1: Finish) */
 u64 gpu_completed(void);
 u64 gpu_present(u64 queue, Window *w, u32 index);    /* the timeline value the present waits for */

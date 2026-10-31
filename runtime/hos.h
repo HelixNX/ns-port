@@ -125,6 +125,7 @@ typedef struct KThread {
     bool preempted;                 /* suspended on cur_core by a higher-priority thread */
     volatile bool preempt_req;      /* give the core up at the next SVC */
     u64 ready_seq;
+    u64 acq[4];                         /* core_acquire: placed at once, by preempting, after 1 ms retries, after a release */
     u64 ready_qpc, sleep_qpc, sleeps;   /* time waiting for a core and asleep (SleepThread), for the CPU report */
     u32 handle;                     /* the handle the creator got (used as the mutex tag by the SDK) */
     void *host;                     /* Windows thread handle */

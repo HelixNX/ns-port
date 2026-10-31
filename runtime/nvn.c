@@ -318,6 +318,7 @@ static void sync_wait(Ctx *c) {
     gpu_wait_site = c->x[30];
     bool ok = gpu_wait(s->value, A(1));
     core_enter();
+    gpu_wait_core_back();
     RET(ok ? 1 : 2);
 }
 

@@ -24,8 +24,8 @@ static bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log;
-    int gpu_skip, flush_draws;
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline;
+    int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
     u64 watch, dump_draws, dump_ssbo, dump_tex;
@@ -53,6 +53,7 @@ static int cur = -1;                    /* the slot being recorded, or -1 */
 static u64 slot_serial;                 /* bumped with each slot opened (staging from older ones is gone) */
 static u64 submitted;                   /* last timeline value submitted */
 static u32 work_unflushed;              /* draws and dispatches recorded since the last submission */
+static u32 head_flush;                  /* the next early flush, in draws (NX_FLUSH_FIRST, doubling; 0: none) */
 static VkSemaphore timeline;
 
 
@@ -217,6 +218,73 @@ static double ms_now(void) {
     return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
+/* NX_GPU_TIMELINE=1: when the GPU is idle and why. Each submission gets a GPU timestamp at its start and end, and the
+ * CPU time of its vkQueueSubmit; they are read back when the slot is reused. The two clocks are lined up by the
+ * smallest (GPU start - CPU submit) in the window (no submission starts before it is submitted). Every 600 frames:
+ * GPU busy per frame (from a submission's start to its end, barrier drains inside included) and idle, split into
+ * idle with nothing submitted yet, before a guest submission's first flush (the render thread was waiting for a
+ * fence or running game code) or between flushes of one (translating slower than the GPU), and idle with work
+ * already submitted (driver and queue latency, presents on the same queue) */
+typedef struct { double submit, start, end; bool first; double woke, core, entry; } TlRec;  /* CPU ms; GPU ms on the GPU's clock */
+static VkQueryPool tl_pool;
+static double tl_submit[SLOTS];
+static bool tl_first[SLOTS], tl_used[SLOTS], tl_guest_first;
+static double tl_woke, tl_core, tl_entry, tl_rec_woke[SLOTS], tl_rec_core[SLOTS], tl_rec_entry[SLOTS];
+static TlRec *tl_recs;
+static int tl_n, tl_cap;
+
+static void tl_collect(int slot) {
+    if (!tl_used[slot]) return;
+    tl_used[slot] = false;
+    u64 t[2];
+    if (vkGetQueryPoolResults(vk.dev, tl_pool, 2 * slot, 2, sizeof t, t, sizeof *t, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    if (tl_n == tl_cap) tl_recs = realloc(tl_recs, (tl_cap = tl_cap * 2 + 4096) * sizeof *tl_recs);
+    double per = vk.props.limits.timestampPeriod / 1e6;
+    tl_recs[tl_n++] = (TlRec){tl_submit[slot], (double)t[0] * per, (double)t[1] * per, tl_first[slot], tl_rec_woke[slot],
+                              tl_rec_core[slot], tl_rec_entry[slot]};
+}
+
+static void tl_report(u64 frames) {
+    if (tl_n < 2) return;
+    double off = 1e300;                 /* GPU clock - CPU clock */
+    for (int i = 0; i < tl_n; i++) if (tl_recs[i].start - tl_recs[i].submit < off) off = tl_recs[i].start - tl_recs[i].submit;
+    double busy = 0, late_head = 0, late_mid = 0, queued = 0, wall = 0, prev = tl_recs[0].start - off;
+    double h_wake = 0, h_core = 0, h_code = 0, h_tr = 0;   /* a head gap's parts: GPU done -> waiter woken -> core back
+                                                             * -> gpu_submit entered -> first flush submitted */
+    u32 ngaps = 0;
+    for (int i = 0; i < tl_n; i++) {
+        const TlRec *r = &tl_recs[i];
+        double gs = r->start - off, ge = r->end - off;
+        if (gs > prev) {                /* the GPU was idle from prev to gs */
+            double gap = gs - prev, late = r->submit > prev ? r->submit - prev : 0;
+            if (late > gap) late = gap;
+            if (r->first) late_head += late; else late_mid += late;
+            if (r->first && late > 0) {
+                double t = prev, w = r->woke > t ? r->woke : t, c = r->core > w ? r->core : w, e = r->entry > c ? r->entry : c;
+                double sub = r->submit;
+                if (w > sub) w = sub;
+                if (c > sub) c = sub;
+                if (e > sub) e = sub;
+                h_wake += w - t, h_core += c - w, h_code += e - c, h_tr += sub - e;
+            }
+            queued += gap - late;
+            if (gap > 0.05) ngaps++;
+        }
+        if (ge > prev) busy += ge - (gs > prev ? gs : prev), prev = ge;
+    }
+    wall = prev - (tl_recs[0].start - off);
+    hlog(0, "gpu timeline: per frame %.2f ms: GPU busy %.2f, idle %.2f = nothing submitted yet (at a guest submission's "
+            "start %.2f, between its flushes %.2f) + submitted, not started %.2f; %.1f gaps over 0.05 ms, %.1f submissions",
+         wall / frames, busy / frames, (wall - busy) / frames, late_head / frames, late_mid / frames, queued / frames,
+         (double)ngaps / frames, (double)tl_n / frames);
+    hlog(0, "gpu timeline:   start gap: GPU done -> waiter woken %.2f, -> its core back %.2f, -> gpu_submit %.2f, "
+            "-> first flush submitted %.2f", h_wake / frames, h_core / frames, h_code / frames, h_tr / frames);
+    tl_n = 0;
+}
+
+void gpu_wait_core_back(void) { if (env.timeline) tl_core = ms_now(); }
+
 static void slot_open(void) {
     static int next;
     Slot *s = &slots[next];
@@ -240,6 +308,16 @@ static void slot_open(void) {
         prof_collect(next);
         vkResetQueryPool(vk.dev, prof_pool[next], 0, PROF_MAX);
     }
+    if (env.timeline) {
+        if (!tl_pool) {
+            VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = 2 * SLOTS};
+            VKCHECK(vkCreateQueryPool(vk.dev, &qi, NULL, &tl_pool));
+            vkResetQueryPool(vk.dev, tl_pool, 0, 2 * SLOTS);
+        }
+        tl_collect(next);
+        vkResetQueryPool(vk.dev, tl_pool, 2 * next, 2);
+    }
     for (int i = 0; i < s->nextra; i++) vk_buffer_free(&s->extra[i]);
     s->nextra = 0;
     s->staging_used = 0;
@@ -248,6 +326,7 @@ static void slot_open(void) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKCHECK(vkBeginCommandBuffer(s->cmd, &bi));
     if (prof_on) prof_mark_in(next, "outside passes (copies, clears, barriers)");
+    if (env.timeline) vkCmdWriteTimestamp2(s->cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, tl_pool, 2 * next);
     cur = next;
     next = (next + 1) % SLOTS;
     slot_serial++;
@@ -310,6 +389,14 @@ static void flush(void) {
     Slot *s = &slots[cur];
     bool pre = mirror_sync(s->pre);
     prof_mark("(end)");
+    if (env.timeline) {
+        vkCmdWriteTimestamp2(s->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tl_pool, 2 * cur + 1);
+        tl_first[cur] = tl_guest_first;
+        tl_rec_woke[cur] = tl_woke, tl_rec_core[cur] = tl_core, tl_rec_entry[cur] = tl_entry;
+        tl_guest_first = false;
+        tl_used[cur] = true;
+        tl_submit[cur] = ms_now();
+    }
     VKCHECK(vkEndCommandBuffer(s->cmd));
     s->value = ++submitted;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = timeline, .value = s->value,
@@ -3942,6 +4029,15 @@ static void run(u64 at, int depth) {
         case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: case OP_DRAW_ARRAYS_INDIRECT: case OP_DRAW_ELEMENTS_INDIRECT:
         case OP_MULTI_DRAW_INDIRECT: case OP_DRAW_TEXTURE: case OP_DRAW_XFB:
             draw(op, pay);
+            /* the game waits for its last frame before submitting the next, so the GPU idles until the first
+             * flush: hand it the first draws early, even in the middle of a pass (that pass splits), then twice as
+             * many each time, so that it has the next part before it runs out, until flushes come at pass
+             * boundaries (NX_FLUSH_DRAWS) */
+            if (head_flush && work_unflushed >= head_flush) {
+                flush();
+                head_flush *= 2;
+                if (head_flush >= (u32)env.flush_draws) head_flush = 0;
+            }
             break;
         case OP_DISPATCH: case OP_DISPATCH_INDIRECT:
             dispatch(op, pay);
@@ -4112,6 +4208,9 @@ void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     EnterCriticalSection(&gpu_cs);
     mirror_scan_start();
     submit_serial++;
+    tl_guest_first = true;
+    head_flush = (u32)env.flush_first;
+    if (env.timeline) tl_entry = t0;
     for (u32 i = 0; i < count; i++)
         if (handles[i]) run(handles[i], 0);
     flush();
@@ -4155,6 +4254,7 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     u64 back = submitted - value;
     double tw = ms_now();
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
+    if (env.timeline) tl_woke = ms_now();
     t_wait_ms += ms_now() - tw;
     hf.wait += ms_now() - tw;
     if (prof_on > 0) {
@@ -4718,6 +4818,7 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     }
     for (int i = 0; frames % 600 == 0 && i < nskip_why; i++) hlog(1, "gpu:   %llu skipped: %s", skip_count[i], skip_why[i]);
     if (prof_on > 0 && frames % 300 == 0) prof_report(300);
+    if (env.timeline && frames % 600 == 0) tl_report(600);
     s32 cw = w->crop[2] > 0 ? w->crop[2] : (s32)w->info[index].width;
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */
@@ -4763,8 +4864,10 @@ static void env_init(void) {
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
+    env.flush_first = (e = getenv("NX_FLUSH_FIRST")) ? atoi(e) : 32;
     env.hitch_ms = (e = getenv("NX_HITCH_MS")) ? atof(e) : 0;
     env.feedback_log = getenv("NX_FEEDBACK_LOG") != NULL;
+    env.timeline = getenv("NX_GPU_TIMELINE") != NULL;
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;
     env.trace_hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : env.trace_lo;
