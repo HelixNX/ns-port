@@ -127,7 +127,11 @@ rate now**).
   `build/save-idle-run`, then `violetrecomp.exe --log 1 --save build\save-idle-run` with NX_NOPACE=1,
   NX_TIME=1792494000, NX_INPUT='300-900/60:A' and no input after that (keep hands off the window). The title and
   load run ~16,700 frames at ~880 fps, then two windows of load hitches; average the `nvn: frame time` windows after
-  those (24+ windows in 105 s). Run to run spread ~0.2 ms a frame.
+  those (24+ windows in 105 s). Run to run spread ~0.2 ms a frame. `violetrecomp\bench.ps1 <name> [NX_X=v ...]`
+  does all of it (log build/bench_<name>.log, frame time and NX_GPU_TIMELINE busy over the windows after the first
+  one over 3 ms and the next: later single hitches are kept, they are part of the scene); `-Summary` re-reads a
+  log; `-Rgp <frame>` takes an RGP capture of that frame into build/<name>.rgp (written 2026-10-31 from the
+  steps that worked by hand, not run as a script yet). Run A / B pairs in both orders.
 - What a frame is (2026-10-22): with rendering, the render thread (5c) translates ~3.4 ms (~2,000 draws, ~1.7 us a
   draw; Savage Wind's is 2.4) and waits ~1.6-2.8 ms for the GPU; main runs only ~40% (waits on 5c). With every draw
   skipped (NX_GPU_SKIP=1): 235-244 fps (4.1-4.3 ms), main 73% running, blocked ~27% (~21% on one condition
@@ -198,8 +202,9 @@ rate now**).
      sRGB / UNORM twins), with those formats as a format list; NX_MUTABLE_ALL=1 is the old way. Two A/B rounds
      (order swapped, 31-33 windows each): frame 6.14 / 6.02 ms old vs 6.05 / 6.16 new, GPU busy 5.41 / 5.37 vs
      5.37 / 5.49: noise. Kept as the more precise setup. So AMD's driver already compresses mutable images, or
-     something else stops it (GENERAL layouts, in-pass clears), or these passes are not bandwidth-bound: Radeon GPU
-     Profiler (not installed) would show DCC per pass. Frames not yet checked with NX_DUMP.
+     something else stops it (GENERAL layouts, in-pass clears), or these passes are not bandwidth-bound. RGP (works
+     since Adrenalin 26.10.2, below) shows no DCC decompress at any barrier; whether targets are compressed at all
+     is still unknown. Frames not yet checked with NX_DUMP.
   2. **No fast clears, no load / store hints.** Every pass is LOAD_OP_LOAD / STORE_OP_STORE in GENERAL layout;
      clears are vkCmdClearAttachments inside the pass (do_clear_color). A clear at a pass's start could be the
      pass's loadOp CLEAR (AMD fast clear, and HTILE for depth), and targets the game discards or fully overwrites
