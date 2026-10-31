@@ -191,12 +191,22 @@ static const struct { u16 nvn; u32 vk; } fmt_table[] = {
     {156, VK_FORMAT_B8G8R8A8_SRGB},
 };
 
-VkFormat vk_format(u32 f) {
+static VkFormat vk_format_scan(u32 f) {
     for (size_t i = 0; i < sizeof fmt_table / sizeof *fmt_table; i++)
         if (fmt_table[i].nvn == f) return (VkFormat)fmt_table[i].vk;
     if (f >= 121 && f <= 134) return VK_FORMAT_R8G8B8A8_UNORM;        /* ASTC: decoded on upload */
     if (f >= 135 && f <= 148) return VK_FORMAT_R8G8B8A8_SRGB;
     return VK_FORMAT_UNDEFINED;
+}
+
+/* every vertex attribute of every draw asks: remembered per format (VkFormat + 1; 0 not looked up yet). Threads
+ * racing on an entry write the same value */
+VkFormat vk_format(u32 f) {
+    static volatile u32 memo[256];
+    if (f >= 256) return vk_format_scan(f);
+    u32 m = memo[f];
+    if (!m) memo[f] = m = (u32)vk_format_scan(f) + 1;
+    return (VkFormat)(m - 1);
 }
 
 bool format_is_astc(u32 f) { return f >= 121 && f <= 148; }

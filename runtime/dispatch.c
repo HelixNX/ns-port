@@ -490,13 +490,37 @@ static void prof_name(u64 rip, char *out, size_t n) {
     snprintf(out, n, "[%s]", slash ? slash + 1 : mod);
 }
 
-static void prof_table(const char *title, const u64 *rips, long n, int show) {
+/* lines: name addresses by function and source line; 1: runtime return addresses (the call that went outside), only
+ * samples whose innermost frame is outside the exe; 2: innermost addresses in the runtime only */
+static void prof_table(const char *title, const u64 *rips, long n, int show, int lines) {
     ProfEnt *e = calloc(4096, sizeof *e);
     int ne = 0;
     for (long i = 0; i < n; i++) {
         if (!rips[i]) continue;
         char nm[96];
-        prof_name(rips[i], nm, sizeof nm);
+        if (lines) {
+            bool in_rt = prof_top[i] >= exe_lo && prof_top[i] < exe_hi && !(prof_top[i] >= lifted_lo && prof_top[i] < lifted_hi);
+            if (lines == 1 ? prof_top[i] >= exe_lo && prof_top[i] < exe_hi : !in_rt) continue;
+            /* the innermost inlined function at the call (a static function inlined into its caller) */
+            HANDLE pr = GetCurrentProcess();
+            u64 a = rips[i] - (lines == 1);
+            IMAGEHLP_LINE64 line = {sizeof line};
+            DWORD disp = 0, ictx = 0, iidx = 0;
+            bool ok = false;
+            prof_name(rips[i], nm, sizeof nm);
+            if (SymAddrIncludeInlineTrace(pr, a) && SymQueryInlineTrace(pr, a, 0, a, a, &ictx, &iidx)) {
+                char sb[sizeof(SYMBOL_INFO) + 96];
+                SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+                memset(sb, 0, sizeof sb);
+                si->SizeOfStruct = sizeof(SYMBOL_INFO);
+                si->MaxNameLen = 95;
+                DWORD64 d64 = 0;
+                if (SymFromInlineContext(pr, a, ictx, &d64, si)) snprintf(nm, sizeof nm, "%s", si->Name);
+                ok = SymGetLineFromInlineContext(pr, a, ictx, 0, &disp, &line);
+            }
+            if (!ok) ok = SymGetLineFromAddr64(pr, a, &disp, &line);
+            if (ok) snprintf(nm + strlen(nm), sizeof nm - strlen(nm), ":%lu", line.LineNumber);
+        } else prof_name(rips[i], nm, sizeof nm);
         int k = 0;
         while (k < ne && strcmp(e[k].name, nm)) k++;
         if (k == ne && ne < 4096) { snprintf(e[ne].name, sizeof e[ne].name, "%s", nm); ne++; }
@@ -562,8 +586,10 @@ void profile_report(void) {
     }
     hlog(0, "profile: %ld samples: lifted guest code %.1f%%, runtime %.1f%%, other modules %.1f%%", n,
          100.0 * lifted / n, 100.0 * runtime / n, 100.0 * other / n);
-    prof_table("innermost function", prof_top, n, 25);
-    prof_table("runtime function calling outside code (driver, CRT, OS)", prof_rt, n, 15);
+    prof_table("innermost function", prof_top, n, 25, 0);
+    prof_table("runtime function calling outside code (driver, CRT, OS)", prof_rt, n, 15, 0);
+    prof_table("runtime call sites, outside code only (function:line)", prof_rt, n, 25, 1);
+    prof_table("runtime lines, innermost (function:line)", prof_top, n, 40, 2);
     prof_n = 0;
 }
 

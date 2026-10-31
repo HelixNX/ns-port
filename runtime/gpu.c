@@ -2424,11 +2424,16 @@ static FILE *pipe_list;                 /* pipelines.list, appended to */
 /* NX_PIPE_LOG (env.pipe_log): log each pipeline's shaders before it is made (a driver that aborts while compiling one) */
 static u64 pipe_vs_hash, pipe_fs_hash;
 
+/* looked up for every draw: hashed a word at a time (the key has no padding, and its size is a multiple of 8) */
 static u32 pipe_bucket(const PipeKey *k) {
-    const u8 *b = (const u8 *)k;
-    u32 h = 2166136261u;
-    for (size_t i = 0; i < sizeof *k; i++) h = (h ^ b[i]) * 16777619u;
-    return h % PIPE_BUCKETS;
+    _Static_assert(sizeof(PipeKey) % 8 == 0, "PipeKey hashed in words");
+    u64 h = 0x9e3779b97f4a7c15ull;
+    for (size_t i = 0; i < sizeof *k; i += 8) {
+        u64 w;
+        memcpy(&w, (const u8 *)k + i, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+    }
+    return (u32)((h ^ h >> 29) % PIPE_BUCKETS);
 }
 
 static Pipe *pipe_find(const PipeKey *k, u32 h) {
@@ -2933,22 +2938,29 @@ typedef struct {
  * holds: c[i] in slot i, c[16] in one the shader leaves free) */
 static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescriptorSet *w, VkDescriptorBufferInfo *bi) {
     static DrvCache cache[ST_COUNT];
-    DrvCache key;
-    memset(&key, 0, sizeof key);        /* compared with memcmp: padding included */
     cmd();
-    key.serial = slot_serial;
-    key.pools_gen = pools_gen;
-    memcpy(key.ssbo, st.ssbo[stage], sizeof key.ssbo);
-    if (stage == ST_COMPUTE) memcpy(key.ubo, st.ubo[stage], sizeof key.ubo);
     DescSet *ts = descset_get(&st.texpool, DS_TEX);
+    u32 tex[32];
     for (u32 k = 0; k < 32; k++) {
         u32 h = (u32)st.tex[stage][k], id = h & 0xfffff;
         if (ts && id < ts->count && ts->intv[id]) h |= HANDLE_INT;
-        key.tex[k] = h;
+        tex[k] = h;
     }
-    for (u32 k = 0; k < 8; k++) key.img[k] = (u32)st.img[stage][k];
     DrvCache *cc = &cache[stage % ST_COUNT];
-    if (env.ssbo_log || memcmp(cc, &key, offsetof(DrvCache, sbuf))) {
+    /* compared in place (twice a draw, ~2,000 draws a frame): the key is built only when it changed */
+    bool hit = !env.ssbo_log && cc->serial == slot_serial && cc->pools_gen == pools_gen &&
+               !memcmp(cc->ssbo, st.ssbo[stage], sizeof cc->ssbo) && !memcmp(cc->tex, tex, sizeof tex) &&
+               (stage != ST_COMPUTE || !memcmp(cc->ubo, st.ubo[stage], sizeof cc->ubo));
+    for (u32 k = 0; hit && k < 8; k++) hit = cc->img[k] == (u32)st.img[stage][k];
+    if (!hit) {
+        DrvCache key;
+        memset(&key, 0, sizeof key);
+        key.serial = slot_serial;
+        key.pools_gen = pools_gen;
+        memcpy(key.ssbo, st.ssbo[stage], sizeof key.ssbo);
+        if (stage == ST_COMPUTE) memcpy(key.ubo, st.ubo[stage], sizeof key.ubo);
+        memcpy(key.tex, tex, sizeof tex);
+        for (u32 k = 0; k < 8; k++) key.img[k] = (u32)st.img[stage][k];
         key.sbuf = NULL;
         key.soff = 0;
         u8 *drv = staging(0x800, &key.sbuf, &key.soff);    /* c[0] at 0, c[2] at 0x600 */
@@ -3160,6 +3172,23 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
 }
 
 static void set_vertex_input(VkCommandBuffer c) {
+    /* draws mostly keep the last one's attributes, streams and vertex buffers: then everything below would come to
+     * what was recorded already (unless the command buffer, the pools or a mirror's bad ranges changed since) */
+    static struct { u64 serial, pools_gen; u32 nattribs, nstreams; VertexAttribState attribs[32];
+                    VertexStreamState streams[32]; BufferRange vbuf[32]; } last = {~0ull};
+    rec_check();
+    if (rec.vi_ok && !nmirrors && last.serial == slot_serial && last.pools_gen == pools_gen &&
+        last.nattribs == st.nattribs && last.nstreams == st.nstreams &&
+        !memcmp(last.attribs, st.attribs, st.nattribs * sizeof *st.attribs) &&
+        !memcmp(last.streams, st.streams, st.nstreams * sizeof *st.streams) && !memcmp(last.vbuf, st.vbuf, sizeof st.vbuf))
+        return;
+    last.serial = slot_serial;
+    last.pools_gen = pools_gen;
+    last.nattribs = st.nattribs;
+    last.nstreams = st.nstreams;
+    memcpy(last.attribs, st.attribs, sizeof last.attribs);
+    memcpy(last.streams, st.streams, sizeof last.streams);
+    memcpy(last.vbuf, st.vbuf, sizeof last.vbuf);
     /* streams 0-30; binding 31 is the zero source for attributes the game leaves unset */
     VkVertexInputBindingDescription2EXT bind[32];
     VkVertexInputAttributeDescription2EXT attr[48];
@@ -4438,6 +4467,14 @@ static unsigned __stdcall scan_thread(void *arg) {
     (void)arg;
     for (;;) {
         WaitForSingleObject(scan_go, INFINITE);
+        /* the ranges sorted and merged (here, not on the render thread: ~0.1 ms a frame) */
+        qsort(scan_rs, scan_nr, sizeof *scan_rs, range_cmp);
+        int m = 0;
+        for (int i = 1; i < scan_nr; i++) {
+            if (scan_rs[i].lo <= scan_rs[m].hi + 0x10000) { if (scan_rs[i].hi > scan_rs[m].hi) scan_rs[m].hi = scan_rs[i].hi; }
+            else scan_rs[++m] = scan_rs[i];
+        }
+        scan_nr = m + 1;
         size_t n = 0;
         double mb = 0;
         for (int i = 0; i < scan_nr; i++) n = written_pages(scan_rs[i].lo, scan_rs[i].hi, &scan_pages, &scan_cap, n, &mb);
@@ -4477,13 +4514,7 @@ static void refresh_scan(void) {
             scan_rs[nr++] = (Range){im->info.addr & ~0xfffull, (im->info.addr + im->size + 0xfff) & ~0xfffull};
         }
     if (!nr) { SetEvent(scan_done); return; }
-    qsort(scan_rs, nr, sizeof *scan_rs, range_cmp);
-    int m = 0;
-    for (int i = 1; i < nr; i++) {
-        if (scan_rs[i].lo <= scan_rs[m].hi + 0x10000) { if (scan_rs[i].hi > scan_rs[m].hi) scan_rs[m].hi = scan_rs[i].hi; }
-        else scan_rs[++m] = scan_rs[i];
-    }
-    scan_nr = m + 1;
+    scan_nr = nr;
     SetEvent(scan_go);
 }
 
