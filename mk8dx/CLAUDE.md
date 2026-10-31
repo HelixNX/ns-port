@@ -136,10 +136,14 @@ Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
   - Stalls drop us out: a freeze of ~1 s or more mid-session makes the game give up ("communication error").
     Causes found: (1) draws waiting for shader translation: `NX_ASYNC_SHADERS` (on in netplay builds) skips them
     instead; (2) translate.py's glslang on every core starved the game's threads (main waiting for a core 73%): it
-    now runs in a job at below-normal priority on half the cores; (3) still open: 2-4 s frames on the pre-race
-    loading screen, the main thread (prio 44, core 0) waiting for a core while the loader thread 52 (prio 45, core 0)
-    runs, probably inside long host calls (GPU pool and texture setup) that cannot be preempted; next: measure
-    them, then let such calls give up the core as IPC does.
+    now runs in a job at below-normal priority on half the cores; (3) 1-4 s frames on the pre-race loading screen:
+    the main thread (prio 44, core 0) waited for a core half the time while the loader thread 52 (prio 45, core 0)
+    sat in host code, which cannot be preempted: `NX_PROFILE="thread 52"` put it in `vk_import_host` (the driver
+    pinning a pool's memory page by page, NtQueryVirtualMemory) under `gpu_pool_created`. nvnMemoryPoolInitialize /
+    Finalize now give up the core (as queue submits do): main's core wait gone (<1%), the load window's worst
+    frame 1,049 -> 236 ms (one 726 ms frame left, main blocked on the loader itself, which spends ~45% of its time
+    importing pools: next, if it matters, make imports cheaper, e.g. keep imports of the same memory across a pool's
+    destroy and re-create). Repro offline: `NX_NETPLAY=0 NX_INPUT="600-7000/45:A"` mashes A into a 50cc race.
   - Still open: sessions ending after 1-2 min with our game leaving on its own, no stall nearby and packets flowing
     both ways (needs the Eden player's log of that moment); with async shaders, a green-tinted, washed-out screen
     on one track and bright flashes (suspect: a skipped draw into a texture drawn once per track, e.g. colour
