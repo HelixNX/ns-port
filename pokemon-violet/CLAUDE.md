@@ -192,6 +192,14 @@ rate now**).
      fps) where no GPU saving could show. Test first: drop MUTABLE_FORMAT for render-target formats that are only
      ever viewed as themselves (log which images get views in another format), or add format lists of the formats
      actually viewed; compare NX_GPU_TIMELINE busy.
+     **Tried (2026-11-01, nxrecomp `abd7a93`): no change.** NX_VIEW_LOG=1 logs views in another format than their
+     image's: in the title, load and stand-still scene only one (a 960x540 sRGB target sampled as UNORM). Images are
+     now mutable only when a view can need another format (gpu.c `format_list`: sampled, integer, storage and
+     sRGB / UNORM twins), with those formats as a format list; NX_MUTABLE_ALL=1 is the old way. Two A/B rounds
+     (order swapped, 31-33 windows each): frame 6.14 / 6.02 ms old vs 6.05 / 6.16 new, GPU busy 5.41 / 5.37 vs
+     5.37 / 5.49: noise. Kept as the more precise setup. So AMD's driver already compresses mutable images, or
+     something else stops it (GENERAL layouts, in-pass clears), or these passes are not bandwidth-bound: Radeon GPU
+     Profiler (not installed) would show DCC per pass. Frames not yet checked with NX_DUMP.
   2. **No fast clears, no load / store hints.** Every pass is LOAD_OP_LOAD / STORE_OP_STORE in GENERAL layout;
      clears are vkCmdClearAttachments inside the pass (do_clear_color). A clear at a pass's start could be the
      pass's loadOp CLEAR (AMD fast clear, and HTILE for depth), and targets the game discards or fully overwrites
