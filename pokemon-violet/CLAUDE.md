@@ -113,7 +113,7 @@ of collected while playing) and a faster lift/compile (first-run time, now 20-40
 Risks: exceptions (V1) and the size of the build are the unknowns MK8 didn't have; NVN coverage is the largest amount
 of work; online code paths must fail as on a console with no internet, not crash.
 
-## Next (written 2026-10-22)
+## Next (written 2026-10-22, updated 2026-10-31)
 
 Where things stand (2026-10-22, RX 7800 XT + Ryzen 7 7800X3D, stand-still benchmark below): ~170 fps uncapped,
 5.8-6.0 ms a frame, 1% lows ~9 ms. The goal is to get much closer to what the hardware allows. Rough scaling from a
@@ -159,50 +159,101 @@ rate now**).
   `8f2c86b8511ac03b` samples the 1920x1080 depth buffer with depth writes on. Every other case is depth read with
   depth writes off (defined). Fixing those two (copy the target first) is cheap.
 
+- **Where a frame goes now (2026-10-31, nxrecomp after `c427890`): ~6.1 ms (164 fps), GPU busy ~5.5 ms of it.**
+  NX_GPU_TIMELINE=1 (gpu.c `tl_*`) timestamps each submission on the GPU, lines the clocks up by the smallest
+  start - submit, and every 600 frames reports GPU busy and idle per frame, idle split into nothing submitted yet
+  (at a guest submission's start / between its flushes) and submitted but not started. Before the early flushes:
+  6.4 ms = busy 5.2 + idle 1.14, of which 0.93 ms in one gap a frame at the guest submission's start: GPU done ->
+  5c woken 0.07, -> its emulated core back 0.21 (main holds core 0; kernel.c's new per-thread counters in the
+  `cpu:` lines show 5c never takes the 1 ms retry path nor preempts: it waits for main's release, as on the
+  console), -> gpu_submit 0.00, -> **first flush 0.63** (flushes only came at render target changes after 250
+  draws, and the frame's first pass is long). Gaps between flushes ~0.02, submitted-not-started ~0.2 (presents
+  share AMD's one queue).
+  - Fix: **early flushes** (gpu.c `head_flush`, NX_FLUSH_FIRST, default 32, 0 off): each guest submission flushes
+    after 32 draws, then 64, 128, ... (mid-pass: the pass splits) until NX_FLUSH_DRAWS takes over. **6.60 -> 6.09 ms
+    (151 -> 164 fps)**, two runs each way; idle 1.14 -> 0.65 (start 0.33: core 0.13 + first flush 0.13; between
+    flushes 0.16; submitted-not-started 0.16), busy 5.2 -> 5.5 (the extra splits). A single early flush gave 6.22.
+    Frames checked (the player's pose differs: the idle animation, user-checked). **Not run on the GTX 1650 Ti**:
+    with pool mirrors on, each flush waits for the mirror scan (~0.5 ms), and an earlier first flush may meet it
+    sooner; compare NX_FLUSH_FIRST=0 there.
+  - Ruled out, each against clean baselines (6.37-6.6 ms): skipping skinning (`vs 44f2ec77`, top item under
+    NX_GPU_PROF with 1.6 ms) 6.61-6.72; NX_FLUSH_DRAWS=60 6.37 (same as 250; =1 8.07, translation doubles); no
+    barrier at pass ends (temporary switch, removed) 6.38: ~0.2, the noise. NX_GPU_PROF's per-pass times inflate
+    around barriers (its timestamps drain the GPU): its 1.6 ms of skinning and 1.48 ms for the 30 passes on the
+    1080p RGBA8 target are mostly drains. Use NX_GPU_TIMELINE for totals and experiments (skip / switch) for causes.
+  - Benchmark scripts: an env switch set for one run must be cleared before the next in the same shell (two runs
+    were void until that was caught).
+- **What we may be missing (2026-10-31): the GPU's 5.5 ms is ~8x what the hardware should need, and none of the
+  per-pass suspects moved it. The likely cause is how we use Vulkan for every pass, not one pass:**
+  1. **Color compression off for every image.** gpu.c `image_get` creates every image with
+     VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT (+ EXTENDED_USAGE) and no VkImageFormatListCreateInfo; on AMD that
+     generally disables DCC, so the G-buffer (1080p, 4 colour + depth, ~1.8 ms) and every 1080p pass move
+     uncompressed. Format lists were "ruled out" 2026-10-19, but in a CPU-bound frame (translation 4 ms, ~130
+     fps) where no GPU saving could show. Test first: drop MUTABLE_FORMAT for render-target formats that are only
+     ever viewed as themselves (log which images get views in another format), or add format lists of the formats
+     actually viewed; compare NX_GPU_TIMELINE busy.
+  2. **No fast clears, no load / store hints.** Every pass is LOAD_OP_LOAD / STORE_OP_STORE in GENERAL layout;
+     clears are vkCmdClearAttachments inside the pass (do_clear_color). A clear at a pass's start could be the
+     pass's loadOp CLEAR (AMD fast clear, and HTILE for depth), and targets the game discards or fully overwrites
+     could be DONT_CARE. GENERAL may also keep the driver from compressing (check amdvlk's behaviour for GENERAL
+     colour / depth with DCC / HTILE).
+  3. **72 pass splits a frame from NVN barrier commands** (gpu.c `OP_BARRIER` -> end_rendering, plus ~21 at
+     render target changes and ~25 from transform feedback). Eden (`deps/suyu`, cloned 2026-10-31: src/video_core
+     and src/shader_recompiler only) ends a render pass only when the framebuffer changes, with a barrier on that
+     pass's attachments from the attachment-output stages; ours is ALL_COMMANDS -> ALL_COMMANDS every time.
+     Dropping the barrier alone saved ~0.2 ms, so the split itself (store and reload of each 1080p target) is the
+     suspect: keep rendering across an NVN barrier when the targets stay the same and no later draw samples them.
+  4. **Shader quality** (translate.py's SPIR-V): compare one hot fragment shader (the G-buffer's, NX_GPU_PROF=2)
+     against Eden's shader_recompiler for how it handles constant buffers, texture handles and control flow. Only
+     after 1-3, which are cheaper to test.
+  Order: 1 (one switch, one run), then 2, then 3. Measure each with NX_GPU_TIMELINE busy, and check frames
+  (NX_DUMP) as above.
+
 In order:
 
-1. **GPU profile of the stand-still scene** (NX_GPU_PROF=1, then 2): how much of the ~5.5 ms is work and how much
-   is gaps around ~165 passes and ~170 barriers a frame (2026-10-19 Mesagoza: ~172 barriers 1.2 ms, G-buffer 2.2
-   ms, 23 passes on one 1080p target 0.96 ms). NX_GPU_PROF's timestamps slow the GPU, so compare its shares, not
-   totals. Then: barriers per image (and only where a later pass reads what an earlier wrote) instead of full ones,
-   and merging consecutive passes on the same targets. NX_PASS_BARRIER (skip every pass-end barrier) corrupted
-   lighting: too blunt, not proof that barriers are needed everywhere.
-2. **Render thread translation** (3.8 ms a frame, what holds real play now): cheaper translation, then take it off
-   the render thread (Savage Wind's ASYNC_EXEC); the GPU wait follows it, so pair it with item 1.
+1. **GPU efficiency** (the list above): DCC / format lists, fast clears and load / store ops, keeping passes
+   across NVN barriers. NX_GPU_PROF=2 for which shaders, NX_GPU_TIMELINE for whether a change moved GPU busy time.
+2. **Render thread translation** (3.2-3.4 ms a frame): cheaper translation, then take it off the render thread.
+   It does not hold the frame now (below); it will once the GPU's frame is under ~3 ms.
    - What "translation" is: NVN calls never reach a driver. Recording (nvn.c, on whichever thread records) writes
      each command in our own encoding (nvn.h) into the game's command memory: cheap. At nvnQueueSubmitCommands
      (nvn.c `queue_submit` -> gpu.c `gpu_submit`, on 5c, emulated core given up) gpu.c replays that stream into
      Vulkan: state tracking, pipeline lookup / build, uniform staging and push descriptors (stage_ubos,
      descset_use), vertex / index binds, render-target changes and barriers, the image cache (deswizzle on a
-     first read), then the vkCmd* calls. ~2,000 draws at ~1.7 us. On the console this is the GPU front end's work
+     first read), then the vkCmd* calls. ~2,000 draws at ~1.6 us. On the console this is the GPU front end's work
      (the command buffer holds GPU methods) and costs the CPU nothing at submit. Shader translation (Maxwell ->
      SPIR-V, tools/shader/translate.py) is separate: once per shader, cached, a hitch cost, not per frame.
-   - Cheaper per draw: earlier rounds took it ~6 -> ~3.4 ms (Status, "Performance"). Sample 5c
-     (`NX_PROFILE='thread 5c'`) for what is left before picking.
-   - **Where it sits now (2026-10-30): just under the GPU's pace.** A 1 us spin per draw (+2.0 ms translating)
-     cost +1.44 ms a frame (GPU wait -0.47), but cutting translation 3.42 -> 3.13 ms (vk_format memoised, word-wise
-     pipe_bucket, the refresh scan's sort on its thread, stage_ubos compared in place, set_vertex_input skipped when
-     attributes / streams / vertex buffers are unchanged; frames checked) left the frame at 6.37 ms: the GPU wait
-     grew 2.02 -> 2.44. So more translation work only pays once the GPU's frame shrinks (item 1), and replaying on
-     another thread would not raise the frame rate now either (the game's one frame in flight still serialises on
-     the GPU). NX_PROFILE now also lists runtime call sites into outside code and the hottest runtime lines
-     (function:line, through inlining). 5c then: AMD driver 18% (push descriptors 3.8%, vkCmdDrawIndexedIndirect
-     3.3%, vkCmdDrawIndexed 3.1%), run 6.5% (its command header loads), draw 5%, stage_ubos 4%, memmove 3.5%.
+   - **Where it sits (2026-10-30): just under the GPU's pace.** A 1 us spin per draw (+2.0 ms translating) cost
+     +1.44 ms a frame (GPU wait -0.47), but cutting translation 3.42 -> 3.13 ms (nxrecomp `c427890`: vk_format
+     memoised, word-wise pipe_bucket, the refresh scan's sort on its thread, stage_ubos compared in place,
+     set_vertex_input skipped when attributes / streams / vertex buffers are unchanged; frames checked) left the
+     frame at 6.37 ms: the GPU wait grew 2.02 -> 2.44. NX_PROFILE now also lists runtime call sites into outside
+     code and the hottest runtime lines (function:line, through inlining). 5c then: AMD driver 18% (push
+     descriptors 3.8%, vkCmdDrawIndexedIndirect 3.3%, vkCmdDrawIndexed 3.1%), run 6.5% (its command header loads),
+     draw 5%, stage_ubos 4%, memmove 3.5%.
+   - From Eden (design only, never its code): its Scheduler records each vkCmd* as a small closure into 32 KB
+     chunks and a worker thread makes the driver calls, so the driver's share runs beside translation. In C that
+     is a tagged command stream (a struct per command, a switch on the worker), like nvn.h one level down. Its
+     dynamic state is emitted from dirty flags set when the game writes those registers (state_tracker Touch*),
+     where our set_dynamic_state rebuilds and memcmps the whole state every draw: our NVN state commands
+     (OP_BLEND, OP_DEPTH_STENCIL, ...) could set dirty bits.
    - Off the render thread (Savage Wind: `ref/SavageWindRecomp/runtime/nvn/objects.c`, "the submission queue",
      SAVAGEWIND_ASYNC_EXEC / SAVAGEWIND_QUEUE_AHEAD): submits, queue fences, presents and texture / sync
      finalizes go in order to one host thread that replays them, and the guest returns at once. The guest waits
      only where it would wait for the GPU on the console (nvnSyncWait, nvnQueueFinish): first for the queue to get
      past that fence, then for the GPU. Replays read guest memory when they run, as the GPU does; the game fences
      its CPU writes to memory in use. Cap how many presents may be queued (Savage Wind defaults to 1).
-   - For us: Violet's 5c already waits for frame N-1's fence (`main+cd0eb4`, nvnSyncWait) before submitting frame
-     N (Status, "GPU-bound"), so the gain is 5c recording frame N+1 while frame N replays. To check first:
-     everything in nvn.c / gpu.c that reads GPU-side results or gpu.c state synchronously (queries and reports,
-     nvnSyncWait / GetStatus, nvnWindowAcquireTexture, texture / pool / sync finalize, CPU texture writes and the
-     CPU-written texture check, the pool mirror's copy-in), and gpu_cs, the one lock over gpu.c.
+   - For us: Violet's 5c waits for frame N-1's fence (`main+cd0eb4`, nvnSyncWait) before submitting frame N, so a
+     replay thread only helps once translation is longer than the GPU's frame. To check first: everything in
+     nvn.c / gpu.c that reads GPU-side results or gpu.c state synchronously (queries and reports, nvnSyncWait /
+     GetStatus, nvnWindowAcquireTexture, texture / pool / sync finalize, CPU texture writes and the CPU-written
+     texture check, the pool mirror's copy-in), and gpu_cs, the one lock over gpu.c.
 3. **CPU-only hand-offs** (only matters without rendering): a short spin after giving up the emulated core,
    before sleeping, at the job condvar; measure with NX_PROFILE's wake columns. Lifted calls are done (Status
    above); passing arguments in host registers is the remaining step there (a big lifter rewrite, ~5-10% at most).
-4. **Measure the dip when spawning / loading** (~80 fps for a second). NX_HITCH_MS=20 logs each slow frame split
+4. **Measure the dip when spawning / loading** (~80 fps for a second). Polling waits make it worse: a draw
+   waiting for a pipeline a worker builds, and JIT waits, poll with Sleep(1) (gpu.c pipeline_get, the jit waits):
+   each rounds up to >= 1 ms; make them events or condition variables. NX_HITCH_MS=20 logs each slow frame split
    into shader loads, JIT waits, pipeline builds, images, uploads, slot waits and the rest (Status, "Performance",
    "Lows"). Run it on the benchmark save (`build/save-bench`). In that scene the lows follow new pipelines and
    images (1% lows ~7-10 ms without, 10-49 ms with). The pipeline cache is now kept between sessions
