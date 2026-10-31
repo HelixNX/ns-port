@@ -179,6 +179,15 @@ In order:
      SPIR-V, tools/shader/translate.py) is separate: once per shader, cached, a hitch cost, not per frame.
    - Cheaper per draw: earlier rounds took it ~6 -> ~3.4 ms (Status, "Performance"). Sample 5c
      (`NX_PROFILE='thread 5c'`) for what is left before picking.
+   - **Where it sits now (2026-10-30): just under the GPU's pace.** A 1 us spin per draw (+2.0 ms translating)
+     cost +1.44 ms a frame (GPU wait -0.47), but cutting translation 3.42 -> 3.13 ms (vk_format memoised, word-wise
+     pipe_bucket, the refresh scan's sort on its thread, stage_ubos compared in place, set_vertex_input skipped when
+     attributes / streams / vertex buffers are unchanged; frames checked) left the frame at 6.37 ms: the GPU wait
+     grew 2.02 -> 2.44. So more translation work only pays once the GPU's frame shrinks (item 1), and replaying on
+     another thread would not raise the frame rate now either (the game's one frame in flight still serialises on
+     the GPU). NX_PROFILE now also lists runtime call sites into outside code and the hottest runtime lines
+     (function:line, through inlining). 5c then: AMD driver 18% (push descriptors 3.8%, vkCmdDrawIndexedIndirect
+     3.3%, vkCmdDrawIndexed 3.1%), run 6.5% (its command header loads), draw 5%, stage_ubos 4%, memmove 3.5%.
    - Off the render thread (Savage Wind: `ref/SavageWindRecomp/runtime/nvn/objects.c`, "the submission queue",
      SAVAGEWIND_ASYNC_EXEC / SAVAGEWIND_QUEUE_AHEAD): submits, queue fences, presents and texture / sync
      finalizes go in order to one host thread that replays them, and the guest returns at once. The guest waits
