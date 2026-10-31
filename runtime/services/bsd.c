@@ -2,8 +2,10 @@
  * the game sends goes to the room server as a proxy packet (net.h) from our fake address and the socket's port; a
  * proxy packet that arrives is queued on every socket bound to its destination port with its protocol. As with
  * Eden's proxy sockets (which ours must talk to), only UDP carries data; TCP connections are refused.
- * A proxy packet's protocol is the one the game passed to socket(), in Network::Protocol numbering (Pia passes 0,
- * so Eden sends and expects IP = 1, not UDP); Eden drops packets whose protocol differs from its socket's.
+ * A proxy packet's protocol is the one the game passed to socket(), as a Network::Protocol; Eden drops packets whose
+ * protocol differs from its socket's. Eden builds number it two ways: releases (and yuzu, Citra) have Unspecified 0,
+ * ICMP 1, TCP 2, UDP 3; newer sources insert IP = 1, so TCP 3, UDP 4. We send the older numbering until a packet
+ * shows the newer one (UDP 4, which the older numbering does not have), and datagram sockets accept either.
  * Without a room this service is not registered, and the generic stub answers the SDK as before.
  * Replies follow the SDK 4.4 proxies: (s32 ret, s32 errno[, u32 length]); errno values are the console's (Linux
  * numbering); a sockaddr is BSD's sockaddr_in: u8 len, u8 family (2), u16 port, u32 address (network order). */
@@ -27,7 +29,7 @@ typedef struct Dgram { struct Dgram *next; u8 ip[4]; u16 port; u32 size; u8 data
 
 typedef struct Sock {
     bool used, stream, bound, broadcast, nonblock, closed, connected;
-    u8 wire_proto;                          /* Network::Protocol of the game's socket() protocol */
+    u32 proto;                              /* the game's socket() protocol (BSD numbers) */
     u8 ip[4];                               /* bound address (0.0.0.0: any) */
     u16 port;                               /* host order */
     u8 peer_ip[4];                          /* connect()ed UDP destination */
@@ -45,14 +47,19 @@ static u16 next_ephemeral = 49152;
 /* traffic counters for the log */
 static volatile long sent_n, recv_n, drop_noport, drop_bcast;
 
-/* the guest protocol (BSD numbers) as Network::Protocol: Unspecified 0, IP 1, ICMP 2, TCP 3, UDP 4 */
+/* which Network::Protocol numbering the room's other members use (see the top) */
+static volatile bool newer_numbering;
+
+/* the guest protocol (BSD numbers) as a Network::Protocol: older Unspecified 0, ICMP 1, TCP 2, UDP 3;
+ * newer Unspecified 0, IP 1, ICMP 2, TCP 3, UDP 4 */
 static u8 wire_protocol(u32 proto, bool stream) {
+    bool n = newer_numbering;
     switch (proto) {
-    case 0: return 1;
-    case 1: return 2;
-    case 6: return NET_PROTO_TCP;
-    case 17: return NET_PROTO_UDP;
-    default: return stream ? NET_PROTO_TCP : NET_PROTO_UDP;
+    case 0: return n ? 1 : 0;
+    case 1: return n ? 2 : 1;
+    case 6: return n ? 3 : 2;
+    case 17: return n ? 4 : 3;
+    default: return stream ? (n ? 3 : 2) : (n ? 4 : 3);
     }
 }
 
@@ -112,13 +119,21 @@ static u32 write_addr(IpcReq *r, int i, const u8 ip[4], u16 port) {
 static void on_proxy(const NetProxyPacket *p) {
     u8 ours[4];
     room_fake_ip(ours);
+    if (p->protocol == 4 && !newer_numbering) {
+        newer_numbering = true;
+        hlog(1, "bsd: a member sends UDP as protocol 4: using the newer Eden protocol numbering");
+    } else if (p->protocol == 3 && newer_numbering) {
+        newer_numbering = false;
+        hlog(1, "bsd: a member sends UDP as protocol 3: using the older Eden protocol numbering");
+    }
     AcquireSRWLockExclusive(&lock);
     bool any = false;
     for (int i = 0; i < MAX_SOCKS; i++) {
         Sock *s = &socks[i];
         if (!s->used || s->closed || !s->bound || s->port != p->remote_port) continue;
-        /* datagram sockets take any datagram protocol (IP, UDP, unspecified), stream sockets TCP */
-        if (s->stream != (p->protocol == NET_PROTO_TCP)) continue;
+        /* only datagrams carry data (Eden's proxy TCP is a stub); they come as UDP, IP or unspecified in either
+         * numbering, so datagram sockets take every protocol */
+        if (s->stream) continue;
         if (p->broadcast && !s->broadcast) { drop_bcast++; continue; }
         if (s->queued >= MAX_QUEUED) { Dgram *d = s->head; s->head = d->next; if (!s->head) s->tail = NULL; free(d); s->queued--; }
         Dgram *d = malloc(sizeof *d + p->size);
@@ -148,7 +163,7 @@ static void send_dgram(Sock *s, const u8 ip[4], u16 port, const void *data, u32 
     p.local_port = s->port;
     memcpy(p.remote_ip, ip, 4);
     p.remote_port = port;
-    p.protocol = s->wire_proto;
+    p.protocol = wire_protocol(s->proto, s->stream);
     p.broadcast = s->broadcast && ip[3] == 255;
     p.data = data;
     p.size = size;
@@ -194,7 +209,7 @@ static void bsd_socket(SvcObj *o, IpcReq *r) {
     memset(&socks[i], 0, sizeof socks[i]);
     socks[i].used = true;
     socks[i].stream = type == SOCK_STREAM_;
-    socks[i].wire_proto = wire_protocol(proto, type == SOCK_STREAM_);
+    socks[i].proto = proto;
     socks[i].sndbuf = socks[i].rcvbuf = 0x10000;
     ReleaseSRWLockExclusive(&lock);
     hlog(1, "bsd: socket %d (%s, protocol %u)", i + FD_BASE, type == SOCK_STREAM_ ? "tcp" : "udp", proto);

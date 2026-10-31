@@ -25,7 +25,7 @@ static bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers;
+        view_log, mutable_all, full_barriers, async_shaders;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -2339,8 +2339,9 @@ static void spv_path(char *path, size_t size, u64 hash) {
 /* Shaders are translated while the game runs. A shader the game creates with no SPIR-V is queued at once
  * (gpu_shader_created) for a host thread that runs tools/shader/translate.py --spv --only=<hashes> on everything
  * queued (~0.3 s a batch: shaders created together share one). A draw that needs a shader still queued waits for it
- * (the game stalls instead of drawing without it). NX_SHADER_JIT=0 turns this off (such draws are skipped);
- * NX_PYTHON names the interpreter (default python). */
+ * (the game stalls instead of drawing without it), or with NX_ASYNC_SHADERS (env_init) is skipped until the
+ * translation is there; dispatches always wait (a skipped one can leave wrong results for good). NX_SHADER_JIT=0
+ * turns this off (such draws are skipped); NX_PYTHON names the interpreter (default python). */
 static struct { u64 *q; u32 *qm, n, cap; u64 seq; SRWLOCK lock; HANDLE wake; } jit = {.lock = SRWLOCK_INIT};
 static volatile u64 jit_done;          /* the last request a finished batch covered */
 
@@ -2385,9 +2386,32 @@ static unsigned __stdcall jit_thread(void *p) {
                 si.dwFlags = STARTF_USESTDHANDLES;
                 si.hStdInput = NULL;
                 si.hStdOutput = si.hStdError = wr;
-                ran = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+                ran = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
                 CloseHandle(wr);
                 if (ran) {
+                    /* translate.py runs glslang on every core at once, which starved the game's threads (a 133-shader
+                     * batch: 2.6 s frames, the main thread waiting for a core 73% of the time). A job keeps it and
+                     * its glslang processes at below-normal priority on the upper half of our cores */
+                    static HANDLE job;
+                    if (!job && (job = CreateJobObjectA(NULL, NULL))) {
+                        DWORD_PTR mine = 0, sys = 0;
+                        GetProcessAffinityMask(GetCurrentProcess(), &mine, &sys);
+                        int nc = 0;
+                        for (DWORD_PTR m = mine; m; m &= m - 1) nc++;
+                        DWORD_PTR half = 0;
+                        int keep = nc / 2, seen = 0;
+                        for (int b = 63; b >= 0 && seen < keep; b--)
+                            if (mine >> b & 1) { half |= (DWORD_PTR)1 << b; seen++; }
+                        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+                        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS |
+                            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | (half ? JOB_OBJECT_LIMIT_AFFINITY : 0);
+                        li.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+                        li.BasicLimitInformation.Affinity = half;
+                        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+                        hlog(1, "gpu: translate.py runs at below-normal priority on %d of %d cores", half ? keep : nc, nc);
+                    }
+                    if (job) AssignProcessToJobObject(job, pi.hProcess);
+                    ResumeThread(pi.hThread);
                     char buf[4096], line[512];
                     DWORD got;
                     size_t ln = 0;
@@ -2457,12 +2481,17 @@ void gpu_shader_created(ShaderCode *s) {
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) s->jit_seq = jit_request(s->hash);
 }
 
-static VkShaderModule shader_load(ShaderCode *s) {
+static bool jit_pending(u64 seq) { return seq && __atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq; }
+
+/* NULL either for good (s->missing) or, when !wait, while its translation is still running (try again later) */
+static VkShaderModule shader_load(ShaderCode *s, bool wait) {
     char path[MAX_PATH + 32];
     spv_path(path, sizeof path, s->hash);
     FILE *f = fopen(path, "rb");
     if (!f) {
-        u64 seq = s->jit_seq ? s->jit_seq : jit_request(s->hash);
+        if (!s->jit_seq) s->jit_seq = jit_request(s->hash);
+        u64 seq = s->jit_seq;
+        if (!wait && jit_pending(seq)) return NULL;
         if (seq) {
             u64 t0 = GetTickCount64();
             while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
@@ -2539,40 +2568,50 @@ static VkShaderModule shader_load(ShaderCode *s) {
     return m;
 }
 
-static VkShaderModule shader_module(ShaderCode *s) {
+/* wait: false for draws with NX_ASYNC_SHADERS (shader_load) */
+static VkShaderModule shader_module_w(ShaderCode *s, bool wait) {
     if (s->module) return s->module;
     if (s->missing) return NULL;
+    if (!wait && jit_pending(s->jit_seq)) return NULL;     /* cheap: no file lookup while it is being translated */
     double t0 = ms_now();
-    VkShaderModule m = shader_load(s);
+    VkShaderModule m = shader_load(s, wait);
     hf.shader += ms_now() - t0;
     hf.nshader++;
     return m;
 }
 
+static VkShaderModule shader_module(ShaderCode *s) { return shader_module_w(s, true); }
+
 /* A vertex shader fed integer vertex formats (8/16-bit UINT/SINT; 32-bit ones are fetched as float, which keeps
  * the bits) needs those inputs declared uvec4 / ivec4: a variant translated with that mask (translate.py
  * <hash>:<mask>, 2 bits per location: 1 unsigned, 2 signed), loaded or translated on first use */
-typedef struct Variant { u64 hash; u32 mask; VkShaderModule m; bool missing; struct Variant *next; } Variant;
+typedef struct Variant { u64 hash; u32 mask; VkShaderModule m; bool missing, done; u64 seq; struct Variant *next; } Variant;
 static Variant *variants[256];
 
-static VkShaderModule shader_variant(ShaderCode *s, u32 mask) {
-    VkShaderModule base = shader_module(s);
+/* NULL with !wait while the base shader or the variant is being translated (the draw is skipped and tries again) */
+static VkShaderModule shader_variant(ShaderCode *s, u32 mask, bool wait) {
+    VkShaderModule base = shader_module_w(s, wait);
     if (!mask || !base) return base;
     Variant **b = &variants[(s->hash ^ mask) & 255], *v;
     for (v = *b; v && (v->hash != s->hash || v->mask != mask); v = v->next) {}
-    if (v) return v->missing ? base : v->m;
-    v = calloc(1, sizeof *v);
-    v->hash = s->hash;
-    v->mask = mask;
-    v->next = *b;
-    *b = v;
+    if (v && v->done) return v->missing ? base : v->m;
+    if (v && !wait && jit_pending(v->seq)) return NULL;
+    if (!v) {
+        v = calloc(1, sizeof *v);
+        v->hash = s->hash;
+        v->mask = mask;
+        v->next = *b;
+        *b = v;
+    }
     double t0 = ms_now();
     char path[MAX_PATH + 48];
     spv_path(path, sizeof path, s->hash);
     snprintf(path + strlen(path) - 4, 16, "_%08x.spv", mask);
     FILE *f = fopen(path, "rb");
     if (!f) {
-        u64 seq = jit_request_variant(s->hash, mask);
+        if (!v->seq) v->seq = jit_request_variant(s->hash, mask);
+        u64 seq = v->seq;
+        if (!wait && jit_pending(seq)) return NULL;
         if (seq) {
             double tj = ms_now();
             while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
@@ -2593,6 +2632,7 @@ static VkShaderModule shader_variant(ShaderCode *s, u32 mask) {
         free(code);
     }
     v->missing = !v->m;
+    v->done = true;
     hf.shader += ms_now() - t0;
     hf.nshader++;
     hlog(1, "gpu: shader %016llx with integer inputs %08x%s", s->hash, mask,
@@ -3748,9 +3788,15 @@ static void draw_one(u32 op, const void *payload) {
     if (!pr || !pr->stage[ST_VERTEX]) { skip_draw("no vertex shader"); return; }
     if (pr->mask & ~(1u << ST_VERTEX | 1u << ST_FRAGMENT)) { skip_draw("geometry or tessellation shaders"); return; }
     u32 vs_mask = int_attr_mask();
-    VkShaderModule vs = shader_variant(pr->stage[ST_VERTEX], vs_mask);
-    VkShaderModule fs = pr->stage[ST_FRAGMENT] ? shader_module(pr->stage[ST_FRAGMENT]) : NULL;
-    if (!vs || (pr->stage[ST_FRAGMENT] && !fs)) { skip_draw("shader not translated"); return; }
+    bool wait = !env.async_shaders;
+    VkShaderModule vs = shader_variant(pr->stage[ST_VERTEX], vs_mask, wait);
+    VkShaderModule fs = pr->stage[ST_FRAGMENT] ? shader_module_w(pr->stage[ST_FRAGMENT], wait) : NULL;
+    if (!vs || (pr->stage[ST_FRAGMENT] && !fs)) {
+        bool gone = pr->stage[ST_VERTEX]->missing || (pr->stage[ST_FRAGMENT] && pr->stage[ST_FRAGMENT]->missing);
+        if (!wait && !gone) skip_draw("shader being translated (NX_ASYNC_SHADERS)");
+        else skip_draw("shader not translated");
+        return;
+    }
     pipe_vs_hash = pr->stage[ST_VERTEX]->hash;
     pipe_fs_hash = pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0;
     /* NX_SKIP_SHADERS=hash,...: skip draws using these shaders (finding one a driver cannot compile) */
@@ -5007,6 +5053,16 @@ static void env_init(void) {
     env.pool_mirror = (e = getenv("NX_POOL_MIRROR")) ? atoi(e) != 0 : slow;
     hlog(1, "gpu: pool mirrors %s%s", env.pool_mirror ? "on" : "off", e ? " (NX_POOL_MIRROR)" : "");
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
+    /* draws skip shaders still being translated instead of waiting (see shader_load): on in netplay builds, where a
+     * stalled game drops out of local play; off elsewhere, since a skipped draw into a texture drawn only once stays
+     * missing */
+#ifdef NX_NETPLAY
+    env.async_shaders = (e = getenv("NX_ASYNC_SHADERS")) ? atoi(e) != 0 : true;
+#else
+    env.async_shaders = (e = getenv("NX_ASYNC_SHADERS")) ? atoi(e) != 0 : false;
+#endif
+    hlog(1, "gpu: draws %s for shaders being translated%s", env.async_shaders ? "do not wait" : "wait",
+         e ? " (NX_ASYNC_SHADERS)" : "");
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
     env.flush_first = (e = getenv("NX_FLUSH_FIRST")) ? atoi(e) : 32;

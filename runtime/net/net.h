@@ -28,7 +28,6 @@ typedef struct NetLdnPacket {
 } NetLdnPacket;
 
 /* a datagram on the room's network; endpoints in network byte order, ports in host order */
-enum { NET_PROTO_TCP = 3, NET_PROTO_UDP = 4 };   /* Network::Protocol values on the wire */
 typedef struct NetProxyPacket {
     u8 local_ip[4], remote_ip[4];           /* sender and receiver */
     u16 local_port, remote_port;
