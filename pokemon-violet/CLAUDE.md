@@ -133,6 +133,19 @@ rate now**).
   skipped (NX_GPU_SKIP=1): 235-244 fps (4.1-4.3 ms), main 73% running, blocked ~27% (~21% on one condition
   variable, main+b47d18, ~11 waits a frame: its jobs on 5a/5b, each ~57% busy), translation 0.8 ms. Main's samples
   then: lifted code ~60% (flat: the hottest function 2.3%), our runtime ~8% (`call_ind` / `jump_ind` ~5%).
+- Lifted calls (2026-10-30, nxrecomp `cf5f543`): NX_PROFILE now splits lifted samples by guest instruction kind.
+  Main, CPU-only: calls ~23% of lifted samples (bl 9%, blr 4%, function entry 4%, ret 3%, br 3%), loads/stores
+  27%, integer 29%, branches 12%, exclusives 3.5%; a `bl` was ~60-80 x86 instructions (~24 stores to Ctx, the call,
+  ~24 reloads, spills). Now calls follow the AAPCS64 (a64lift SAVEC / LOADC: no flags, x19-x30 / sp / v8-v15 not
+  reloaded; everything still stored first): CPU-only **4.41 -> 3.99 ms (228 -> 252 fps)**, ~40 windows each.
+  Indirect calls look up one flat table inline (a64rt.h `call_ind_fast` / `jump_ind_fast`): main's runtime share
+  9.6 -> 3.1%, **no frame-time change**. a64test passes (18,163 + 17,355 cases; run it with `py -3.12`, the
+  Python that has capstone and unicorn).
+- Why CPU-only stays ~250 fps (2026-10-30): not one thread's speed. Main runs ~70%, blocked ~20% at the job join
+  (main+b47d18, ~11 waits a frame, ~6 us to wake); 5a is idle ~35% waiting for jobs at the same condvar (~16 waits
+  a frame), 5a/5b ~50% busy. The frame is a chain of hand-offs between main and the workers. With rendering
+  (~160 fps, 6.2-6.4 ms this session): 5c runs ~70% (translating 3.8 ms, GPU wait 1.7 ms), main ~45%: game code
+  is not the limit there.
 - Ruled out (2026-10-22): lifted code at -O2 (NX_LIFT_OPT in nxrecomp.cmake; 5 min full build): CPU-only 235 -> 244
   fps (~3%, inside the noise), with rendering 172 vs 165 (noise). The default stays -O1. Decompiling the game
   (IDA / Ghidra) to recompile it natively: not worth it (output does not compile, silently wrong functions, years
@@ -154,27 +167,24 @@ In order:
    totals. Then: barriers per image (and only where a later pass reads what an earlier wrote) instead of full ones,
    and merging consecutive passes on the same targets. NX_PASS_BARRIER (skip every pass-end barrier) corrupted
    lighting: too blunt, not proof that barriers are needed everywhere.
-2. **Lifted calls: the register save / reload.** Every call between lifted functions stores ~20 guest registers to
-   `Ctx` and loads them back (the SAVE / LOAD macros at each call). Measure its share first (count calls a frame or
-   sample around them), then try passing / keeping the argument and callee-saved registers in host registers
-   (lifter change in nxrecomp/tools/lifter).
-3. **Indirect calls** (`call_ind` / `jump_ind`, ~5% of main): a per-call-site cache of the last target, or a direct
-   table lookup.
-4. **Take translation off the render thread** (Savage Wind's ASYNC_EXEC): only pays after items 1-3, since the
-   GPU wait follows it anyway.
-5. **Measure the dip when spawning / loading** (~80 fps for a second). NX_HITCH_MS=20 logs each slow frame split
+2. **Render thread translation** (3.8 ms a frame, what holds real play now): cheaper translation, then take it off
+   the render thread (Savage Wind's ASYNC_EXEC); the GPU wait follows it, so pair it with item 1.
+3. **CPU-only hand-offs** (only matters without rendering): a short spin after giving up the emulated core,
+   before sleeping, at the job condvar; measure with NX_PROFILE's wake columns. Lifted calls are done (Status
+   above); passing arguments in host registers is the remaining step there (a big lifter rewrite, ~5-10% at most).
+4. **Measure the dip when spawning / loading** (~80 fps for a second). NX_HITCH_MS=20 logs each slow frame split
    into shader loads, JIT waits, pipeline builds, images, uploads, slot waits and the rest (Status, "Performance",
    "Lows"). Run it on the benchmark save (`build/save-bench`). In that scene the lows follow new pipelines and
    images (1% lows ~7-10 ms without, 10-49 ms with). The pipeline cache is now kept between sessions
    (`build/pipelines.bin`, or `pipelines.bins` with VK_KHR_pipeline_binary), and `pipelines.list` is prebuilt on
    worker threads at start; their effect on hitches is not measured yet.
-6. **Extract every shader up front** (the "unpacker", also a V8 prerequisite): walk the shader archives in
+5. **Extract every shader up front** (the "unpacker", also a V8 prerequisite): walk the shader archives in
    `dump/romfs/arc/data.trpfs` (8 GB) instead of collecting shaders as the game creates them (`build/shaders`,
    5,488 so far), and translate them all ahead of time. First learn the trpfs layout and its compression; if it
    is a proprietary compressor, prefer running the game's own lifted loading code in a tool mode over writing a
    decoder. Gains: no translation stall the first time an area is reached, a complete shader set, and no Python
    needed during play. It will not raise the frame rate in areas already visited.
-7. **Keep the shader JIT as a fallback** after item 6 (gpu.c `jit_request`, NX_SHADER_JIT): anything not found
+6. **Keep the shader JIT as a fallback** after item 5 (gpu.c `jit_request`, NX_SHADER_JIT): anything not found
    in the archives (DLC, generated shaders) still gets translated. Removing Python entirely means porting
    `translate.py` to C, which belongs with V8 (packaging), not here.
 
