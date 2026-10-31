@@ -25,7 +25,7 @@ static bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all;
+        view_log, mutable_all, full_barriers;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -367,16 +367,54 @@ static void *staging(u64 size, VkBuffer *buf, u64 *off) {
     return e->a.map;
 }
 
-static void barrier_in(VkCommandBuffer c) {
+static void barrier_src(VkCommandBuffer c, VkAccessFlags2 src) {
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = src,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(c, &d);
 }
 
-static void barrier(void) { barrier_in(cmd()); }
+static void barrier_in(VkCommandBuffer c) { barrier_src(c, VK_ACCESS_2_MEMORY_WRITE_BIT); }
+
+/* the writes a pass without colour or depth writes can have made (transform feedback, shader stores): naming only
+ * these spares the driver flushing the colour and depth caches (RGP: every barrier flushed CB / DB / L2 with a
+ * full stall, ~230 a frame, many after transform-feedback passes that rasterize nothing) */
+#define ACCESS_NO_ATTACHMENTS (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | \
+                               VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)
+
+/* NX_GPU_LABELS: debug-utils regions a capture shows as user events (RGP): each pass by its targets, each draw and
+ * dispatch by its shaders, each barrier by the line that asked for it. Regions nest: a draw's closes before its
+ * pass ends (label_draw_end, end_rendering) */
+static void label_begin(VkCommandBuffer c, const char *fmt, ...) {
+    char s[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    VkDebugUtilsLabelEXT l = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = s};
+    vkCmdBeginDebugUtilsLabelEXT(c, &l);
+}
+
+static bool label_draw_open;
+
+static void label_draw_end(void) {
+    if (!label_draw_open) return;
+    vkCmdEndDebugUtilsLabelEXT(cmd());
+    label_draw_open = false;
+}
+
+static void barrier_at(u32 line, VkAccessFlags2 src) {
+    VkCommandBuffer c = cmd();
+    if (vk.labels) label_begin(c, "barrier L%u%s", line, src == VK_ACCESS_2_MEMORY_WRITE_BIT ? "" : " (no attachment writes)");
+    barrier_src(c, src);
+    if (vk.labels) vkCmdEndDebugUtilsLabelEXT(c);
+}
+#define barrier() barrier_at(__LINE__, VK_ACCESS_2_MEMORY_WRITE_BIT)
+
+/* the current pass has written colour or depth (a draw that rasterizes, a clear): end_rendering's barrier */
+static bool pass_att_writes;
 
 static void end_rendering_at(u32 line);
 #define end_rendering() end_rendering_at(__LINE__)
@@ -1356,9 +1394,16 @@ static void end_rendering_at(u32 line) {
     if (prof_on > 0)
         for (u32 i = 0; i < 64; i++)
             if (prof_ends[i].line == line || !prof_ends[i].line) { prof_ends[i].line = line; prof_ends[i].count++; break; }
+    label_draw_end();
     vkCmdEndRendering(cmd());
+    if (vk.labels) {                    /* the pass's region, then who ended it */
+        vkCmdEndDebugUtilsLabelEXT(cmd());
+        label_begin(cmd(), "end pass L%u", line);
+        vkCmdEndDebugUtilsLabelEXT(cmd());
+    }
     st.rendering = false;
     prof_mark("outside passes (copies, clears, barriers)");
+    bool full = pass_att_writes || env.full_barriers;
     if (npending) {
         barrier();                      /* after the draws before them */
         for (u32 i = 0; i < npending; i++) {
@@ -1366,8 +1411,9 @@ static void end_rendering_at(u32 line) {
             if (pending[i].mbuf) vkCmdUpdateBuffer(cmd(), pending[i].mbuf, pending[i].moff, pending[i].size, pending[i].data);
         }
         npending = 0;
+        full = true;                    /* and the updates (transfer writes) */
     }
-    barrier();
+    barrier_at(__LINE__, full ? VK_ACCESS_2_MEMORY_WRITE_BIT : ACCESS_NO_ATTACHMENTS);
     st.xfb_captured = false;
     memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
 }
@@ -1467,8 +1513,21 @@ static bool begin_rendering(void) {
         if (has_d || has_s) snprintf(lb + n, sizeof lb - n, " ds:%d", has_d ? st.depth_format : st.stencil_format);
         prof_mark(lb);
     }
+    if (vk.labels) {                    /* the pass by its size, formats and the first target's address */
+        char lb[128];
+        int n = snprintf(lb, sizeof lb, "pass %ux%u", w, h);
+        if (layers > 1) n += snprintf(lb + n, sizeof lb - n, "x%u", layers);
+        for (u32 i = 0; i < st.nrt && n < 80; i++)
+            if (st.rt_format[i]) n += snprintf(lb + n, sizeof lb - n, " c%u:%d", i, st.rt_format[i]);
+        if (has_d || has_s) n += snprintf(lb + n, sizeof lb - n, " ds:%d", has_d ? st.depth_format : st.stencil_format);
+        u64 a = 0;
+        for (u32 i = 0; i < 9 && !a; i++) a = st.rt_sub[i].addr;
+        if (n < (int)sizeof lb) snprintf(lb + n, sizeof lb - n, " @%llx", a);
+        label_begin(cmd(), "%s", lb);
+    }
     vkCmdBeginRendering(cmd(), &ri);
     st.rendering = true;
+    pass_att_writes = false;
     return true;
 }
 
@@ -1513,6 +1572,7 @@ static void do_clear_color(const CmdClearColor *p) {
     VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, p->index, {.color = clear_value(p->type, p->v)}};
     VkClearRect cr = {r, 0, 1};
     vkCmdClearAttachments(cmd(), 1, &a, 1, &cr);
+    pass_att_writes = true;
 }
 
 static void do_clear_depth_stencil(const CmdClearDS *p) {
@@ -1528,6 +1588,7 @@ static void do_clear_depth_stencil(const CmdClearDS *p) {
     VkClearAttachment a = {asp, 0, {.depthStencil = {p->depth, p->stencil}}};
     VkClearRect cr = {r, 0, 1};
     vkCmdClearAttachments(cmd(), 1, &a, 1, &cr);
+    pass_att_writes = true;
 }
 
 /* ClearTexture: a region of a level/layers, outside the render targets */
@@ -3602,12 +3663,14 @@ static void query_end(VkCommandBuffer c) {
 
 static void draw(u32 op, const void *payload) {
     if (st.xfb_captured && xfb_hazard(op, payload)) {   /* what was captured is read (or captured into) next */
+        bool in_pass = st.rendering;
         end_rendering();
-        barrier();
+        if (!in_pass) barrier();        /* end_rendering has made one */
         st.xfb_captured = false;
         memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
     }
     draw_one(op, payload);
+    label_draw_end();
     dump_after_draw();
     if (xfb_capturing) {
         vkCmdEndTransformFeedbackEXT(cmd(), 0, 0, NULL, NULL);
@@ -3817,6 +3880,13 @@ static void draw_one(u32 op, const void *payload) {
                  pr->stage[ST_VERTEX]->hash, pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0ull);
         prof_mark(lb);
     }
+    if (!st.rasterizer_discard || env.no_discard) pass_att_writes = true;
+    if (vk.labels) {                    /* closed by draw() after the draw, or by end_rendering */
+        label_draw_end();
+        label_begin(c, "draw vs %016llx fs %016llx", pr->stage[ST_VERTEX]->hash,
+                    pr->stage[ST_FRAGMENT] ? pr->stage[ST_FRAGMENT]->hash : 0ull);
+        label_draw_open = true;
+    }
     rec_check();
     bool all = !rec.bind_ok;
     rec.bind_ok = true;
@@ -3986,6 +4056,7 @@ static void dispatch(u32 op, const u8 *pay) {
         snprintf(lb, sizeof lb, "compute %016llx", pr_hash());
         prof_mark(lb);
     }
+    if (vk.labels) label_begin(c, "compute %016llx", pr_hash());
     if (op == OP_DISPATCH) {
         u32 g[3];
         memcpy(g, pay, 12);
@@ -3997,6 +4068,7 @@ static void dispatch(u32 op, const u8 *pay) {
         u64 off;
         if (gpu_buffer(a, &buf, &off)) vkCmdDispatchIndirect(c, buf, off);
     }
+    if (vk.labels) vkCmdEndDebugUtilsLabelEXT(c);
     prof_mark("outside passes (copies, clears, barriers)");
     barrier();
 }
@@ -4199,7 +4271,10 @@ static void run(u64 at, int depth) {
             break;
         }
         case OP_DOWNSAMPLE: { PL(CmdDownsample); do_downsample(p); break; }
-        case OP_BARRIER: end_rendering(); break;
+        case OP_BARRIER:                /* the game's: ends the pass (with its barrier), or nothing outside one */
+            if (vk.labels) { label_begin(cmd(), "nvn barrier%s", st.rendering ? "" : " (no pass)"); vkCmdEndDebugUtilsLabelEXT(cmd()); }
+            end_rendering();
+            break;
         case OP_FENCE_SYNC: {
             PL(CmdSync);
             Sync *s = obj_get(p->sync, T_SYNC);
@@ -4939,6 +5014,7 @@ static void env_init(void) {
     env.feedback_log = getenv("NX_FEEDBACK_LOG") != NULL;
     env.view_log = getenv("NX_VIEW_LOG") != NULL;
     env.mutable_all = getenv("NX_MUTABLE_ALL") != NULL;
+    env.full_barriers = getenv("NX_FULL_BARRIERS") != NULL;
     env.timeline = getenv("NX_GPU_TIMELINE") != NULL;
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;

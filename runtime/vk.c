@@ -19,6 +19,7 @@ VK_GLOBAL_FNS(VK_DEFINE)
 VK_INSTANCE_FNS(VK_DEFINE)
 VK_DEVICE_FNS(VK_DEFINE)
 VK_DEVICE_OPT_FNS(VK_DEFINE)
+VK_LABEL_FNS(VK_DEFINE)
 #undef VK_DEFINE
 
 Vk vk;
@@ -104,10 +105,17 @@ static void load_instance(void) {
     const char *layers[1];
     u32 nlayers = 0;
     bool validate = getenv("NX_VK_VALIDATION") != NULL;
-    if (validate) {
-        layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
-        ext[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    if (validate) layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
+    if (getenv("NX_GPU_LABELS")) {
+        u32 ne = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+        vkEnumerateInstanceExtensionProperties(NULL, &ne, ep);
+        for (u32 i = 0; i < ne; i++) vk.labels |= !strcmp(ep[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        free(ep);
+        if (!vk.labels) hlog(0, "vk: NX_GPU_LABELS: no VK_EXT_debug_utils");
     }
+    if (validate || vk.labels) ext[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = NX_NAME,
                              .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -116,6 +124,11 @@ static void load_instance(void) {
     VKCHECK(vkCreateInstance(&ci, NULL, &vk.instance));
 #define VK_LOAD_I(f) if (!(f = (PFN_##f)gipa(vk.instance, #f))) fatal("Vulkan: no %s", #f);
     VK_INSTANCE_FNS(VK_LOAD_I)
+    if (vk.labels) {
+#define VK_LOAD_L(f) f = (PFN_##f)gipa(vk.instance, #f);
+        VK_LABEL_FNS(VK_LOAD_L)
+        vk.labels = vkCmdBeginDebugUtilsLabelEXT && vkCmdEndDebugUtilsLabelEXT;
+    }
     if (validate) {
         PFN_vkCreateDebugUtilsMessengerEXT create =
             (PFN_vkCreateDebugUtilsMessengerEXT)gipa(vk.instance, "vkCreateDebugUtilsMessengerEXT");
