@@ -24,7 +24,8 @@ static bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline;
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
+        view_log, mutable_all;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -601,6 +602,8 @@ typedef struct Image {
     VkImage image;
     VkAlloc alloc;
     VkFormat format;
+    VkFormat vfmts[6];                  /* the formats its views may use (format_list); vfmts[0] is format */
+    u32 nvfmts;
     VkImageAspectFlags aspects;
     VkImageUsageFlags usage;
     u32 levels, layers;
@@ -788,6 +791,42 @@ static VkFormat uint_twin(VkFormat f) {
     }
 }
 
+/* the sRGB format of a UNORM one and back (the game samples an sRGB target as UNORM; NX_VIEW_LOG) */
+static VkFormat srgb_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+    default: return f;
+    }
+}
+
+/* The formats an image's views may use: its own, and the twins image_view picks (sampled, integer, storage,
+ * sRGB / UNORM). Only an image with more than one is made MUTABLE_FORMAT, with these as its format list: a
+ * mutable image without a list loses colour compression (DCC) on AMD. A guest view in any other format falls back
+ * to the image's own (logged). NX_MUTABLE_ALL=1: every image mutable, no lists (as before 2026-11-01) */
+static void format_list(Image *im) {
+    VkFormat f = im->format, c[5] = {sampled_format(f), uint_twin(f), srgb_twin(f),
+        im->usage & VK_IMAGE_USAGE_STORAGE_BIT ? storage_format(f) : f, f};
+    im->vfmts[0] = f;
+    im->nvfmts = 1;
+    for (int i = 0; i < 5; i++) {
+        bool dup = c[i] == VK_FORMAT_UNDEFINED;
+        for (u32 j = 0; j < im->nvfmts; j++) dup |= im->vfmts[j] == c[i];
+        if (!dup) im->vfmts[im->nvfmts++] = c[i];
+    }
+}
+
+static bool format_listed(const Image *im, VkFormat f) {
+    if (env.mutable_all) return true;
+    for (u32 i = 0; i < im->nvfmts; i++)
+        if (im->vfmts[i] == f) return true;
+    return false;
+}
+
 static Image *image_create(const TexInfo *t, u32 h);
 static void images_evict(u64 target, bool wait);
 
@@ -954,7 +993,15 @@ static Image *image_make(const TexInfo *t, u32 h) {
     im->usage = usage;
     VkImageType type = t->target == TEX_3D ? VK_IMAGE_TYPE_3D :
                        t->target == TEX_1D || t->target == TEX_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
-    VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    format_list(im);
+    VkImageCreateFlags flags = 0;
+    if (env.mutable_all) flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    else if (im->nvfmts > 1) flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    /* a usage the image's own format lacks (storage through the UNORM twin of an sRGB format) */
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT && !(ft & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = im->nvfmts, .pViewFormats = im->vfmts};
     if (type == VK_IMAGE_TYPE_2D && im->layers >= 6 && t->width == t->height && t->samples <= 1)
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (type == VK_IMAGE_TYPE_3D) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
@@ -963,6 +1010,7 @@ static Image *image_make(const TexInfo *t, u32 h) {
         .extent = {t->width, tex_height(t), tex_depth(t)}, .mipLevels = im->levels, .arrayLayers = im->layers,
         .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (!env.mutable_all && flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ci.pNext = &fl;
     VkResult r = vkCreateImage(vk.dev, &ci, NULL, &im->image);
     if (r != VK_SUCCESS) {
         hlog(0, "gpu: vkCreateImage %ux%ux%u format %u (vk %d) target %u: %d", t->width, t->height, t->depth,
@@ -1063,6 +1111,13 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
         if (im->views[i].kind == kind && !memcmp(&im->views[i].v, v, sizeof *v)) return im->views[i].view;
     VkFormat fmt = usable_format(v->format);
     if (fmt == VK_FORMAT_UNDEFINED || format_aspects(fmt) != im->aspects) fmt = im->format;
+    if (!format_listed(im, fmt)) {      /* not in the image's format list (format_list): seen as its own format */
+        static int warned;
+        if (warned++ < 16)
+            hlog(0, "gpu: view of image vk %d (guest f%u, %ux%u) as vk %d (guest f%u) not in its format list",
+                 im->format, im->info.format, im->info.width, tex_height(&im->info), fmt, v->format);
+        fmt = im->format;
+    }
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .format = fmt};
     u32 base_level = v->base_level < im->levels ? v->base_level : im->levels - 1;
     u32 nlevels = v->num_levels && base_level + v->num_levels <= im->levels ? v->num_levels : im->levels - base_level;
@@ -1107,6 +1162,21 @@ static VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     if (vkCreateImageView(vk.dev, &ci, NULL, &view) != VK_SUCCESS) {
         hlog(0, "gpu: image view (format %u, kind %u) failed", v->format, kind);
         return NULL;
+    }
+    /* NX_VIEW_LOG: views in a format other than the image's (each image format, view format and kind once): the
+     * formats a VkImageFormatListCreateInfo would have to name, and which images need MUTABLE_FORMAT at all */
+    if (env.view_log && ci.format != im->format) {
+        static struct { VkFormat i, v; u32 kind; } seen[256];
+        static int ns;
+        bool dup = false;
+        for (int i = 0; i < ns; i++) dup |= seen[i].i == im->format && seen[i].v == ci.format && seen[i].kind == kind;
+        if (!dup && ns < 256) {
+            seen[ns].i = im->format; seen[ns].v = ci.format; seen[ns].kind = kind; ns++;
+            hlog(0, "gpu: view: image vk %d (guest f%u, %ux%u%s) seen as vk %d (guest f%u), kind %u", im->format,
+                 im->info.format, im->info.width, tex_height(&im->info),
+                 im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ?
+                 ", attachment" : "", ci.format, v->format, kind);
+        }
     }
     if (im->nviews == im->capviews) im->views = realloc(im->views, (im->capviews = im->capviews * 2 + 4) * sizeof *im->views);
     im->views[im->nviews++] = (View){*v, kind, view};
@@ -4867,6 +4937,8 @@ static void env_init(void) {
     env.flush_first = (e = getenv("NX_FLUSH_FIRST")) ? atoi(e) : 32;
     env.hitch_ms = (e = getenv("NX_HITCH_MS")) ? atof(e) : 0;
     env.feedback_log = getenv("NX_FEEDBACK_LOG") != NULL;
+    env.view_log = getenv("NX_VIEW_LOG") != NULL;
+    env.mutable_all = getenv("NX_MUTABLE_ALL") != NULL;
     env.timeline = getenv("NX_GPU_TIMELINE") != NULL;
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;
