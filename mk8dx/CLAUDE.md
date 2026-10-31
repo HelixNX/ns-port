@@ -125,8 +125,29 @@ Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
   `services/bsd.c` (bsd:u: UDP sockets as proxy packets from our fake 192.168.x.y address; TCP refused, as in
   Eden). Offline both stay as before (ldn unavailable, bsd stubbed). `net/room.c` owns ENet on its own thread.
 - Verified: the browser lists the rooms (25 MK8 of 133); joining a real public room works (fake address assigned,
-  game info shown to the room). Not yet tested: a local-play session with a second player (two of our instances in
-  one room, or one of ours with an Eden player).
+  game info shown to the room).
+- 2026-11-01, local play with an Eden player (a friend, "meow"), public rooms and a room of our own:
+  - Protocol numbering: proxy packets carry a `Network::Protocol`, and Eden builds number it two ways: releases (and
+    yuzu, Citra) have Unspecified 0, ICMP 1, TCP 2, UDP 3; `deps/suyu`'s newer sources insert IP = 1 (UDP 4). Both
+    sides drop packets of another protocol without a word, so each side's host saw the station join (LDN fine) and
+    then nothing: "A communication error has occurred" after 5 s. `bsd.c` now sends 3, switches to 4 if a member
+    sends 4, and datagram sockets take either. Fixed: we joined an Eden host and raced (2 min, ~1,500 packets each
+    way). Not yet seen working: an Eden player joining us as host.
+  - Stalls drop us out: a freeze of ~1 s or more mid-session makes the game give up ("communication error").
+    Causes found: (1) draws waiting for shader translation: `NX_ASYNC_SHADERS` (on in netplay builds) skips them
+    instead; (2) translate.py's glslang on every core starved the game's threads (main waiting for a core 73%): it
+    now runs in a job at below-normal priority on half the cores; (3) still open: 2-4 s frames on the pre-race
+    loading screen, the main thread (prio 44, core 0) waiting for a core while the loader thread 52 (prio 45, core 0)
+    runs, probably inside long host calls (GPU pool and texture setup) that cannot be preempted; next: measure
+    them, then let such calls give up the core as IPC does.
+  - Still open: sessions ending after 1-2 min with our game leaving on its own, no stall nearby and packets flowing
+    both ways (needs the Eden player's log of that moment); with async shaders, a green-tinted, washed-out screen
+    on one track and bright flashes (suspect: a skipped draw into a texture drawn once per track, e.g. colour
+    grading or exposure; test: the same track again with its shaders cached).
+  - `../nxrecomp/tools/room` (`build.bat <out dir>`; built to `build/room/room_server.exe`): a room server of our
+    own (same protocol, 192.168.1.x for everyone as Eden's rooms; `--log 2` prints every relayed packet with its
+    decompressed first bytes: Pia's packets start `32 ab 98 64`). To host: run it on UDP 24872 and expose that
+    port (playit.gg UDP tunnel worked; ngrok has no UDP); join with `NX_ROOM=127.0.0.1:24872`.
 - 2026-10-31: MK8 was re-lifted with the current lifter (the Violet-era lifter writes unresolved-import stubs into
   `table.c`); `dump_v21` was rebuilt from the NSPs (`elf/` by `../nxrecomp/tools/nso2elf.py`).
 
