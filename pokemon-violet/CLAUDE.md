@@ -131,7 +131,11 @@ rate now**).
   does all of it (log build/bench_<name>.log, frame time and NX_GPU_TIMELINE busy over the windows after the first
   one over 3 ms and the next: later single hitches are kept, they are part of the scene); `-Summary` re-reads a
   log; `-Rgp <frame>` takes an RGP capture of that frame into build/<name>.rgp (written 2026-10-31 from the
-  steps that worked by hand, not run as a script yet). Run A / B pairs in both orders.
+  steps that worked by hand, not run as a script yet; 2026-10-31 fixed two bugs that broke it: the capture path
+  variable was the same as `-Rgp` (PowerShell names ignore case), and `NAME=value` pairs bound to `-Rgp`, so
+  only `<name>` is positional now). Run A / B pairs in both orders. To compare two exes, swap
+  `build\cmake\violetrecomp.exe` between runs: retry the copy (the last run holds the file a few seconds) and
+  check its hash, and don't count the first run after a swap (~0.1 ms slow).
 - What a frame is (2026-10-22): with rendering, the render thread (5c) translates ~3.4 ms (~2,000 draws, ~1.7 us a
   draw; Savage Wind's is 2.4) and waits ~1.6-2.8 ms for the GPU; main runs only ~40% (waits on 5c). With every draw
   skipped (NX_GPU_SKIP=1): 235-244 fps (4.1-4.3 ms), main 73% running, blocked ~27% (~21% on one condition
