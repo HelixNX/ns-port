@@ -13,15 +13,15 @@ if (-not $Summary) {
     $set = @{ NX_NOPACE = '1'; NX_TIME = '1792494000'; NX_INPUT = '300-900/60:A'; NX_GPU_TIMELINE = '1' }
     foreach ($e in $Env) { $k, $v = $e -split '=', 2; $set[$k] = $v }
     $cli = $null
-    $rgp = "$b\$Name.rgp"
+    $rgpFile = "$b\$Name.rgp"
     if ($Rgp) {         # the Panel CLI must be waiting before the game starts; neither exits after the capture
         $tools = Get-ChildItem (Join-Path $PSScriptRoot '..\..\.tools\rdts') -Recurse -Filter RadeonDeveloperPanelCLI.exe |
             Select-Object -First 1
         if (-not $tools) { throw 'no RadeonDeveloperPanelCLI.exe under .tools\rdts' }
-        if (Test-Path $rgp) { Remove-Item -Force $rgp }
+        if (Test-Path $rgpFile) { Remove-Item -Force $rgpFile }
         $cli = Start-Process -FilePath $tools.FullName -PassThru -NoNewWindow -RedirectStandardOutput "$b\rgp_$Name.out" `
             -ArgumentList @('-m', 'profiling', '-p', 'violetrecomp', "--rgp-auto-capture=frame:$Rgp",
-                            '--rgp-sqtt-buffer-size', 'high', '-o', $rgp)
+                            '--rgp-sqtt-buffer-size', 'high', '-o', $rgpFile)
         Start-Sleep -Seconds 3
     }
     foreach ($k in $set.Keys) { Set-Item "Env:$k" $set[$k] }
@@ -31,14 +31,14 @@ if (-not $Summary) {
         $t0 = Get-Date
         while (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt ($Rgp ? 150 : 135)) {
             Start-Sleep -Seconds 2
-            if ($Rgp -and (Test-Path $rgp)) { Start-Sleep -Seconds 5; break }   # a cut-off trace fails (-2)
+            if ($Rgp -and (Test-Path $rgpFile)) { Start-Sleep -Seconds 5; break }   # a cut-off trace fails (-2)
         }
         if (-not $p.HasExited) { $p.Kill() }
     } finally {
         foreach ($k in $set.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
         if ($cli -and -not $cli.HasExited) { Start-Sleep -Seconds 3; $cli.Kill() }
     }
-    if ($Rgp) { if (Test-Path $rgp) { "{0}: {1:N1} MB" -f $rgp, ((Get-Item $rgp).Length / 1MB) } else { "no capture (see $b\rgp_$Name.out)" } }
+    if ($Rgp) { if (Test-Path $rgpFile) { "{0}: {1:N1} MB" -f $rgpFile, ((Get-Item $rgpFile).Length / 1MB) } else { "no capture (see $b\rgp_$Name.out)" } }
 }
 $ft = @(Select-String -Path $log -Pattern 'nvn: frame time ([\d.]+) ms')
 $first = 0         # the load's two hitch windows: the first window over 3 ms (title and load run ~1 ms) and the next
