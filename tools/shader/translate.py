@@ -80,6 +80,10 @@ class Translator:
         self.uses = set()           # features: 'global', 'lmem', 'fragdepth', 'vertexid', ...
         self.indent = 1
         self.lmem_words = 0
+        # texture / image handles read from c[2] at a fixed offset are the same for the whole draw, so their
+        # descriptor indices go without nonuniformEXT (which can cost a loop per access, AMD); handles from
+        # registers keep it (TMML.B sets this while it is emitted; surface() checks its own handle)
+        self.nonuniform = False
         self.xfb = self.xfb_layout()
         sph = sh.sph
         if sph:
@@ -123,15 +127,22 @@ class Translator:
         if p != PT:
             self.emit('p%d = %s;' % (p, expr))
 
+    def ix(self, e):
+        """a descriptor array index"""
+        return ('nonuniformEXT(%s)' if self.nonuniform else '(%s)') % e
+
     def cbuf(self, idx, off):
         """32-bit word of c[idx] at byte offset off (constant)"""
         if idx == 0 and self.stage == 'vertex' and off in (0x640, 0x644):
             # NVN's driver data: the draw's base vertex and base instance, which indirect draws take from GPU memory
             # (GPU-culled objects have large base instances: read as 0, trees and rocks near the camera vanished)
             return 'uint(gl_BaseVertex)' if off == 0x640 else 'uint(gl_BaseInstance)'
-        self.cbufs.add(idx)
         if off & 3:
             raise Unsupported('unaligned cbuf offset')
+        if idx == 1 and 0 <= off and off + 4 <= len(self.sh.consts):
+            # c[1] holds the shader's own embedded constants (runtime/gpu.c binds them from the shader): literals
+            return '0x%08xu' % struct.unpack_from('<I', self.sh.consts, off)[0]
+        self.cbufs.add(idx)
         return 'cb%d.d[%d][%d]' % (idx, off >> 4, (off >> 2) & 3)
 
     def cbuf_dyn(self, idx, expr):
@@ -157,7 +168,8 @@ class Translator:
         if form == 'R':
             return self.Rf(bits(w, 20, 8))
         if form == 'C':
-            return 'F(%s)' % self.cbuf(bits(w, 34, 5), bits(w, 20, 14) * 4)
+            v = self.cbuf(bits(w, 34, 5), bits(w, 20, 14) * 4)
+            return flit(int(v[2:-1], 16)) if v.startswith('0x') else 'F(%s)' % v
         if form == 'I':
             return flit(bits(w, 20, 19) << 12 | bits(w, 56, 1) << 31)
         if form == '32I':
@@ -284,8 +296,7 @@ class Translator:
         if dref is not None:
             styp += 'Shadow'
         self.uses.add('tex_' + arr)
-        s = '%s(%s[nonuniformEXT((%s & 0xffffu))], smp[nonuniformEXT(min(%s >> 20, 4095u))])' % (
-            styp, arr, handle, handle)
+        s = '%s(%s[%s], smp[%s])' % (styp, arr, self.ix('%s & 0xffffu' % handle), self.ix('min(%s >> 20, 4095u)' % handle))
         if query:
             return 'textureQueryLod(%s, %s)' % (s, coords)
         if gather is not None:
@@ -297,8 +308,8 @@ class Translator:
                 e = 'textureGather(%s, %s, %d)' % (s, coords, gather)
             if kind in ('2D', '2DARRAY'):       # integer textures: the raw bits through the integer view
                 self.uses.add('tex_u' + arr)
-                us = 'u%s(u%s[nonuniformEXT((%s & 0xffffu))], smp[nonuniformEXT(min(%s >> 20, 4095u))])' % (
-                    styp, arr, handle, handle)
+                us = 'u%s(u%s[%s], smp[%s])' % (styp, arr, self.ix('%s & 0xffffu' % handle),
+                                                self.ix('min(%s >> 20, 4095u)' % handle))
                 ue = ('textureGatherOffset(%s, %s, %s, %d)' % (us, coords, offset, gather) if offset else
                       'textureGather(%s, %s, %d)' % (us, coords, gather))
                 e = '(%s ? uintBitsToFloat(%s) : %s)' % (INT_FLAG % handle, ue, e)
@@ -1342,11 +1353,11 @@ class Translator:
         self.uses.add('tex_' + arr)
         if offset:
             coords = '(%s + %s)' % (coords, offset)
-        e = 'texelFetch(%s[nonuniformEXT((%s & 0xffffu))], %s, %s)' % (arr, handle, coords, lod)
+        e = 'texelFetch(%s[%s], %s, %s)' % (arr, self.ix('%s & 0xffffu' % handle), coords, lod)
         if kind in ('2D', '2DARRAY'):           # integer textures: the raw bits through the integer view
             self.uses.add('tex_u' + arr)
-            e = '(%s ? uintBitsToFloat(texelFetch(u%s[nonuniformEXT((%s & 0xffffu))], %s, %s)) : %s)' % (
-                INT_FLAG % handle, arr, handle, coords, lod, e)
+            e = '(%s ? uintBitsToFloat(texelFetch(u%s[%s], %s, %s)) : %s)' % (
+                INT_FLAG % handle, arr, self.ix('%s & 0xffffu' % handle), coords, lod, e)
         return e
 
     def op_TLDS(self, w, form, pc):
@@ -1474,7 +1485,9 @@ class Translator:
             h = self.R(mr)
         else:
             h = self.tex_handle(bits(w, 36, 13))
+        self.nonuniform = form == 'B'
         e = self.sample(kind, 'h_', coords, query=True)
+        self.nonuniform = False
         self.emit('{ uint h_ = %s; vec2 v_ = %s;' % (h, e))
         self.indent += 1
         r = d
@@ -1495,6 +1508,7 @@ class Translator:
             raise Unsupported('TXQ mode %d' % mode)
         if form == 'B':
             h, lod = self.R(sr), self.R(sr + 1 if sr != RZ else RZ)
+            self.uses.add('txq_nu')     # a handle from a register: txq() indexes with nonuniformEXT
         else:
             h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
         # each view type has its own array (runtime/gpu.c TB_*): every 2D image has a 2D array view, a 3D image only
@@ -1527,10 +1541,11 @@ class Translator:
         if dim.endswith('ARRAY'):
             coords.append('int(%s & 0xffffu)' % self.R(c + n if c != RZ else RZ))
         coords = coords[0] if len(coords) == 1 else 'ivec%d(%s)' % (len(coords), ', '.join(coords))
-        h = self.cbuf(2, bits(w, 36, 13) * 4) if bits(w, 51, 1) else self.R(bits(w, 39, 8))
+        bound = bits(w, 51, 1)
+        h = self.cbuf(2, bits(w, 36, 13) * 4) if bound else self.R(bits(w, 39, 8))
         name = {'f': 'i', 'a': 'ua', 'ai': 'ia'}[kind] + dim.lower()
         self.uses.add('img_' + name)
-        return '%s[nonuniformEXT((%s & 0xffffu))]' % (name, h), coords
+        return '%s[%s(%s & 0xffffu)]' % (name, '' if bound else 'nonuniformEXT', h), coords
 
     def op_SUST(self, w, form, pc):
         if bits(w, 52, 1):
@@ -1918,7 +1933,8 @@ class Translator:
             out.append('layout(set = 2, binding = 0) uniform sampler smp[];')
             if 'txq' in self.uses:
                 # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D
-                out += ['uvec4 txq(uint h, int lod) {',
+                nu = 'nonuniformEXT' if 'txq_nu' in self.uses else ''
+                out += [l.replace('nonuniformEXT', nu) for l in ['uvec4 txq(uint h, int lod) {',
                         '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
                         '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
                         '    int l = textureQueryLevels(sampler2DArray(t2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]));',
@@ -1927,7 +1943,7 @@ class Translator:
                         '        if (d != ivec3(1)) { z = d; l = textureQueryLevels(sampler3D(t3d[nonuniformEXT(t)], smp[nonuniformEXT(s)])); }',
                         '    }',
                         '    return uvec4(uvec3(z), uint(l));',
-                        '}']
+                        '}']]
         # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)
         idecl = {'1d': 'image1D', '1darray': 'image1DArray', '2d': 'image2D', '2darray': 'image2DArray', '3d': 'image3D'}
         for dim, typ in idecl.items():

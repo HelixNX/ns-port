@@ -376,7 +376,10 @@ void vk_init(void) {
         .occlusionQueryPrecise = 1, .vertexPipelineStoresAndAtomics = 1, .fragmentStoresAndAtomics = 1,
         .shaderImageGatherExtended = 1, .shaderStorageImageExtendedFormats = 1,
         .shaderStorageImageReadWithoutFormat = 1, .shaderStorageImageWriteWithoutFormat = 1,
-        .shaderClipDistance = 1, .shaderCullDistance = 1, .shaderFloat64 = 1, .shaderInt64 = 1, .shaderInt16 = 1};
+        .shaderClipDistance = 1, .shaderCullDistance = 1,
+        /* descriptor arrays indexed by a handle that is the same for the whole draw (translate.py: from c[2], no
+         * nonuniformEXT) */
+        .shaderSampledImageArrayDynamicIndexing = 1, .shaderStorageImageArrayDynamicIndexing = 1, .shaderFloat64 = 1, .shaderInt64 = 1, .shaderInt16 = 1};
     float prio[2] = {1, 1};
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk.family,
                                    .queueCount = family_queues >= 2 ? 2 : 1, .pQueuePriorities = prio};
