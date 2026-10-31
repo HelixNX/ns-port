@@ -97,6 +97,23 @@ typedef u64 __attribute__((aligned(1))) u64u;
     static inline void STL##b(u64 a, u##b v) { __atomic_store_n((u##b *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 #undef DEF_MEM
+/* Loads and stores with SP as the base: the thread's own stack frame. Volatile like the rest; NX_STACK_PLAIN
+ * (nxrecomp.cmake) makes them plain, so that clang can keep a slot in a register, merge reloads and drop overwritten
+ * stores. Another thread reaches a stack object only through a pointer (a volatile access on its side), lifted calls
+ * are opaque (slots are reloaded after any call), and the addresses come from integers (no reordering past volatile
+ * accesses that may alias). Measured 2026-10-31 on Violet's CPU-only benchmark: no change (4.00 ms either way), so
+ * the default stays volatile. */
+#ifdef NX_STACK_PLAIN
+#define DEF_MEMS(b) \
+    static inline u##b LDS##b(u64 a) { return *(u##b##u *)(uintptr_t)a; } \
+    static inline void STS##b(u64 a, u##b v) { *(u##b##u *)(uintptr_t)a = v; }
+#else
+#define DEF_MEMS(b) \
+    static inline u##b LDS##b(u64 a) { return LD##b(a); } \
+    static inline void STS##b(u64 a, u##b v) { ST##b(a, v); }
+#endif
+DEF_MEMS(8) DEF_MEMS(16) DEF_MEMS(32) DEF_MEMS(64)
+#undef DEF_MEMS
 static inline v128 LDQ(u64 a) { v128 v; memcpy(&v, (const void *)(uintptr_t)a, 16); return v; }
 static inline void STQ(u64 a, v128 v) { memcpy((void *)(uintptr_t)a, &v, 16); }
 /* DMB/DSB. A full barrier: a locked no-op on the stack, the same ordering for normal memory as MFENCE at a fraction

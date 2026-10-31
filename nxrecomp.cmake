@@ -58,6 +58,11 @@ set(NX_LIFT_OPT "-O1" CACHE STRING "clang optimization level for lifted code")
 set(NX_LIFT_FLAGS /clang:${NX_LIFT_OPT} /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-march=haswell
                   /clang:-fbracket-depth=1024 /clang:-Wno-everything
                   /clang:-gline-tables-only /clang:-gcodeview)   # lines = guest offsets (a64lift #line)
+# loads and stores with SP as the base (a64rt.h LDS / STS) are volatile like the rest; ON makes them plain, to compare
+option(NX_STACK_PLAIN "plain (non-volatile) stack accesses in lifted code" OFF)
+if(NX_STACK_PLAIN)
+    list(APPEND NX_LIFT_FLAGS /DNX_STACK_PLAIN)
+endif()
 
 set(NX_RUNTIME_SOURCES
     main.c loader.c dispatch.c mem.c kernel.c kmem.c svc.c ipc.c

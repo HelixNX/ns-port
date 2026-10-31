@@ -392,6 +392,8 @@ def balanced(s):
 LD = {0: 'LD8', 1: 'LD16', 2: 'LD32', 3: 'LD64'}
 ST = {0: 'ST8', 1: 'ST16', 2: 'ST32', 3: 'ST64'}
 SEXT = {0: 's8', 1: 's16', 2: 's32'}
+LDS = {0: 'LDS8', 1: 'LDS16', 2: 'LDS32', 3: 'LDS64'}    # SP as the base: the thread's own stack (a64rt.h)
+STS = {0: 'STS8', 1: 'STS16', 2: 'STS32', 3: 'STS64'}
 
 
 def loadstore(fn, w, pc):
@@ -409,25 +411,25 @@ def loadstore(fn, w, pc):
     raise Unimpl('ldst')
 
 
-def mem_read(fn, size, v, signed_to=None):
-    """Expression loading `size` (0..3 = 8..64 bits) at address expression v."""
-    e = '%s(%s)' % (LD[size], v)
+def mem_read(fn, size, v, signed_to=None, stack=False):
+    """Expression loading `size` (0..3 = 8..64 bits) at address expression v (stack: SP is the base)."""
+    e = '%s(%s)' % ((LDS if stack else LD)[size], v)
     if signed_to is not None:
         e = '(%s)(%s)%s' % ('u64' if signed_to else 'u32', SEXT[size], e)
     return e
 
 
-def vreg_load(fn, rt, sz, addr):
+def vreg_load(fn, rt, sz, addr, stack=False):
     """SIMD&FP scalar load of 2**sz bytes (0..4) into Vrt, zeroing the rest."""
     if sz == 4:
         return fn.setv(rt, 'LDQ(%s)' % addr)
-    return fn.setv(rt, 'vz%d(%s(%s))' % (8 << sz, LD[sz], addr))
+    return fn.setv(rt, 'vz%d(%s(%s))' % (8 << sz, (LDS if stack else LD)[sz], addr))
 
 
-def vreg_store(fn, rt, sz, addr):
+def vreg_store(fn, rt, sz, addr, stack=False):
     if sz == 4:
         return 'STQ(%s, %s);' % (addr, fn.v(rt))
-    return '%s(%s, (u%d)%s[0]);' % (ST[sz], addr, 8 << sz, '((v%du%d)%s)' % (128 // (8 << sz), 8 << sz, fn.v(rt)))
+    return '%s(%s, (u%d)%s[0]);' % ((STS if stack else ST)[sz], addr, 8 << sz, '((v%du%d)%s)' % (128 // (8 << sz), 8 << sz, fn.v(rt)))
 
 
 def load_literal(fn, w, pc):
@@ -476,6 +478,8 @@ def load_pair(fn, w, pc):
     scale = 1 << sz
     imm = sext(bits(w, 21, 15), 7) * scale
     base = fn.x(rn, sp=True)
+    stk = rn == 31
+    st = STS if stk else ST
     if mode == 1:                                                     # post-index
         a = base
     else:
@@ -483,24 +487,25 @@ def load_pair(fn, w, pc):
     parts = ['u64 a = %s;' % a]
     if vbit:
         if l:
-            parts.append(vreg_load(fn, rt, sz, 'a'))
-            parts.append(vreg_load(fn, rt2, sz, 'a + %d' % scale))
+            parts.append(vreg_load(fn, rt, sz, 'a', stk))
+            parts.append(vreg_load(fn, rt2, sz, 'a + %d' % scale, stk))
         else:
-            parts.append(vreg_store(fn, rt, sz, 'a'))
-            parts.append(vreg_store(fn, rt2, sz, 'a + %d' % scale))
+            parts.append(vreg_store(fn, rt, sz, 'a', stk))
+            parts.append(vreg_store(fn, rt2, sz, 'a + %d' % scale, stk))
     elif l:
         if opc == 1:                                                  # LDPSW
-            v1, v2 = mem_read(fn, 2, 'a', 1), mem_read(fn, 2, 'a + 4', 1)
+            v1, v2 = mem_read(fn, 2, 'a', 1, stk), mem_read(fn, 2, 'a + 4', 1, stk)
             parts.append('u64 t1 = %s, t2 = %s;' % (v1, v2))
             parts.append(fn.setx(rt, 't1'))
             parts.append(fn.setx(rt2, 't2'))
         else:
-            parts.append('u64 t1 = %s, t2 = %s;' % (mem_read(fn, sz, 'a'), mem_read(fn, sz, 'a + %d' % scale)))
+            parts.append('u64 t1 = %s, t2 = %s;' % (mem_read(fn, sz, 'a', stack=stk),
+                                                    mem_read(fn, sz, 'a + %d' % scale, stack=stk)))
             parts.append(fn.setr(rt, sz == 3, 't1'))
             parts.append(fn.setr(rt2, sz == 3, 't2'))
     else:
-        parts.append('%s(a, %s);' % (ST[sz], fn.r(rt, sz == 3)))
-        parts.append('%s(a + %d, %s);' % (ST[sz], scale, fn.r(rt2, sz == 3)))
+        parts.append('%s(a, %s);' % (st[sz], fn.r(rt, sz == 3)))
+        parts.append('%s(a + %d, %s);' % (st[sz], scale, fn.r(rt2, sz == 3)))
     if mode == 1:
         parts.append(fn.setx(rn, 'a + %s' % hx(imm), sp=True))
     elif mode == 3:
@@ -512,6 +517,7 @@ def load_reg(fn, w, pc):
     size, vbit, opc = bits(w, 31, 30), bits(w, 26, 26), bits(w, 23, 22)
     rt, rn = bits(w, 4, 0), bits(w, 9, 5)
     base = fn.x(rn, sp=True)
+    stk = rn == 31
     wb = None                                                         # (writeback, post)
     if bits(w, 25, 24) == 1:                                          # unsigned offset
         if vbit:
@@ -549,27 +555,27 @@ def load_reg(fn, w, pc):
             stmts.append('u64 a = %s;' % a)
             a = 'a'
         if opc & 1:
-            stmts.append(vreg_load(fn, rt, sz, a))
+            stmts.append(vreg_load(fn, rt, sz, a, stk))
         else:
-            stmts.append(vreg_store(fn, rt, sz, a))
+            stmts.append(vreg_store(fn, rt, sz, a, stk))
     else:
         if wb is not None:
             stmts.append('u64 a = %s;' % a)
             a = 'a'
         if opc == 0:
-            stmts.append('%s(%s, %s);' % (ST[size], a, fn.r(rt, size == 3)))
+            stmts.append('%s(%s, %s);' % ((STS if stk else ST)[size], a, fn.r(rt, size == 3)))
         elif opc == 1:
-            stmts.append(fn.setr(rt, size == 3, mem_read(fn, size, a)))
+            stmts.append(fn.setr(rt, size == 3, mem_read(fn, size, a, stack=stk)))
         elif size == 3:
             stmts.append(';')                                         # PRFM / PRFUM
             if wb is not None:
                 raise Unimpl('prfm-wb')
         elif opc == 2:                                                # sign-extend to 64
-            stmts.append(fn.setx(rt, mem_read(fn, size, a, signed_to=1)))
+            stmts.append(fn.setx(rt, mem_read(fn, size, a, signed_to=1, stack=stk)))
         else:
             if size == 2:
                 raise Unimpl('ldr-opc')
-            stmts.append(fn.setw(rt, mem_read(fn, size, a, signed_to=0)))
+            stmts.append(fn.setw(rt, mem_read(fn, size, a, signed_to=0, stack=stk)))
     if wb is not None:
         kind, imm = wb
         stmts.append(fn.setx(rn, ('a + %s' % hx(imm)) if kind == 'post' else 'a', sp=True))
