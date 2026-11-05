@@ -425,10 +425,13 @@ static void end_rendering_at(u32 line);
 
 static bool mirror_sync(VkCommandBuffer pre);
 static void mirror_scan_start(void);
+static void linear_writeback(void);
+static int nwb;
 
 static void flush(void) {
     end_rendering();
     if (cur < 0) return;
+    if (nwb) linear_writeback();
     Slot *s = &slots[cur];
     bool pre = mirror_sync(s->pre);
     prof_mark("(end)");
@@ -657,11 +660,25 @@ typedef struct Image {
     bool gpu_written;                   /* rendered, cleared or copied into: guest memory is not its source */
     u64 size;                           /* bytes of guest memory it covers */
     u64 used;                           /* the frame (frame_no + 1) it was last looked up in */
+    bool wb_pending;                    /* pitch-linear, GPU-written since its last copy back (linear_wrote) */
     View *views;
     int nviews, capviews;
     struct Image *next;
 } Image;
 static void image_touch(Image *im);
+
+/* Pitch-linear textures are memory the CPU may read as it is (on the console, one memory): what the GPU writes
+ * into one is copied back to guest memory at the end of the submission (flush), before its syncs signal. Violet's
+ * screen capture (profile photo, player icon) renders into a linear RGBA8 texture and BC1-encodes it on the CPU;
+ * without this it read zeros and saved a black picture. */
+#define WB_MAX 64
+static Image *wb_list[WB_MAX];
+static void linear_wrote(Image *im) {
+    if (!im || im->wb_pending || !(im->info.flags & TEX_FLAG_LINEAR)) return;
+    if (nwb == WB_MAX) { hlog(0, "gpu: more than %d linear textures written in one submission", WB_MAX); return; }
+    im->wb_pending = true;
+    wb_list[nwb++] = im;
+}
 #define IMAGE_BUCKETS 4096
 static Image *buckets[IMAGE_BUCKETS];
 static int nimages;
@@ -717,6 +734,9 @@ static void byaddr_remove(Image *im) {
 
 static void image_destroy(Image *im) {
     image_epoch++;
+    if (im->wb_pending)
+        for (int i = 0; i < nwb; i++)
+            if (wb_list[i] == im) { wb_list[i] = wb_list[--nwb]; break; }
     byaddr_remove(im);
     for (int i = 0; i < im->nviews; i++) bury(DEAD_VIEW, im->views[i].view, NULL);
     free(im->views);
@@ -1472,6 +1492,7 @@ static bool begin_rendering(void) {
         im->valid = true;
         im->rt_frame = frame_no + 1;
         im->gpu_written = true;
+        linear_wrote(im);
         any = true;
     }
     bool has_d = false, has_s = false;
@@ -1615,6 +1636,7 @@ static void do_clear_texture(const CmdClearTexture *p) {
     }
     im->valid = true;
     im->gpu_written = true;
+    linear_wrote(im);
     barrier();
 }
 
@@ -1651,6 +1673,7 @@ static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
     vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     im->valid = true;
     im->gpu_written = true;
+    linear_wrote(im);
     barrier();
 }
 
@@ -1671,6 +1694,50 @@ static void do_copy_texture_to_buffer(const CmdCopyBT *p) {
         r.bufferOffset = moff;
         vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, mbuf, 1, &r);
     }
+    barrier();
+}
+
+/* copy the linear textures the GPU wrote in this submission back into guest memory (see linear_wrote) */
+static void linear_writeback(void) {
+    end_rendering();
+    barrier();
+    for (int i = 0; i < nwb; i++) {
+        Image *im = wb_list[i];
+        im->wb_pending = false;
+        TexLayout L;
+        tex_layout(&im->info, &L);
+        VkBuffer buf, mbuf;
+        u64 off, moff;
+        static int skipped, logged;
+        if (!L.bpb || format_is_astc(im->info.format) || vk_format(im->info.format) != im->format ||
+            im->info.samples > 1 ||
+            !gpu_cpu(im->info.addr, L.layer_size * L.layers) || !gpu_buffer(im->info.addr, &buf, &off)) {
+            if (skipped++ < 8)
+                hlog(0, "gpu: linear %ux%u f%u at %llx written by the GPU: not copied back (format or memory)",
+                     im->info.width, im->info.height, im->info.format, im->info.addr);
+            continue;
+        }
+        mbuf = mirror_at(im->info.addr, &moff);
+        if (logged++ < 16)
+            hlog(1, "gpu: frame %llu: linear %ux%u f%u at %llx (row %llu) copied back to guest memory", frame_no + 1,
+                 im->info.width, im->info.height, im->info.format, im->info.addr, L.level[0].row_pitch);
+        u32 levels = im->levels < L.levels ? im->levels : L.levels;
+        for (u32 layer = 0; layer < L.layers && layer < im->layers; layer++)
+            for (u32 l = 0; l < levels; l++) {
+                const TexLevel *lv = &L.level[l];
+                if (lv->row_pitch % L.bpb) continue;
+                u32 w = im->info.width >> l, h = tex_height(&im->info) >> l, d = tex_depth(&im->info) >> l;
+                u64 at = (u64)layer * L.layer_size + lv->offset;
+                VkBufferImageCopy r = {off + at, (u32)(lv->row_pitch / L.bpb * L.bw), lv->h * L.bh,
+                                       {copy_aspect(im), l, layer, 1}, {0, 0, 0}, {w ? w : 1, h ? h : 1, d ? d : 1}};
+                vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+                if (mbuf) {
+                    r.bufferOffset = moff + at;
+                    vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, mbuf, 1, &r);
+                }
+            }
+    }
+    nwb = 0;
     barrier();
 }
 
@@ -1847,6 +1914,7 @@ static void do_copy_texture_to_texture(const CmdCopyTT *p) {
                 return;
             d->valid = true;
             d->gpu_written = true;
+            linear_wrote(d);
             barrier();
             return;
         }
@@ -1855,6 +1923,7 @@ static void do_copy_texture_to_texture(const CmdCopyTT *p) {
     }
     d->valid = true;
     d->gpu_written = true;
+    linear_wrote(d);
     barrier();
 }
 
@@ -1882,6 +1951,7 @@ static void do_downsample(const CmdDownsample *p) {
                 return;
             d->valid = true;
             d->gpu_written = true;
+            linear_wrote(d);
             barrier();
             return;
         }
@@ -1892,6 +1962,7 @@ static void do_downsample(const CmdDownsample *p) {
     }
     d->valid = true;
     d->gpu_written = true;
+    linear_wrote(d);
     barrier();
 }
 
@@ -2439,7 +2510,7 @@ static void descset_use(DescSet *d, const u64 *tex, u32 n) {
             Image *im = d->img[id];
             if (!im) continue;
             image_touch(im);
-            if (d->kind == DS_IMG) im->gpu_written = true;      /* shaders may store into it */
+            if (d->kind == DS_IMG) { im->gpu_written = true; linear_wrote(im); }      /* shaders may store into it */
         }
         if (d->epoch == image_epoch) break;    /* else resolving destroyed an image (a container took it over) */
     }
@@ -4829,6 +4900,7 @@ void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *
         vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &reg);
         im->valid = true;
         im->gpu_written = true;         /* guest memory does not hold these texels */
+        linear_wrote(im);
         barrier();
         static int logged;
         if (logged++ < 8) {
