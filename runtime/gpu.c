@@ -587,7 +587,9 @@ static bool gpu_buffer_ro(u64 addr, u64 size, VkBuffer *buf, u64 *off) {
 
 void gpu_pool_created(Pool *p) {
     if (!gpu_ready) return;
-    EnterCriticalSection(&gpu_cs);
+    /* the import first, outside gpu_cs: the driver pins the memory page by page (milliseconds for big pools), and
+     * the render thread, which needs gpu_cs to submit or fence, held core 0 waiting for it, and main with it (the
+     * periodic 20-100 ms frames while areas stream in). It touches nothing but this pool's own objects */
     HostBuffer *hb = NULL;
     if (p->storage && !(p->flags & (POOL_VIRTUAL | POOL_GPU_NO_ACCESS))) {
         hb = calloc(1, sizeof *hb);
@@ -597,6 +599,7 @@ void gpu_pool_created(Pool *p) {
             hb = NULL;
         }
     }
+    EnterCriticalSection(&gpu_cs);
     p->hb = hb;
     Mirror *mir = NULL;
     if (hb && env.pool_mirror && p->size >= MIRROR_MIN && p->flags & POOL_GPU_CACHED && !(p->flags & POOL_CPU_NO_ACCESS) &&
@@ -2671,7 +2674,15 @@ typedef struct PipeKey {
     u32 compute, pad;                   /* pad (0): no padding bytes in the key (memcmp, hashing, the file) */
 } PipeKey;
 enum { P_LISTED, P_BUILDING, P_READY };   /* recorded, not built / being built / built (pipe NULL: failed) */
-typedef struct Pipe { PipeKey key; VkPipeline pipe; volatile LONG state; bool listed; struct Pipe *next; } Pipe;
+typedef struct Pipe {
+    PipeKey key;
+    VkPipeline pipe;
+    volatile LONG state;
+    bool listed;
+    bool no_async;                      /* a worker could not build it from disk: the render thread does */
+    struct Pipe *next;
+    struct Pipe *qnext;                 /* in the async queue */
+} Pipe;
 #define PIPE_BUCKETS 1024
 static Pipe *pipes[PIPE_BUCKETS];       /* under pipes_lock */
 static SRWLOCK pipes_lock = SRWLOCK_INIT;
@@ -2980,12 +2991,70 @@ static VkPipeline pipeline_build(const PipeKey *k, VkShaderModule vs, VkShaderMo
     return pipe;
 }
 
-/* the render thread's pipeline for k, from modules it has loaded */
-static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModule fs) {
+static VkShaderModule spv_module(u64 hash, u32 mask);
+
+/* With NX_ASYNC_SHADERS, a graphics pipeline first needed during play is built by a worker (from the SPIR-V on
+ * disk, as the prebuild does) and its draws are skipped until it is ready, as for shaders being translated: the
+ * render thread compiled it in the draw before, ~100 ms a pipeline on amdvlk (hitches of 0.1-1 s). Draws also skip
+ * a pipeline the prebuild is still building. Compute pipelines are still built in the dispatch (skipping one would
+ * leave later draws without its results). */
+#define ASYNC_PIPE_THREADS 2
+static Pipe *async_head, *async_tail;
+static SRWLOCK async_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE async_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG async_built, async_failed;
+
+static unsigned __stdcall async_pipe_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        AcquireSRWLockExclusive(&async_lock);
+        while (!async_head) SleepConditionVariableSRW(&async_cv, &async_lock, INFINITE, 0);
+        Pipe *p = async_head;
+        async_head = p->qnext;
+        if (!async_head) async_tail = NULL;
+        ReleaseSRWLockExclusive(&async_lock);
+        const PipeKey *k = &p->key;
+        VkShaderModule vs = spv_module(k->vs, k->vs_mask), fs = k->fs ? spv_module(k->fs, 0) : NULL;
+        if (vs && (!k->fs || fs)) {
+            p->pipe = pipeline_build(k, vs, fs);
+            InterlockedIncrement(&async_built);
+            InterlockedExchange(&p->state, P_READY);
+        } else {                                /* not on disk: back to the render thread */
+            p->no_async = true;
+            InterlockedIncrement(&async_failed);
+            InterlockedExchange(&p->state, P_LISTED);
+        }
+        if (vs) vkDestroyShaderModule(vk.dev, vs, NULL);
+        if (fs) vkDestroyShaderModule(vk.dev, fs, NULL);
+    }
+}
+
+static void async_pipe_queue(Pipe *p) {
+    static bool started;
+    if (!started) {
+        started = true;
+        for (int i = 0; i < ASYNC_PIPE_THREADS; i++) {
+            HANDLE t = (HANDLE)_beginthreadex(NULL, 0, async_pipe_thread, NULL, 0, NULL);
+            if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); }
+        }
+    }
+    AcquireSRWLockExclusive(&async_lock);
+    p->qnext = NULL;
+    if (async_tail) async_tail->qnext = p; else async_head = p;
+    async_tail = p;
+    ReleaseSRWLockExclusive(&async_lock);
+    WakeConditionVariable(&async_cv);
+}
+
+/* the render thread's pipeline for k, from modules it has loaded. async (graphics draws with NX_ASYNC_SHADERS): NULL
+ * with *pending set while a worker builds it */
+static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModule fs, bool async, bool *pending) {
     bool claimed;
+    *pending = false;
     Pipe *p = pipe_claim(k, P_BUILDING, &claimed);
     if (!claimed) {
         if (p->state == P_READY) return p->pipe;
+        if (async) { *pending = true; return NULL; }
         double t0 = ms_now();                   /* a worker is building it */
         while (p->state != P_READY) Sleep(1);
         hf.pipe += ms_now() - t0;
@@ -3008,6 +3077,17 @@ static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModu
              !k->depth || dp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "" : "(not renderable)",
              k->stencil, k->samples, k->logic_op);
     } else if (env.pipe_log) hlog(0, "gpu: compute pipeline: cs %016llx", k->vs);
+    if (async && !p->no_async) {
+        if (pipe_list && !p->listed) {          /* only the render thread writes the list */
+            fwrite(k, sizeof *k, 1, pipe_list);
+            fflush(pipe_list);
+            p->listed = true;
+        }
+        if (++npipes % 100 == 0) hlog(1, "gpu: %u pipelines (%ld built by workers during play)", npipes, async_built);
+        async_pipe_queue(p);
+        *pending = true;
+        return NULL;
+    }
     double t0 = ms_now();
     VkPipeline pipe = pipeline_build(k, vs, fs);
     hf.pipe += ms_now() - t0;
@@ -3839,8 +3919,9 @@ static void draw_one(u32 op, const void *payload) {
     k.minus_one = depth_mode == 0;
     if (!vk.dyn_logic_op) k.logic_op = st.color.logic_op & 15;
     if (fs && st.color.alpha_test >= 1 && st.color.alpha_test <= 7) k.alpha_func = st.color.alpha_test;
-    VkPipeline pipe = pipeline_get(&k, vs, fs);
-    if (!pipe) { skip_draw("pipeline creation failed"); return; }
+    bool pending;
+    VkPipeline pipe = pipeline_get(&k, vs, fs, env.async_shaders, &pending);
+    if (!pipe) { skip_draw(pending ? "pipeline being built (NX_ASYNC_SHADERS)" : "pipeline creation failed"); return; }
     if (trace_frame()) {
         const CmdDraw *d = payload;
         static char tb[8192];
@@ -4077,7 +4158,8 @@ static void dispatch(u32 op, const u8 *pay) {
     memset(&k, 0, sizeof k);
     k.vs = cs->hash;
     k.compute = 1;
-    VkPipeline cpipe = pipeline_get(&k, m, NULL);
+    bool pending;
+    VkPipeline cpipe = pipeline_get(&k, m, NULL, false, &pending);
     if (!cpipe) return;
     DescSet *ts = descset_get(&st.texpool, DS_TEX), *ss = descset_get(&st.smppool, DS_SMP);
     descset_sync(ts);
@@ -5027,6 +5109,23 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
              frames, frame, hf.submit, hf.present, hf.wait, frame - hf.submit - hf.present - hf.wait, hf.shader,
              hf.nshader, hf.jit, hf.njit, hf.pipe, hf.npipe, hf.image, hf.nimage, hf.upload, hf.nupload, hf.slot,
              hf.mirror);
+    if (env.hitch_ms > 0) {
+        /* which guest threads ran (or waited for a core) in a slow frame */
+        char busy[512];
+        bool slow = frame > env.hitch_ms;
+        kernel_frame_threads(slow, busy, sizeof busy);
+        if (slow) hlog(0, "gpu:   threads this frame: %s", busy);
+    }
+    /* the profile's slow-frame samples: not the frames around a 600-frame report (it runs on this thread) */
+    profile_frame_end(env.hitch_ms > 0 && frame > env.hitch_ms && frames % 600 > 1);
+    if (env.hitch_ms > 0) {
+        /* with NX_PROFILE=<thread>: that thread's waits in this frame (the longest names where it blocked) */
+        double blocked, longest;
+        int waits;
+        char where[1024];
+        if (waitprof_frame(&blocked, &waits, &longest, where, sizeof where) && frame > env.hitch_ms)
+            hlog(0, "gpu:   profiled thread: blocked %.1f ms in %d waits, longest %.1f ms: %s", blocked, waits, longest, where);
+    }
     memset(&hf, 0, sizeof hf);
     last_end = t_end;
     LeaveCriticalSection(&gpu_cs);

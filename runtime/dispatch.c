@@ -411,14 +411,26 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     fatal("crashed");
 }
 
-/* NX_PROFILE=<thread name, e.g. "thread 5c">: samples that thread about every millisecond and reports, with the CPU
- * statistics every 600 frames, where its time went: lifted guest code, our runtime or other modules (the driver),
- * the hottest functions, and for time outside our code the runtime function that called out */
+/* NX_PROFILE=<thread name>[,<thread name>...] (e.g. "main,thread 5a,thread 5b"; up to 4): samples those threads
+ * about every millisecond and reports, with the CPU statistics every 600 frames, where their time went: lifted guest
+ * code, our runtime or other modules (the driver), the hottest functions, and for time outside our code the runtime
+ * function that called out. With NX_HITCH_MS, the samples taken during slow frames (profile_frame_end) are also
+ * kept apart and reported per thread: what the game ran in the frames that dipped. */
 #define PROF_MAX 262144
-static HANDLE prof_thread;
+#define PROF_THREADS 4
+static HANDLE prof_threads[PROF_THREADS];
+static char prof_names[PROF_THREADS][32];
+static volatile long nprof;
+static HANDLE prof_thread;              /* the first one; set once prof_loop runs */
 static u64 prof_top[PROF_MAX], prof_rt[PROF_MAX];
+static u8 prof_who[PROF_MAX];
 static volatile long prof_n;
 static u64 exe_lo, exe_hi;
+/* samples of slow frames, by thread (profile_frame_end) */
+#define PROF_SLOW_MAX (PROF_MAX / 4)
+static u64 slow_top[PROF_SLOW_MAX], slow_rt[PROF_SLOW_MAX];
+static u8 slow_who[PROF_SLOW_MAX];
+static long nslow, slow_frames, frame_start;
 
 static unsigned __stdcall prof_loop(void *p) {
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -427,39 +439,68 @@ static unsigned __stdcall prof_loop(void *p) {
     SetWaitableTimer(timer, &due, 1, NULL, NULL, FALSE);
     for (;;) {
         WaitForSingleObject(timer, INFINITE);
-        CONTEXT ctx = {0};
-        ctx.ContextFlags = CONTEXT_FULL;
-        if (SuspendThread(prof_thread) == (DWORD)-1) continue;
-        if (GetThreadContext(prof_thread, &ctx) && prof_n < PROF_MAX) {
-            u64 top = ctx.Rip, rt = 0;
-            for (int i = 0; i < 24 && ctx.Rip; i++) {
-                if (ctx.Rip >= exe_lo && ctx.Rip < exe_hi && !(ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi)) { rt = ctx.Rip; break; }
-                if (ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi) break;     /* in lifted code: no runtime caller */
-                DWORD64 base = 0;
-                RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-                if (!rf) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
-                void *hd = NULL;
-                DWORD64 frame = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &frame, NULL);
+        for (long k = 0; k < nprof; k++) {
+            CONTEXT ctx = {0};
+            ctx.ContextFlags = CONTEXT_FULL;
+            HANDLE th = prof_threads[k];
+            if (SuspendThread(th) == (DWORD)-1) continue;
+            if (GetThreadContext(th, &ctx) && prof_n < PROF_MAX) {
+                u64 top = ctx.Rip, rt = 0;
+                for (int i = 0; i < 24 && ctx.Rip; i++) {
+                    if (ctx.Rip >= exe_lo && ctx.Rip < exe_hi && !(ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi)) { rt = ctx.Rip; break; }
+                    if (ctx.Rip >= lifted_lo && ctx.Rip < lifted_hi) break;     /* in lifted code: no runtime caller */
+                    DWORD64 base = 0;
+                    RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                    if (!rf) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
+                    void *hd = NULL;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &frame, NULL);
+                }
+                long i = prof_n;
+                prof_top[i] = top;
+                prof_rt[i] = rt;
+                prof_who[i] = (u8)k;
+                prof_n = i + 1;
             }
-            long i = prof_n;
-            prof_top[i] = top;
-            prof_rt[i] = rt;
-            prof_n = i + 1;
+            ResumeThread(th);
         }
-        ResumeThread(prof_thread);
     }
     return 0;
 }
 
-void profile_start(void *host) {
-    if (prof_thread || !host) return;
-    MODULEINFO mi;
-    GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(NULL), &mi, sizeof mi);
-    exe_lo = (u64)(uintptr_t)mi.lpBaseOfDll;
-    exe_hi = exe_lo + mi.SizeOfImage;
-    DuplicateHandle(GetCurrentProcess(), (HANDLE)host, GetCurrentProcess(), &prof_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    _beginthreadex(NULL, 0, prof_loop, NULL, 0, NULL);
+void profile_start(void *host, const char *name) {
+    if (!host || nprof >= PROF_THREADS) return;
+    for (long k = 0; k < nprof; k++)
+        if (!strcmp(prof_names[k], name)) return;
+    if (!prof_thread) {
+        MODULEINFO mi;
+        GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(NULL), &mi, sizeof mi);
+        exe_lo = (u64)(uintptr_t)mi.lpBaseOfDll;
+        exe_hi = exe_lo + mi.SizeOfImage;
+    }
+    long k = nprof;
+    snprintf(prof_names[k], sizeof prof_names[k], "%s", name);
+    DuplicateHandle(GetCurrentProcess(), (HANDLE)host, GetCurrentProcess(), &prof_threads[k], 0, FALSE, DUPLICATE_SAME_ACCESS);
+    nprof = k + 1;
+    if (!prof_thread) {
+        prof_thread = prof_threads[0];
+        _beginthreadex(NULL, 0, prof_loop, NULL, 0, NULL);
+    }
+}
+
+/* the end of a presented frame (gpu.c, on the render thread, as profile_report): a slow frame's samples are kept */
+void profile_frame_end(bool slow) {
+    long end = prof_n;
+    if (!prof_thread) return;
+    if (slow) {
+        slow_frames++;
+        for (long i = frame_start; i < end && nslow < PROF_SLOW_MAX; i++) {
+            slow_top[nslow] = prof_top[i];
+            slow_rt[nslow] = prof_rt[i];
+            slow_who[nslow++] = prof_who[i];
+        }
+    }
+    frame_start = end;
 }
 
 typedef struct { char name[96]; long n; } ProfEnt;
@@ -590,7 +631,30 @@ void profile_report(void) {
     prof_table("runtime function calling outside code (driver, CRT, OS)", prof_rt, n, 15, 0);
     prof_table("runtime call sites, outside code only (function:line)", prof_rt, n, 25, 1);
     prof_table("runtime lines, innermost (function:line)", prof_top, n, 40, 2);
+    if (nslow) {
+        static u64 one[PROF_SLOW_MAX], one_rt[PROF_SLOW_MAX];
+        for (long k = 0; k < nprof; k++) {
+            long m = 0, lifted_s = 0, other_s = 0;
+            for (long i = 0; i < nslow; i++)
+                if (slow_who[i] == k) {
+                    u64 r = slow_top[i];
+                    one_rt[m] = slow_rt[i];
+                    one[m++] = r;
+                    if (r >= lifted_lo && r < lifted_hi) lifted_s++;
+                    else if (r < exe_lo || r >= exe_hi) other_s++;
+                }
+            if (m < 20) continue;
+            char title[200];
+            snprintf(title, sizeof title, "slow frames (%ld): %s, %ld samples (lifted %.0f%%, outside the exe %.0f%%), "
+                     "innermost function", slow_frames, prof_names[k], m, 100.0 * lifted_s / m, 100.0 * other_s / m);
+            prof_table(title, one, m, 25, 0);
+            snprintf(title, sizeof title, "slow frames: %s, runtime function calling outside code", prof_names[k]);
+            prof_table(title, one_rt, m, 12, 0);
+        }
+    }
+    nslow = slow_frames = 0;
     prof_n = 0;
+    frame_start = 0;
 }
 
 /* a host thread's whole native stack (suspends it, unwinds with the x64 unwind tables): where a thread blocked in

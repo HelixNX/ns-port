@@ -127,6 +127,7 @@ typedef struct KThread {
     u64 ready_seq;
     u64 acq[4];                         /* core_acquire: placed at once, by preempting, after 1 ms retries, after a release */
     u64 ready_qpc, sleep_qpc, sleeps;   /* time waiting for a core and asleep (SleepThread), for the CPU report */
+    u64 hold_qpc, hold_since;           /* time holding a core (kernel_frame_threads), since when (under klock) */
     u32 handle;                     /* the handle the creator got (used as the mutex tag by the SDK) */
     void *host;                     /* Windows thread handle */
     u32 host_id;
@@ -149,7 +150,9 @@ extern __declspec(thread) KThread *cur_thread;
 void kernel_init(void);
 void kernel_dump_threads(void);
 void kernel_report_cpu(u64 frames);                    /* fps and busy threads */
-void profile_start(void *host);                         /* dispatch.c: NX_PROFILE */
+void profile_start(void *host, const char *name);       /* dispatch.c: NX_PROFILE */
+void kernel_frame_threads(bool report, char *out, size_t n);   /* kernel.c: CPU time per thread this frame */
+void profile_frame_end(bool slow);                      /* gpu.c: a presented frame ended (slow: over NX_HITCH_MS) */
 void profile_report(void);
 void dump_mem_env(void);                               /* main.c: NX_DUMP_MEM */
 void klock(void);
@@ -163,7 +166,8 @@ void thread_sleep(s64 ns);
 void thread_set_core(KThread *t, s32 core, u64 mask);
 void core_leave(void);                              /* around host work that is a wait on the console (IPC) */
 void core_enter(void);
-void kernel_svc_exit(void);                         /* end of every SVC: give the core up if asked to */
+void kernel_svc_exit(void);
+bool waitprof_frame(double *blocked_ms, int *waits, double *longest_ms, char *where, size_t wn);   /* NX_PROFILE, per frame */                         /* end of every SVC: give the core up if asked to */
 extern u64 lifted_lo, lifted_hi;                    /* host code range of lifted code and a64rt (dispatch.c) */
 u32 arbitrate_lock(u32 owner, u64 addr, u32 tag);
 u32 arbitrate_unlock(u64 addr);

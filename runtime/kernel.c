@@ -173,9 +173,13 @@ static KThread *core_owner[NCORES];        /* under klock */
 static u64 ready_seq;
 u64 lifted_lo, lifted_hi;
 
+static u64 qpc_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (u64)q.QuadPart; }
+static void hold_end(KThread *t) { if (t->hold_since) t->hold_qpc += qpc_now() - t->hold_since; t->hold_since = 0; }
+
 static void core_assign(KThread *t, int c) {
     core_owner[c] = t;
     t->cur_core = c;
+    t->hold_since = qpc_now();
     t->ready = false;
     if (t->preempted) {
         t->preempted = false;
@@ -207,6 +211,7 @@ static void core_release(KThread *t) {
     if (c < 0) return;
     t->cur_core = -1;
     t->preempt_req = false;
+    hold_end(t);
     core_owner[c] = NULL;
     KThread *n = next_for_core(c);
     if (n) core_assign(n, c);
@@ -246,6 +251,7 @@ static int core_try_place(KThread *t) {
         return -1;
     }
     o->preempted = true;
+    hold_end(o);
     core_owner[v] = NULL;
     core_assign(t, v);
     return 1;
@@ -335,6 +341,11 @@ typedef struct { int kind; u64 chain[WAITPROF_CHAIN]; double ms, wake_us, core_u
 static WaitProf waitprof[512];
 static int nwaitprof;
 
+/* the profiled thread's waits that ended in the current frame (gpu.c's slow-frame lines, waitprof_frame) */
+static double wf_blocked_ms, wf_long_ms;
+static u64 wf_long_chain[WAITPROF_CHAIN];
+static int wf_long_kind, wf_n;
+
 static void waitprof_add(const KThread *t, int kind, double ms, double wake_us, double core_us) {
     WaitProf w = {kind};
     bool woken = wake_us >= 0;
@@ -346,6 +357,9 @@ static void waitprof_add(const KThread *t, int kind, double ms, double wake_us, 
         w.chain[i] = *(const u64 *)(uintptr_t)(fp + 8);
         fp = *(const u64 *)(uintptr_t)fp;
     }
+    wf_blocked_ms += ms;
+    wf_n++;
+    if (ms > wf_long_ms) { wf_long_ms = ms; wf_long_kind = kind; memcpy(wf_long_chain, w.chain, sizeof w.chain); }
     for (int i = 0; i < nwaitprof; i++)
         if (waitprof[i].kind == w.kind && !memcmp(waitprof[i].chain, w.chain, sizeof w.chain)) {
             waitprof[i].ms += ms;
@@ -359,6 +373,29 @@ static void waitprof_add(const KThread *t, int kind, double ms, double wake_us, 
         if (woken) { w.wake_us = wake_us; w.core_us = core_us; w.nwoken = 1; }
         waitprof[nwaitprof++] = w;
     }
+}
+
+/* NX_PROFILE's thread this frame: blocked time, waits, the longest one (where: its guest call chain, written as
+ * module+offset); then starts the next frame. false without NX_PROFILE */
+bool waitprof_frame(double *blocked_ms, int *waits, double *longest_ms, char *where, size_t wn) {
+    if (!waitprof_thread) return false;
+    klock();
+    *blocked_ms = wf_blocked_ms;
+    *waits = wf_n;
+    *longest_ms = wf_long_ms;
+    int n = 0;
+    where[0] = 0;
+    static const char *kinds[] = {"none", "sync", "mutex", "condvar", "arbiter", "sleep"};
+    if (wf_n) n += snprintf(where, wn, "%s", kinds[wf_long_kind >= 0 && wf_long_kind < 6 ? wf_long_kind : 0]);
+    for (int i = 0; i < WAITPROF_CHAIN && wf_long_chain[i] && n < (int)wn - 1; i++) {
+        char b[160];
+        n += snprintf(where + n, wn - n, " < %s", describe_addr(wf_long_chain[i], b, sizeof b));
+    }
+    wf_blocked_ms = wf_long_ms = 0;
+    wf_n = 0;
+    memset(wf_long_chain, 0, sizeof wf_long_chain);
+    kunlock();
+    return true;
 }
 
 static int waitprof_cmp(const void *a, const void *b) {
@@ -745,6 +782,8 @@ void thread_exit(void) {
     for (;;) {}
 }
 
+#define SLEEP_SPIN_NS 250000                    /* thread_sleep spins the last 0.25 ms */
+
 void thread_sleep(s64 ns) {
     KThread *t = cur_thread;
     if (ns <= 0) {                                     /* 0, -1, -2: the yield variants, to equal priorities */
@@ -762,15 +801,22 @@ void thread_sleep(s64 ns) {
     t->wait = W_SLEEP;
     core_release(t);
     kunlock();
+    /* the high-resolution timer to SLEEP_SPIN_NS before the deadline, then spin to it: the timer alone wakes late
+     * by a fraction of a millisecond, varying (frame pacing sleeps here once a frame). The core is released, so
+     * the spin costs host time only */
     static __declspec(thread) HANDLE timer;
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER due;
-    due.QuadPart = -(ns + 99) / 100;
-    LARGE_INTEGER q0, q1;
+    LARGE_INTEGER q0, q1, f;
     QueryPerformanceCounter(&q0);
-    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
-    else Sleep((DWORD)((ns + 999999) / 1000000));
-    QueryPerformanceCounter(&q1);
+    QueryPerformanceFrequency(&f);
+    u64 deadline = (u64)q0.QuadPart + (u64)((double)ns * (double)f.QuadPart / 1e9);
+    if (ns > SLEEP_SPIN_NS) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(ns - SLEEP_SPIN_NS) / 100;
+        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
+        else Sleep((DWORD)((ns - SLEEP_SPIN_NS) / 1000000));
+    }
+    do { _mm_pause(); QueryPerformanceCounter(&q1); } while ((u64)q1.QuadPart < deadline);
     t->sleep_qpc += q1.QuadPart - q0.QuadPart;
     t->sleeps++;
     klock();
@@ -804,6 +850,54 @@ void event_clear(KEvent *e) {
 /* every guest thread: what it waits for, and its backtrace as of its last call or SVC */
 /* every 600 frames: frames per second, and the share of one host core each busy guest thread used since the last
  * report (a thread near 100% is what holds the frame rate) */
+/* every presented frame (gpu.c, with NX_HITCH_MS): how long each guest thread held its emulated core and waited for
+ * one since the last call (exact, from the scheduler; Windows' CPU times come in 15.6 ms steps); for a slow frame
+ * (report), the threads that held or waited most, as "name held core 0 12.3 ms (core wait 1.0), ..." (core: the
+ * thread's ideal core) */
+void kernel_frame_threads(bool report, char *out, size_t n) {
+    static struct { KThread *t; u64 cpu, ready, hold; } last[128];
+    static int nlast;
+    struct { const char *name; double cpu, ready, hold; int core; } top[128];
+    int ntop = 0;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    klock();
+    u64 now = qpc_now();
+    for (KThread *t = threads; t; t = t->next)          /* holders so far: count up to now */
+        if (t->hold_since) { t->hold_qpc += now - t->hold_since; t->hold_since = now; }
+    for (KThread *t = threads; t; t = t->next) {
+        FILETIME c0, e0, k, u;
+        if (!t->host || !GetThreadTimes(t->host, &c0, &e0, &k, &u)) continue;
+        u64 cpu = ((u64)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((u64)u.dwHighDateTime << 32 | u.dwLowDateTime);
+        int i = 0;
+        while (i < nlast && last[i].t != t) i++;
+        if (i == nlast) {
+            if (nlast == 128) continue;
+            last[nlast++] = (typeof(last[0])){t, cpu, t->ready_qpc, t->hold_qpc};
+            continue;
+        }
+        double ms = (double)(cpu - last[i].cpu) / 1e4, ready = (double)(t->ready_qpc - last[i].ready) * 1000.0 / (double)f.QuadPart;
+        double hold = (double)(t->hold_qpc - last[i].hold) * 1000.0 / (double)f.QuadPart;
+        last[i].cpu = cpu;
+        last[i].ready = t->ready_qpc;
+        last[i].hold = t->hold_qpc;
+        if (report && (hold >= 1 || ready >= 1)) top[ntop++] = (typeof(top[0])){t->name, ms, ready, hold, t->core};
+    }
+    kunlock();
+    if (!report) return;
+    int o = 0;
+    out[0] = 0;
+    for (int shown = 0; shown < 8 && ntop; shown++) {
+        int b = 0;
+        for (int i = 1; i < ntop; i++)
+            if (top[i].hold + top[i].ready > top[b].hold + top[b].ready) b = i;
+        if (o < (int)n)
+            o += snprintf(out + o, n - o, "%s%s held core %d %.1f ms", shown ? ", " : "", top[b].name, top[b].core, top[b].hold);
+        if (top[b].ready >= 0.5 && o < (int)n) o += snprintf(out + o, n - o, " (core wait %.1f)", top[b].ready);
+        top[b] = top[--ntop];
+    }
+}
+
 void kernel_report_cpu(u64 frames) {
     static LARGE_INTEGER last_t;
     static u64 last_frames;
@@ -843,9 +937,18 @@ void kernel_report_cpu(u64 frames) {
             }
         }
     }
-    const char *pn = getenv("NX_PROFILE");                /* NX_PROFILE: dispatch.c */
-    for (KThread *t = threads; pn && t; t = t->next)
-        if (!strcmp(t->name, pn) && t->host) { profile_start(t->host); waitprof_thread = t; }
+    /* NX_PROFILE (dispatch.c): a comma-separated list of thread names; the first one's waits are also profiled */
+    static char pn[256];
+    static bool pn_read;
+    if (!pn_read) { const char *e = getenv("NX_PROFILE"); if (e) snprintf(pn, sizeof pn, ",%s,", e); pn_read = true; }
+    for (KThread *t = threads; pn[0] && t; t = t->next) {
+        char key[48];
+        snprintf(key, sizeof key, ",%s,", t->name);
+        const char *at = t->host ? strstr(pn, key) : NULL;
+        if (!at) continue;
+        profile_start(t->host, t->name);
+        if (at == pn) waitprof_thread = t;
+    }
     waitprof_report(wall);                              /* its table is written under klock */
     ReleaseSRWLockShared(&klk);
     profile_report();

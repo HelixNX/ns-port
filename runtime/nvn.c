@@ -14,6 +14,7 @@
  * level 2 so that a wrong guess shows. */
 #include "nvn.h"
 #include "framerate.h"
+#include "game_config.h"
 #include "vk.h"
 #include <stdlib.h>
 #include <windows.h>
@@ -317,7 +318,9 @@ static void sync_finalize(Ctx *c) { obj_free(A(0)); }
 static void queue_fence_sync(Ctx *c) {
     Sync *s = obj_get(A(1), T_SYNC);
     if (!s) return;
+    core_leave();                               /* gpu_fence flushes under gpu_cs: as queue_submit */
     s->value = gpu_fence(A(0));
+    core_enter();
     s->fenced = true;
 }
 /* nvnSyncWait(sync, u64 timeout_ns): ALREADY_SIGNALED 0, CONDITION_SATISFIED 1, TIMEOUT_EXPIRED 2, FAILED 3 */
@@ -1487,14 +1490,15 @@ static void queue_acquire(Ctx *c) {
     w->next = (w->next + 1) % w->count;
     RET(0);
 }
-/* frame rate (framerate.h): NX_FRAMERATE=<fps>, 0 uncapped (as NX_NOPACE=1), unset the game's own */
+/* frame rate (framerate.h): NX_FRAMERATE=<fps>, 0 uncapped (as NX_NOPACE=1); unset, game.json's "framerate"
+ * (NX_DEFAULT_FRAMERATE), else the game's own */
 static volatile LONG framerate = -2;    /* -2 not read yet */
 static double frame_ns_smooth;          /* measured frame time, smoothed */
 
 s32 nx_framerate(void) {
     if (framerate == -2) {
         const char *e = getenv("NX_FRAMERATE");
-        LONG r = e ? atoi(e) : getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE")) ? FRAMERATE_UNCAPPED : FRAMERATE_GAME;
+        LONG r = e ? atoi(e) : getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE")) ? FRAMERATE_UNCAPPED : NX_DEFAULT_FRAMERATE;
         InterlockedCompareExchange(&framerate, r, -2);
         vk_set_unthrottled(framerate == FRAMERATE_UNCAPPED || framerate > 60);
     }
