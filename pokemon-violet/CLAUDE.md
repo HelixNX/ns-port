@@ -186,6 +186,8 @@ a second backend next to the room. Not started: needs the adapter.
      converts it with I2F.U32, so taken as clamped at 0; Eden drops the fraction).
   9. FMUL.RZ -> `fmul_rz` (fma error term, one ulp toward 0; overflow to the largest finite), I2F.RZ of 32-bit
      integers keeps the top 24 significant bits (`i2f_rz`). Checked in Python against exact rounding (200k cases).
+  Speed: not measured cleanly (an old / new A/B with bench.ps1 was spoiled by play during the runs; the user felt
+  a small dip, with validation on). User's call: leave it, and profile CPU and GPU again as a whole instead.
   Left:
   8. Not taken yet, measure first (costs speed): no `precise` on FADD / FMUL, so the driver may fuse a multiply
      and an add the console rounds apart (positions shared between passes may differ: z-fighting, EQUAL depth
