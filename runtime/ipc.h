@@ -75,6 +75,7 @@ void out_data(IpcReq *r, const void *p, u32 size);          /* appends, aligned 
 static inline void out_u64(IpcReq *r, u64 v) { out_data(r, &v, 8); }
 static inline void out_u32(IpcReq *r, u32 v) { out_data(r, &v, 4); }
 static inline void out_u8(IpcReq *r, u8 v) { out_data(r, &v, 1); }
+SvcObj *in_object(IpcReq *r, int i);                         /* an object argument (domains), referenced: unref it */
 void out_object(IpcReq *r, SvcObj *o);                      /* a sub-interface: a session, or a domain object */
 void out_copy_handle(IpcReq *r, u32 h);
 void out_move_handle(IpcReq *r, u32 h);

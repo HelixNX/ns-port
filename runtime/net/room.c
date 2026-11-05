@@ -1,7 +1,9 @@
 /* The room client. One ENet host with one peer (the room server). room_join connects and waits for the join answer
- * on the calling thread; then a host thread owns ENet: it services the connection every few ms, hands received LDN
- * and proxy packets to the services' handlers and sends what other threads queued (ENet is not thread-safe, so no
- * other thread touches it).
+ * on the calling thread; then a host thread owns ENet: it hands received LDN and proxy packets to the services'
+ * handlers and sends what other threads queued (ENet is not thread-safe, so no other thread touches it). It sleeps
+ * until the socket has data or a thread queues a packet (send_event), else wakes every few ms for ENet's timers:
+ * a packet the game sends goes out at once (with a plain timeout it waited for the next tick, up to the system
+ * timer's 15.6 ms, on every hop of every exchange).
  * Messages (type byte first; see net.h for the encoding):
  *   JoinRequest   nickname, preferred fake ip (ff ff ff ff: any), network version, password, token ("": anonymous)
  *   SetGameInfo   name, title id, version
@@ -93,6 +95,7 @@ static void (*disconnect_handler)(void);
 typedef struct Queued { struct Queued *next; u32 n; u8 data[]; } Queued;
 static SRWLOCK send_lock = SRWLOCK_INIT;
 static Queued *send_head, *send_tail;
+static HANDLE send_event;                   /* set when a packet is queued: wakes the host thread */
 
 /* messages by type, for the traffic line in the log */
 static volatile long rx_count[32], tx_count[32];
@@ -108,6 +111,7 @@ static void queue_send(Pkt *k) {
     if (send_tail) send_tail->next = q; else send_head = q;
     send_tail = q;
     ReleaseSRWLockExclusive(&send_lock);
+    if (send_event) SetEvent(send_event);
 }
 
 static void flush_sends(void) {
@@ -260,36 +264,45 @@ static void log_traffic(void) {
     long sum = rx_count[ID_PROXY_PACKET] + rx_count[ID_LDN_PACKET] + tx_count[ID_PROXY_PACKET] + tx_count[ID_LDN_PACKET];
     if (sum == last) return;
     last = sum;
-    hlog(1, "room traffic: received %ld proxy, %ld ldn, %ld other; sent %ld proxy, %ld ldn", rx_count[ID_PROXY_PACKET],
-         rx_count[ID_LDN_PACKET], rx_count[ID_ROOM_INFORMATION] + rx_count[ID_STATUS_MESSAGE] + rx_count[ID_CHAT_MESSAGE],
-         tx_count[ID_PROXY_PACKET], tx_count[ID_LDN_PACKET]);
+    hlog(1, "room traffic: received %ld proxy, %ld ldn, %ld other; sent %ld proxy, %ld ldn; round trip to the server %u ms",
+         rx_count[ID_PROXY_PACKET], rx_count[ID_LDN_PACKET],
+         rx_count[ID_ROOM_INFORMATION] + rx_count[ID_STATUS_MESSAGE] + rx_count[ID_CHAT_MESSAGE], tx_count[ID_PROXY_PACKET],
+         tx_count[ID_LDN_PACKET], server ? server->roundTripTime : 0);
 }
 
 static unsigned __stdcall loop(void *arg) {
     (void)arg;
     DWORD last_log = GetTickCount();
+    HANDLE sock_event = WSACreateEvent();
+    WSAEventSelect(host->socket, sock_event, FD_READ);
+    HANDLE waits[2] = {sock_event, send_event};
     while (!stopping) {
         if (GetTickCount() - last_log >= 3000) { last_log = GetTickCount(); log_traffic(); }
+        bool lost = false;
         ENetEvent ev;
-        int got = enet_host_service(host, &ev, 2);
-        if (got > 0 && ev.type == ENET_EVENT_TYPE_RECEIVE) {
-            const char *err = handle_packet(ev.packet->data, ev.packet->dataLength);
-            enet_packet_destroy(ev.packet);
-            if (err) {
-                hlog(0, "room: %s", err);
+        int got;
+        while (!lost && (got = enet_host_service(host, &ev, 0)) > 0) {
+            if (ev.type == ENET_EVENT_TYPE_RECEIVE) {
+                const char *err = handle_packet(ev.packet->data, ev.packet->dataLength);
+                enet_packet_destroy(ev.packet);
+                if (err) {
+                    hlog(0, "room: %s", err);
+                    joined = false;
+                }
+            } else if (ev.type == ENET_EVENT_TYPE_DISCONNECT) {
+                hlog(0, "room: lost the connection to the room server");
+                server = NULL;
                 joined = false;
+                lost = true;
             }
-        } else if (got > 0 && ev.type == ENET_EVENT_TYPE_DISCONNECT) {
-            hlog(0, "room: lost the connection to the room server");
-            server = NULL;
-            joined = false;
-        } else if (got < 0) {
-            Sleep(2);
         }
         bool was = joined;
         flush_sends();
         if (!server || !was) break;
+        WaitForMultipleObjects(2, waits, FALSE, 5);
+        WSAResetEvent(sock_event);
     }
+    WSACloseEvent(sock_event);
     joined = false;
     if (!stopping && disconnect_handler) disconnect_handler();
     return 0;
@@ -377,6 +390,7 @@ bool room_join(const char *hostname, u16 port, const char *nick, const char *pas
     }
     hlog(0, "room: joined \"%s\" at %s:%u as %s, address %u.%u.%u.%u", room_title, hostname, port, nickname,
          fake_ip[0], fake_ip[1], fake_ip[2], fake_ip[3]);
+    if (!send_event) send_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     loop_thread = (HANDLE)_beginthreadex(NULL, 0, loop, NULL, 0, NULL);
     return true;
 }

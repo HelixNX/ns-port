@@ -1,6 +1,7 @@
 /* am: the applet manager, as an application sees it (appletOE -> IApplicationProxy and its controllers).
  * The game runs docked (operation mode console, 1920x1080), always in focus. */
 #include "../ipc.h"
+#include "../swkbd.h"
 #include <stdlib.h>
 #include <windows.h>
 
@@ -189,27 +190,103 @@ static SvcObj *storage_new(const void *data, u64 size) {
 /* ---------------------------------------------------------------------------------------------- library applets
  * No applet runs: each one finishes as soon as it is started, as if the user cancelled it, and hands back an
  * output storage whose first word is 1 (the "cancelled" result of the Mii editor and selectors). The software
- * keyboard (0x11) instead returns Enter and an ASCII name (NX_PLAYER_NAME, else the account's nickname), since games
- * ask again when their name prompt is cancelled. Nothing ever arrives on the interactive channel. */
-typedef struct LibApplet { u32 id, mode; bool started, done; KEvent *state, *popout, *interactive; bool popped; } LibApplet;
+ * keyboard (0x11) asks the user in an input box (swkbd.c) with the game's prompt, and finishes when it closes;
+ * with NX_PLAYER_NAME set (unattended runs) it returns Enter and that text at once. Nothing ever arrives on the
+ * interactive channel.
+ * Keyboard config (the second input storage, libnx's SwkbdConfigCommon): u32 type (1 number pad) at 0, UTF-16
+ * header text at 0x38 (65 chars), sub text at 0xba (129), guide text at 0x1bc (257), u32 max length at 0x3c0. */
+typedef struct LibApplet {
+    u32 id, mode;
+    bool started, done;
+    KEvent *state, *popout, *interactive;
+    bool popped;
+    /* keyboard */
+    int pushes;
+    u32 kbd_type, kbd_max;
+    wchar_t kbd_title[66], kbd_prompt[400];
+    wchar_t kbd_text[501];
+    bool kbd_ok;
+    volatile LONG kbd_open;                 /* the input box is up: the box's thread owns this struct */
+    volatile LONG kbd_orphaned;             /* destroyed while it was up: the thread frees it */
+} LibApplet;
 
-static void la_destroy(SvcObj *o) { free(o->data); }
+static void la_destroy(SvcObj *o) {
+    LibApplet *a = o->data;
+    if (a->kbd_open) { InterlockedExchange(&a->kbd_orphaned, 1); if (a->kbd_open) return; }
+    free(a);
+}
 static void la_state_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->state); }
 static void la_popout_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->popout); }
 static void la_interactive_event(SvcObj *o, IpcReq *r) { out_event(r, ((LibApplet *)o->data)->interactive); }
 static void la_no_data(SvcObj *o, IpcReq *r) { (void)o; r->result = 0x680; }    /* am: no data */
 static void la_is_completed(SvcObj *o, IpcReq *r) { out_u8(r, ((LibApplet *)o->data)->done); }
-static void la_start(SvcObj *o, IpcReq *r) {
-    LibApplet *a = o->data;
-    hlog(1, "am: library applet %#x (mode %u) started: finishes at once, %s", a->id, a->mode,
-         a->id == 0x11 ? "with Enter" : "cancelled");
-    a->started = a->done = true;
+static void la_finish(LibApplet *a) {
+    a->done = true;
     event_signal(a->popout);
     event_signal(a->state);
 }
+
+static DWORD WINAPI kbd_thread(void *p) {
+    LibApplet *a = p;
+    a->kbd_ok = swkbd_prompt(a->kbd_title, a->kbd_prompt, a->kbd_max, a->kbd_type == 1, a->kbd_text, 501);
+    hlog(1, "am: keyboard closed: %s \"%ls\"", a->kbd_ok ? "OK" : "cancelled", a->kbd_ok ? a->kbd_text : L"");
+    if (InterlockedExchange(&a->kbd_open, 0) && a->kbd_orphaned) { free(a); return 0; }
+    la_finish(a);
+    return 0;
+}
+
+static void la_start(SvcObj *o, IpcReq *r) {
+    LibApplet *a = o->data;
+    a->started = true;
+    const char *name = getenv("NX_PLAYER_NAME");
+    if (a->id == 0x11 && !(name && *name)) {
+        hlog(1, "am: keyboard (mode %u, type %u, up to %u characters): \"%ls\"", a->mode, a->kbd_type, a->kbd_max,
+             a->kbd_prompt);
+        a->kbd_open = 1;
+        HANDLE t = CreateThread(NULL, 0, kbd_thread, a, 0, NULL);
+        if (t) { CloseHandle(t); return; }
+        a->kbd_open = 0;
+    }
+    hlog(1, "am: library applet %#x (mode %u) started: finishes at once, %s", a->id, a->mode,
+         a->id == 0x11 ? "with Enter" : "cancelled");
+    if (a->id == 0x11) { a->kbd_ok = true; for (int i = 0; name && name[i] && i < 500; i++) a->kbd_text[i] = (u8)name[i]; }
+    la_finish(a);
+}
+
+/* copies a UTF-16 string of at most n characters from the config, if it is there */
+static void kbd_string(wchar_t *dst, size_t dn, const u8 *cfg, u64 size, u32 off, u32 n) {
+    if (off + n * 2 > size) return;
+    size_t i = 0;
+    for (; i < n && i + 1 < dn; i++) {
+        u16 c;
+        memcpy(&c, cfg + off + i * 2, 2);
+        if (!c) break;
+        dst[i] = c;
+    }
+    dst[i] = 0;
+}
+
 static void la_exit(SvcObj *o, IpcReq *r) { LibApplet *a = o->data; a->done = true; event_signal(a->state); }
 static void la_result(SvcObj *o, IpcReq *r) { (void)o; }
-static void la_push_in(SvcObj *o, IpcReq *r) { (void)o; }
+static void la_push_in(SvcObj *o, IpcReq *r) {
+    LibApplet *a = o->data;
+    if (a->id != 0x11 || ++a->pushes != 2) return;          /* the keyboard's second storage is its config */
+    SvcObj *so = in_object(r, 0);
+    if (!so) { hlog(1, "am: keyboard config: no storage object"); return; }
+    Storage *s = so->iface == &iface_storage ? so->data : NULL;
+    if (!s || s->size < 0x3c4) { svcobj_unref(so); return; }
+    memcpy(&a->kbd_type, s->data, 4);
+    memcpy(&a->kbd_max, s->data + 0x3c0, 4);
+    if (a->kbd_max > 500) a->kbd_max = 500;
+    wchar_t header[66] = {0}, sub[130] = {0}, guide[258] = {0};
+    kbd_string(header, 66, s->data, s->size, 0x38, 65);
+    kbd_string(sub, 130, s->data, s->size, 0xba, 129);
+    kbd_string(guide, 258, s->data, s->size, 0x1bc, 257);
+    memcpy(a->kbd_title, header, sizeof header);
+    _snwprintf(a->kbd_prompt, 399, L"%ls%ls%ls%ls%ls", header, header[0] && (sub[0] || guide[0]) ? L"\r\n" : L"", sub,
+               sub[0] && guide[0] ? L"\r\n" : L"", guide);
+    svcobj_unref(so);
+}
 static void la_pop_out(SvcObj *o, IpcReq *r) {
     LibApplet *a = o->data;
     if (a->popped || !a->done) { r->result = 0x680; return; }          /* am: no data */
@@ -222,10 +299,9 @@ static void la_pop_out(SvcObj *o, IpcReq *r) {
     memcpy(out, &cancelled, 4);
     if (a->id == 0x11) {
         /* keyboard: {u32 close result (0 Enter, 1 cancel), UTF-16 text}, 0x7d8 bytes */
-        const char *name = getenv("NX_PLAYER_NAME");
-        if (!name || !*name) name = "Player";
-        memset(out, 0, 4);
-        for (u32 i = 0; name[i] && i < 0x3e0; i++) { out[4 + 2 * i] = (u8)name[i]; out[5 + 2 * i] = 0; }
+        u32 res = a->kbd_ok ? 0 : 1;
+        memcpy(out, &res, 4);
+        for (u32 i = 0; a->kbd_ok && a->kbd_text[i] && i < 0x3e0; i++) memcpy(out + 4 + 2 * i, &(u16){a->kbd_text[i]}, 2);
         out_object(r, storage_new(out, 0x7d8));
         return;
     }

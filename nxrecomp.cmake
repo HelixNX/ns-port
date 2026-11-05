@@ -69,34 +69,65 @@ set(NX_RUNTIME_SOURCES
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
-    nvn.c gpu.c tex.c vk.c astc.c input.c movie.c)
+    nvn.c gpu.c tex.c vk.c astc.c input.c movie.c swkbd.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
-# with ENet (deps/enet, v1.3.18) and zstd (deps/zstd, v1.5.6) built from source
+# with ENet and zstd, found in this order:
+#   vcpkg (x64-windows: `vcpkg install enet zstd`): the vcpkg SDL3 came from, then $VCPKG_ROOT and
+#   $VCPKG_INSTALLATION_ROOT; DLLs go next to the exe
+#   deps/enet (v1.3.18) and deps/zstd (v1.5.6, lib/ only), built from source
 set(NX_NETPLAY_SOURCES net/room.c net/lobby.c net/browser.c services/ldn_net.c services/bsd.c)
 list(TRANSFORM NX_NETPLAY_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
+# defines nx_enet and nx_zstd; NX_NETPLAY_DLLS lists DLLs to copy next to the exe
 function(nx_netplay_libs)
     if(TARGET nx_enet)
         return()
     endif()
-    foreach(_d enet zstd)
-        if(NOT EXISTS "${NX_DEPS}/${_d}")
-            message(FATAL_ERROR "NETPLAY needs deps/${_d} (see nxrecomp.cmake)")
+    set(NX_NETPLAY_DLLS "" CACHE INTERNAL "")
+    # the vcpkg tree SDL3 came from first: Visual Studio's environment points VCPKG_ROOT at its own vcpkg
+    get_filename_component(_sdl_base "${NX_SDL3_INCLUDE}" DIRECTORY)
+    set(_bases "${_sdl_base}")
+    foreach(_v "$ENV{VCPKG_ROOT}" "$ENV{VCPKG_INSTALLATION_ROOT}")
+        if(_v)
+            file(TO_CMAKE_PATH "${_v}/installed/x64-windows" _b)
+            list(APPEND _bases "${_b}")
         endif()
     endforeach()
+    foreach(_b ${_bases})
+        if(EXISTS "${_b}/include/enet/enet.h" AND EXISTS "${_b}/lib/enet.lib" AND EXISTS "${_b}/include/zstd.h"
+           AND EXISTS "${_b}/lib/zstd.lib")
+            message(STATUS "nxrecomp: netplay libraries from vcpkg (${_b})")
+            add_library(nx_enet INTERFACE)
+            target_include_directories(nx_enet INTERFACE "${_b}/include")
+            target_link_libraries(nx_enet INTERFACE "${_b}/lib/enet.lib" ws2_32 winmm)
+            add_library(nx_zstd INTERFACE)
+            target_include_directories(nx_zstd INTERFACE "${_b}/include")
+            target_link_libraries(nx_zstd INTERFACE "${_b}/lib/zstd.lib")
+            file(GLOB _dlls "${_b}/bin/enet.dll" "${_b}/bin/zstd.dll")
+            set(NX_NETPLAY_DLLS "${_dlls}" CACHE INTERNAL "")
+            return()
+        endif()
+    endforeach()
+    foreach(_d enet zstd)
+        if(NOT EXISTS "${NX_DEPS}/${_d}")
+            message(FATAL_ERROR "NETPLAY needs ENet and zstd: `vcpkg install enet zstd` (x64-windows), or deps/${_d} (see nxrecomp.cmake)")
+        endif()
+    endforeach()
+    message(STATUS "nxrecomp: netplay libraries built from deps/enet and deps/zstd")
     set(_e "${NX_DEPS}/enet")
     add_library(nx_enet STATIC ${_e}/callbacks.c ${_e}/compress.c ${_e}/host.c ${_e}/list.c ${_e}/packet.c
                                ${_e}/peer.c ${_e}/protocol.c ${_e}/win32.c)
-    target_include_directories(nx_enet PUBLIC "${_e}/include")
+    target_include_directories(nx_enet BEFORE PUBLIC "${_e}/include")
     target_compile_definitions(nx_enet PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS _CRT_SECURE_NO_WARNINGS)
     target_compile_options(nx_enet PRIVATE /clang:-O2 /clang:-Wno-everything)
     target_link_libraries(nx_enet PUBLIC ws2_32 winmm)
     set(_z "${NX_DEPS}/zstd/lib")
     file(GLOB _zsrc "${_z}/common/*.c" "${_z}/compress/*.c" "${_z}/decompress/*.c")
     add_library(nx_zstd STATIC ${_zsrc})
-    target_include_directories(nx_zstd PUBLIC "${_z}")
+    # ahead of the SDL3 / Vulkan include folders: a vcpkg one may have its own zstd.h, which imports zstd from a DLL
+    target_include_directories(nx_zstd BEFORE PUBLIC "${_z}")
     target_compile_definitions(nx_zstd PRIVATE ZSTD_DISABLE_ASM)
     target_compile_options(nx_zstd PRIVATE /clang:-O2 /clang:-Wno-everything)
 endfunction()
@@ -122,6 +153,12 @@ function(nx_game)
             list(APPEND NX_DLC "${d}")
         endforeach()
     endif()
+    # default frame rate, e.g. "framerate": 60 (only for games whose hooks step the game by the frame time;
+    # absent: the game's own, FRAMERATE_GAME); NX_FRAMERATE / NX_NOPACE and F5 still change it
+    string(JSON NX_DEFAULT_FRAMERATE ERROR_VARIABLE no_fr GET "${json}" framerate)
+    if(no_fr)
+        set(NX_DEFAULT_FRAMERATE -1)
+    endif()
     list(LENGTH NX_DLC NX_DLC_COUNT)
     list(APPEND NX_DLC 0)                               # a C array may not be empty
     list(JOIN NX_DLC ", " NX_DLC)
@@ -140,6 +177,7 @@ function(nx_game)
 #define NX_ROOT "@NX_ROOT@"
 #define NX_DLC_COUNT @NX_DLC_COUNT@
 #define NX_DLC_INDICES {@NX_DLC@}
+#define NX_DEFAULT_FRAMERATE (@NX_DEFAULT_FRAMERATE@)
 ]] @ONLY)
 
     set(LIFTED_DIR "${build}/lifted" CACHE PATH "C sources written by tools/lifter/a64lift.py")
@@ -189,6 +227,10 @@ function(nx_game)
         nx_netplay_libs()
         target_sources(${NX_NAME} PRIVATE ${NX_NETPLAY_SOURCES})
         target_compile_definitions(${NX_NAME} PRIVATE NX_NETPLAY)
+        foreach(_dll ${NX_NETPLAY_DLLS})
+            add_custom_command(TARGET ${NX_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                               "${_dll}" "$<TARGET_FILE_DIR:${NX_NAME}>")
+        endforeach()
         target_link_libraries(${NX_NAME} PRIVATE nx_enet nx_zstd winhttp comctl32)
     endif()
 endfunction()

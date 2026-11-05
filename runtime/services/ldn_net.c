@@ -10,6 +10,7 @@
  * Command ids: IUserLocalCommunicationService (SDK 4.4: nn::ldn::Initialize is command 400). */
 #include "../ipc.h"
 #include "../net/net.h"
+#include "game_config.h"
 #include <stdlib.h>
 #include <windows.h>
 #include <bcrypt.h>
@@ -71,6 +72,9 @@ enum {
     CREATE_USER = 0x44, CREATE_NETCFG = 0x78,               /* CreateNetworkConfig */
     CREATE_P_SECPARAM = 0x44, CREATE_P_USER = 0x64, CREATE_P_NETCFG = 0x98,   /* CreateNetworkConfigPrivate */
     CONNECT_USER = 0x44, CONNECT_VERSION = 0x74,            /* ConnectNetworkData */
+    /* ConnectPrivate (SDK 13; Ryujinx's layout, checked in the log): SecurityConfig, SecurityParameter, UserConfig,
+     * u32 version, u32 option, NetworkConfig */
+    CONNECT_P_SECPARAM = 0x44, CONNECT_P_USER = 0x64, CONNECT_P_VERSION = 0x94, CONNECT_P_NETCFG = 0xa0,
 };
 
 static CRITICAL_SECTION lk;
@@ -78,6 +82,9 @@ static KEvent *state_event;
 static int state = ST_NONE;
 static bool initialized;
 static NetworkInfo net;                     /* ours (access point) or the host's copy (station) */
+/* SetAdvertiseData may come before CreateNetwork (Violet's raids do so), which starts net afresh: kept here */
+static u8 advertise[ADVERTISE_MAX];
+static u16 advertise_size;
 static u8 last_connected[NODES], node_change[NODES];
 static s16 disconnect_reason;
 /* access point: the stations in nodes 1..7, by fake address */
@@ -165,9 +172,10 @@ static void on_ldn(const NetLdnPacket *p) {
     case LDN_SCAN_RESP:
         if (p->size >= sizeof(NetworkInfo)) {
             const NetworkInfo *info = (const NetworkInfo *)p->data;
-            hlog(1, "ldn: network of %u.%u.%u.%u: local communication id %016llx, scene %u, version %d, %u of %u nodes",
-                 p->local_ip[0], p->local_ip[1], p->local_ip[2], p->local_ip[3], info->id.intent.local_communication_id,
-                 info->id.intent.scene_id, info->nodes[0].local_communication_version, info->node_count, info->node_count_max);
+            hlog(1, "ldn: network of %u.%u.%u.%u: local communication id %016llx, scene %u, version %d, %u of %u nodes, "
+                 "%u bytes of advertise data", p->local_ip[0], p->local_ip[1], p->local_ip[2], p->local_ip[3],
+                 info->id.intent.local_communication_id, info->id.intent.scene_id, info->nodes[0].local_communication_version,
+                 info->node_count, info->node_count_max, info->advertise_size);
             int i = 0;
             while (i < nscan && memcmp(scan_results[i].bssid, info->bssid, 6)) i++;
             if (i < 16) { memcpy(&scan_results[i], info, sizeof *info); if (i == nscan) nscan++; }
@@ -293,11 +301,17 @@ static void lc_latest_update(SvcObj *o, IpcReq *r) {
     LeaveCriticalSection(&lk);
 }
 
+/* local communication id -1 is "this application's own" (the console takes the first of the NACP's
+ * LocalCommunicationIds; for our games, the title id) */
+#define LOCAL_COMM_DEFAULT 0xffffffffffffffffull
+static u64 own_comm_id(u64 id) { return id == LOCAL_COMM_DEFAULT ? NX_TITLE_ID : id; }
+
 static bool scan_match(const u8 *filter, const NetworkInfo *n) {
     u32 flag;
     memcpy(&flag, filter + 0x5c, 4);
     const NetworkId *fid = (const NetworkId *)filter;
-    if (flag & SF_LOCAL_COMM_ID && fid->intent.local_communication_id != n->id.intent.local_communication_id) return false;
+    if (flag & SF_LOCAL_COMM_ID && own_comm_id(fid->intent.local_communication_id) != n->id.intent.local_communication_id)
+        return false;
     if (flag & SF_SESSION_ID && memcmp(&fid->session, &n->id.session, 16)) return false;
     if (flag & SF_NETWORK_TYPE) { u32 t; memcpy(&t, filter + 0x20, 4); if (t != n->network_type) return false; }
     if (flag & SF_SSID) {
@@ -308,16 +322,22 @@ static bool scan_match(const u8 *filter, const NetworkInfo *n) {
     return true;
 }
 
-static void lc_scan(SvcObj *o, IpcReq *r) {
-    const IpcBuf *b = buf_out(r, 0);
-    if (!b || !b->size) { r->result = R_LDN_BAD_INPUT; return; }
-    u8 filter[0x60] = {0};
-    if (r->in_size >= SCAN_FILTER + 0x60) memcpy(filter, r->in + SCAN_FILTER, 0x60);
+/* asks every member for its network and collects the answers in scan_results; returns how many */
+static int scan_room(void) {
     EnterCriticalSection(&lk);
     nscan = 0;
     send_ldn(LDN_SCAN, NULL, NULL, 0);
     LeaveCriticalSection(&lk);
     Sleep(1000);                            /* the replies (Eden waits as long) */
+    return nscan;
+}
+
+static void lc_scan(SvcObj *o, IpcReq *r) {
+    const IpcBuf *b = buf_out(r, 0);
+    if (!b || !b->size) { r->result = R_LDN_BAD_INPUT; return; }
+    u8 filter[0x60] = {0};
+    if (r->in_size >= SCAN_FILTER + 0x60) memcpy(filter, r->in + SCAN_FILTER, 0x60);
+    scan_room();
     EnterCriticalSection(&lk);
     s16 count = 0;
     u64 max = b->size / sizeof(NetworkInfo);
@@ -325,7 +345,11 @@ static void lc_scan(SvcObj *o, IpcReq *r) {
         if (scan_match(filter, &scan_results[i]))
             memcpy((u8 *)(uintptr_t)b->addr + count++ * sizeof(NetworkInfo), &scan_results[i], sizeof(NetworkInfo));
     LeaveCriticalSection(&lk);
-    hlog(1, "ldn: scan found %d network(s)", count);
+    u32 fflag;
+    memcpy(&fflag, filter + 0x5c, 4);
+    const NetworkId *fid = (const NetworkId *)filter;
+    hlog(1, "ldn: scan found %d network(s) of %d (filter flags %#x: local communication id %016llx, scene %u)", count,
+         nscan, fflag, fid->intent.local_communication_id, fid->intent.scene_id);
     out_data(r, &count, 2);
 }
 
@@ -378,6 +402,9 @@ static void create_network(IpcReq *r, u32 user_off, u32 netcfg_off, const u8 *se
         memcpy(&net.id.session, secparam + 16, 16);
     } else BCryptGenRandom(NULL, (u8 *)&net.id.session, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     memcpy(&net.id.intent, in + netcfg_off, 0x10);
+    net.id.intent.local_communication_id = own_comm_id(net.id.intent.local_communication_id);
+    memcpy(net.advertise, advertise, advertise_size);
+    net.advertise_size = advertise_size;
     for (int i = 0; i < NODES; i++) net.nodes[i].node_id = (s8)i;
     u16 version;
     memcpy(&version, in + netcfg_off + 0x14, 2);
@@ -385,8 +412,9 @@ static void create_network(IpcReq *r, u32 user_off, u32 netcfg_off, const u8 *se
     state = ST_AP_CREATED;
     reset_node_changes();
     update_nodes();
-    hlog(1, "ldn: created a network (local communication id %016llx, scene %u, version %u, up to %u nodes)",
-         net.id.intent.local_communication_id, net.id.intent.scene_id, version, net.node_count_max);
+    hlog(1, "ldn: created a network (local communication id %016llx, scene %u, version %u, up to %u nodes, %u bytes "
+         "of advertise data)", net.id.intent.local_communication_id, net.id.intent.scene_id, version, net.node_count_max,
+         net.advertise_size);
     LeaveCriticalSection(&lk);
 }
 
@@ -407,9 +435,13 @@ static void lc_advertise(SvcObj *o, IpcReq *r) {
     u64 n = b ? b->size : 0;
     if (n > ADVERTISE_MAX) { r->result = R_LDN_ADVERTISE_TOO_BIG; return; }
     EnterCriticalSection(&lk);
-    if (n) memcpy(net.advertise, (const void *)(uintptr_t)b->addr, n);
+    if (n) memcpy(advertise, (const void *)(uintptr_t)b->addr, n);
+    advertise_size = (u16)n;
+    memcpy(net.advertise, advertise, n);
     net.advertise_size = (u16)n;
     if (state == ST_AP_CREATED) update_nodes();
+    static int logged;
+    if (logged++ < 8) hlog(1, "ldn: advertise data, %u bytes (%s)", (u32)n, state == ST_AP_CREATED ? "network up" : "before the network");
     LeaveCriticalSection(&lk);
 }
 
@@ -439,19 +471,13 @@ static void lc_close_station(SvcObj *o, IpcReq *r) {
     LeaveCriticalSection(&lk);
 }
 
-/* Connect: ConnectNetworkData in the arguments, the NetworkInfo (from Scan) in a pointer buffer */
-static void lc_connect(SvcObj *o, IpcReq *r) {
-    const IpcBuf *b = buf_in(r, 0);
-    if (!b || b->size < sizeof(NetworkInfo) || r->in_size < CONNECT_VERSION + 4) { r->result = R_LDN_BAD_INPUT; return; }
-    NetworkInfo target;
-    memcpy(&target, (const void *)(uintptr_t)b->addr, sizeof target);
-    if (!target.node_count) { r->result = R_LDN_NODE_COUNT; return; }
+/* joins target's network as a station (Connect and ConnectPrivate) */
+static void connect_to(IpcReq *r, const NetworkInfo *target, const u8 *user_config, u32 version) {
+    if (!target->node_count) { r->result = R_LDN_NODE_COUNT; return; }
     EnterCriticalSection(&lk);
     if (state != ST_STATION_OPENED) { r->result = R_LDN_BAD_STATE; LeaveCriticalSection(&lk); return; }
-    u32 version;
-    memcpy(&version, r->in + CONNECT_VERSION, 4);
-    make_node(&self_node, r->in + CONNECT_USER, (u16)version);
-    ip_from_host(target.nodes[0].ipv4, host_ip);
+    make_node(&self_node, user_config, (u16)version);
+    ip_from_host(target->nodes[0].ipv4, host_ip);
     have_host = true;
     reset_node_changes();
     send_ldn(LDN_CONNECT, host_ip, &self_node, sizeof self_node);
@@ -468,6 +494,49 @@ static void lc_connect(SvcObj *o, IpcReq *r) {
     }
     hlog(1, "ldn: connected to the network of %u.%u.%u.%u (local communication version %d; ours %u)", host_ip[0], host_ip[1],
          host_ip[2], host_ip[3], net.nodes[0].local_communication_version, version);
+}
+
+/* Connect: ConnectNetworkData in the arguments, the NetworkInfo (from Scan) in a pointer buffer */
+static void lc_connect(SvcObj *o, IpcReq *r) {
+    const IpcBuf *b = buf_in(r, 0);
+    if (!b || b->size < sizeof(NetworkInfo) || r->in_size < CONNECT_VERSION + 4) { r->result = R_LDN_BAD_INPUT; return; }
+    NetworkInfo target;
+    memcpy(&target, (const void *)(uintptr_t)b->addr, sizeof target);
+    u32 version;
+    memcpy(&version, r->in + CONNECT_VERSION, 4);
+    connect_to(r, &target, r->in + CONNECT_USER, version);
+}
+
+/* ConnectPrivate: no NetworkInfo, only the network's intent (NetworkConfig) and session id (in the
+ * SecurityParameter), which the game got from the host some other way. Find that network with a scan. */
+static void lc_connect_private(SvcObj *o, IpcReq *r) {
+    if (r->in_size < CONNECT_P_NETCFG + 0x20) { r->result = R_LDN_BAD_INPUT; return; }
+    const u8 *in = r->in;
+    IntentId intent;
+    SessionId session;
+    u32 version;
+    memcpy(&intent, in + CONNECT_P_NETCFG, sizeof intent);
+    memcpy(&session, in + CONNECT_P_SECPARAM + 16, sizeof session);
+    memcpy(&version, in + CONNECT_P_VERSION, 4);
+    hlog(1, "ldn: ConnectPrivate to local communication id %016llx, scene %u, session %016llx%016llx, version %u",
+         intent.local_communication_id, intent.scene_id, session.high, session.low, version);
+    int n = scan_room();
+    NetworkInfo target;
+    bool found = false;
+    EnterCriticalSection(&lk);
+    for (int i = 0; i < n && !found; i++)
+        if (scan_results[i].id.intent.local_communication_id == intent.local_communication_id &&
+            !memcmp(&scan_results[i].id.session, &session, sizeof session)) {
+            target = scan_results[i];
+            found = true;
+        }
+    LeaveCriticalSection(&lk);
+    if (!found) {
+        hlog(0, "ldn: ConnectPrivate: no network with that session among %d found", n);
+        r->result = R_LDN_CONNECT_FAILED;
+        return;
+    }
+    connect_to(r, &target, in + CONNECT_P_USER, version);
 }
 
 static void lc_disconnect(SvcObj *o, IpcReq *r) {
@@ -526,6 +595,7 @@ static const Iface iface_local = {"IUserLocalCommunicationService", (const IpcCm
     {300, lc_open_station, "OpenStation"},
     {301, lc_close_station, "CloseStation"},
     {302, lc_connect, "Connect"},
+    {303, lc_connect_private, "ConnectPrivate"},
     {304, lc_disconnect, "Disconnect"},
     {400, lc_initialize, "Initialize"},
     {401, lc_finalize, "Finalize"},

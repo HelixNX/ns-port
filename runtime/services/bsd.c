@@ -29,6 +29,8 @@ typedef struct Dgram { struct Dgram *next; u8 ip[4]; u16 port; u32 size; u8 data
 
 typedef struct Sock {
     bool used, stream, bound, broadcast, nonblock, closed, connected;
+    bool efd, efd_semaphore;                /* an eventfd (SDK 13 EventFd): no network, a counter */
+    u64 efd_count;
     u32 proto;                              /* the game's socket() protocol (BSD numbers) */
     u8 ip[4];                               /* bound address (0.0.0.0: any) */
     u16 port;                               /* host order */
@@ -379,7 +381,65 @@ static void do_recv(IpcReq *r, s32 fd, u32 flags, bool from) {
 }
 static void bsd_recv(SvcObj *o, IpcReq *r) { do_recv(r, (s32)in_u32(r, 0), in_u32(r, 4), false); }
 static void bsd_recvfrom(SvcObj *o, IpcReq *r) { do_recv(r, (s32)in_u32(r, 0), in_u32(r, 4), true); }
-static void bsd_read(SvcObj *o, IpcReq *r) { do_recv(r, (s32)in_u32(r, 0), 0, false); }
+
+/* ---------------------------------------------------------------------------------------------- eventfd */
+/* EventFd(u64 initval, u32 flags): flags as Linux (EFD_SEMAPHORE 1, EFD_NONBLOCK 0x800). nn::socket::EventFdRead and
+ * EventFdWrite are Read and Write of 8 bytes on it */
+enum { EFD_SEMAPHORE_ = 1 };
+
+static void bsd_eventfd(SvcObj *o, IpcReq *r) {
+    u64 init;
+    memcpy(&init, r->in, 8);
+    u32 flags = in_u32(r, 8);
+    AcquireSRWLockExclusive(&lock);
+    int i = 0;
+    while (i < MAX_SOCKS && socks[i].used) i++;
+    if (i == MAX_SOCKS) { ReleaseSRWLockExclusive(&lock); reply(r, -1, E_MFILE); return; }
+    memset(&socks[i], 0, sizeof socks[i]);
+    socks[i].used = socks[i].efd = true;
+    socks[i].efd_semaphore = (flags & EFD_SEMAPHORE_) != 0;
+    socks[i].nonblock = (flags & O_NONBLOCK_) != 0;
+    socks[i].efd_count = init;
+    ReleaseSRWLockExclusive(&lock);
+    hlog(1, "bsd: eventfd %d (initial %llu, flags %#x)", i + FD_BASE, init, flags);
+    reply(r, i + FD_BASE, 0);
+}
+
+/* lock held, exclusive */
+static void efd_read(IpcReq *r, s32 fd) {
+    const IpcBuf *b = buf_out(r, 0);
+    Sock *s = get(fd);
+    if (!b || b->size < 8) { reply(r, -1, E_INVAL); return; }
+    while (s && !s->closed && !s->efd_count) {
+        if (s->nonblock) { reply(r, -1, E_AGAIN); return; }
+        SleepConditionVariableSRW(&arrived, &lock, 100, 0);
+        s = get(fd);
+    }
+    if (!s || s->closed) { reply(r, -1, E_BADF); return; }
+    u64 v = s->efd_semaphore ? 1 : s->efd_count;
+    s->efd_count -= v;
+    memcpy((void *)(uintptr_t)b->addr, &v, 8);
+    reply(r, 8, 0);
+}
+
+static void efd_write(IpcReq *r, s32 fd, const IpcBuf *msg) {
+    Sock *s = get(fd);
+    u64 v;
+    if (!msg || msg->size < 8) { reply(r, -1, E_INVAL); return; }
+    memcpy(&v, (const void *)(uintptr_t)msg->addr, 8);
+    s->efd_count += v;
+    WakeAllConditionVariable(&arrived);
+    reply(r, 8, 0);
+}
+
+static void bsd_read(SvcObj *o, IpcReq *r) {
+    s32 fd = (s32)in_u32(r, 0);
+    AcquireSRWLockExclusive(&lock);
+    Sock *s = get(fd);
+    if (s && s->efd) { efd_read(r, fd); ReleaseSRWLockExclusive(&lock); return; }
+    ReleaseSRWLockExclusive(&lock);
+    do_recv(r, fd, 0, false);
+}
 
 static void do_send(IpcReq *r, s32 fd, const IpcBuf *msg, const IpcBuf *to) {
     AcquireSRWLockExclusive(&lock);
@@ -412,7 +472,14 @@ done:
 }
 static void bsd_send(SvcObj *o, IpcReq *r) { do_send(r, (s32)in_u32(r, 0), buf_in(r, 0), NULL); }
 static void bsd_sendto(SvcObj *o, IpcReq *r) { do_send(r, (s32)in_u32(r, 0), buf_in(r, 0), buf_in(r, 1)); }
-static void bsd_write(SvcObj *o, IpcReq *r) { do_send(r, (s32)in_u32(r, 0), buf_in(r, 0), NULL); }
+static void bsd_write(SvcObj *o, IpcReq *r) {
+    s32 fd = (s32)in_u32(r, 0);
+    AcquireSRWLockExclusive(&lock);
+    Sock *s = get(fd);
+    if (s && s->efd) { efd_write(r, fd, buf_in(r, 0)); ReleaseSRWLockExclusive(&lock); return; }
+    ReleaseSRWLockExclusive(&lock);
+    do_send(r, fd, buf_in(r, 0), NULL);
+}
 
 /* poll: struct pollfd { s32 fd; s16 events, revents; } in buffer 0, results to output buffer 0 */
 static void bsd_poll(SvcObj *o, IpcReq *r) {
@@ -434,6 +501,7 @@ static void bsd_poll(SvcObj *o, IpcReq *r) {
             Sock *s = get(fd);
             if (fd < 0) rev = 0;
             else if (!s) rev = POLLNVAL_;
+            else if (s->efd) rev = (ev & POLLIN_ && s->efd_count ? POLLIN_ : 0) | (ev & POLLOUT_);
             else {
                 if (ev & POLLIN_ && s->head) rev |= POLLIN_;
                 if (ev & POLLOUT_ && !s->stream) rev |= POLLOUT_;
@@ -504,6 +572,7 @@ static const Iface iface_bsd = {"bsd:u", (const IpcCmd[]){
     {24, bsd_write, "Write"},
     {25, bsd_read, "Read"},
     {26, bsd_close, "Close"},
+    {31, bsd_eventfd, "EventFd"},
     IPC_END}, NULL};
 
 static SvcObj *open_bsd(const char *name) { return svcobj_new(&iface_bsd, NULL, name); }

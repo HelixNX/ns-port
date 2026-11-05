@@ -1,16 +1,24 @@
 /* nifm: network interface manager, with no network. Every request the game submits is rejected at once (state Free,
  * a nifm error), so the SDK's SubmitAndWait returns, IsNetworkAvailable is false and online features stay off.
+ * The exception is a request for local communication while local wireless works (netplay builds in a room): the SDK's
+ * nn::nifm::SetLocalNetworkMode(true) gives its request requirement preset 1 (4 otherwise), and such a request is
+ * accepted, as a console in local play mode does.
  * Command ids are from the SDK 4.4 proxies (IStaticService, IGeneralService, IRequest). */
 #include "../ipc.h"
 #include <stdlib.h>
+#ifdef NX_NETPLAY
+#include "../net/net.h"
+#endif
 
 #define R_NIFM_NO_NETWORK (110 | (1111 << 9))        /* nifm: network communication disabled */
 
 enum { REQ_FREE = 1, REQ_ON_HOLD = 2, REQ_ACCEPTED = 3 };
+enum { PRESET_LOCAL = 1 };
 
 typedef struct Request {
     KEvent *state_event, *other_event;              /* GetSystemEventReadableHandles: state changes, and a second */
     u32 state, result;
+    u32 preset;
 } Request;
 
 static void req_destroy(SvcObj *o) {
@@ -28,10 +36,16 @@ static void req_events(SvcObj *o, IpcReq *r) {
 }
 static void req_submit(SvcObj *o, IpcReq *r) {
     Request *q = o->data;
-    q->state = REQ_FREE;
-    q->result = R_NIFM_NO_NETWORK;
+    bool local = false;
+#ifdef NX_NETPLAY
+    local = q->preset == PRESET_LOCAL && room_joined();
+#endif
+    q->state = local ? REQ_ACCEPTED : REQ_FREE;
+    q->result = local ? 0 : R_NIFM_NO_NETWORK;
+    hlog(1, "nifm: request with requirement preset %u %s", q->preset, local ? "accepted (local communication)" : "rejected");
     event_signal(q->state_event);
 }
+static void req_preset(SvcObj *o, IpcReq *r) { ((Request *)o->data)->preset = in_u32(r, 0); }
 static void req_cancel(SvcObj *o, IpcReq *r) {
     Request *q = o->data;
     q->state = REQ_FREE;
@@ -45,7 +59,7 @@ static const Iface iface_request = {"IRequest", (const IpcCmd[]){
     {3, req_cancel, "Cancel"},
     {4, req_submit, "Submit"},
     {5, ipc_noop, "SetRequirement"},
-    {6, ipc_noop, "SetRequirementPreset"},
+    {6, req_preset, "SetRequirementPreset"},
     {8, ipc_noop, "SetPriority"},
     {9, ipc_noop, "SetNetworkProfileId"},
     {10, ipc_noop, "SetRejectable"},

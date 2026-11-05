@@ -120,6 +120,12 @@ static SvcObj *domain_get(Domain *d, u32 id) {
     return o;
 }
 
+/* the i-th object argument of a domain request (e.g. an IStorage pushed to an applet), with a reference */
+SvcObj *in_object(IpcReq *r, int i) {
+    Domain *d = r->session ? r->session->domain : NULL;
+    return d && i < r->nin_objs && i < 8 ? domain_get(d, r->in_objs[i]) : NULL;
+}
+
 static void domain_close(Domain *d, u32 id) {
     SvcObj *o = NULL;
     AcquireSRWLockExclusive(&d->lock);
@@ -164,7 +170,21 @@ void ipc_stub(SvcObj *self, IpcReq *r) {
 const Iface iface_stub = {"stub", (const IpcCmd[]){{0, NULL, NULL}}, NULL};
 void ipc_noop(SvcObj *self, IpcReq *r) { (void)self; (void)r; }
 
+/* NX_IPC_TRACE=<interface>,... logs every command of those interfaces (by Iface name, e.g.
+ * IUserLocalCommunicationService,bsd:u) and failed results at log level 1; --log 2 traces every interface */
+static char ipc_trace[512];
+
+static bool traced(const char *iface) {
+    if (!ipc_trace[0]) return false;
+    size_t n = strlen(iface);
+    for (const char *p = ipc_trace; (p = strstr(p, iface)); p += n)
+        if ((p == ipc_trace || p[-1] == ',') && (p[n] == ',' || !p[n])) return true;
+    return false;
+}
+
 void services_init(const char *game_dir, const char *save_dir) {
+    const char *t = getenv("NX_IPC_TRACE");
+    if (t) snprintf(ipc_trace, sizeof ipc_trace, "%s", t);
     am_register();
     lm_register();
     apm_register();
@@ -198,8 +218,10 @@ void services_init(const char *game_dir, const char *save_dir) {
 static void dispatch(SvcObj *o, IpcReq *r) {
     for (const IpcCmd *c = o->iface->cmds; c->fn; c++)
         if (c->id == r->cmd) {
-            hlog(2, "ipc %s.%s (%u)", o->name, c->name, r->cmd);
+            int lv = traced(o->iface->name) ? 1 : 2;
+            hlog(lv, "ipc %s.%s (%u)", o->name, c->name, r->cmd);
             c->fn(o, r);
+            if (r->result) hlog(lv, "ipc %s.%s (%u) -> result %#x", o->name, c->name, r->cmd, r->result);
             return;
         }
     if (o->iface != &iface_stub) hlog(0, "%s: command %u is not implemented", o->name, r->cmd);
