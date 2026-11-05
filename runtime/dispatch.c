@@ -1,6 +1,9 @@
 /* What the lifted code calls into: indirect calls and branches (one table slot per text word, so a lookup is an
  * index), host functions at guest addresses ("host calls"), traps, the counter and FPCR, and the crash report. */
 #include "hos.h"
+#ifdef NX_PACKAGE
+#include "game_config.h"                  /* NX_TITLE */
+#endif
 #include <stdlib.h>
 #include <windows.h>
 #include <dbghelp.h>
@@ -229,6 +232,16 @@ void fatal(const char *fmt, ...) {
     va_start(ap, fmt);
     vlog("fatal: ", fmt, ap);
     va_end(ap);
+#ifdef NX_PACKAGE
+    {   /* no console for players: say what went wrong and where the log is */
+        char what[1024], msg[1400];
+        va_start(ap, fmt);
+        vsnprintf(what, sizeof what, fmt, ap);
+        va_end(ap);
+        snprintf(msg, sizeof msg, "%s\n\nThe log (log.txt) is in %%LOCALAPPDATA%%\\" NX_TITLE "\\.", what);
+        MessageBoxA(NULL, msg, NX_TITLE, MB_ICONERROR);
+    }
+#endif
     if (IsDebuggerPresent()) __debugbreak();
     TerminateProcess(GetCurrentProcess(), 3);
     for (;;) {}

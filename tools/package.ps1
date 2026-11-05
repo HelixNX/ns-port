@@ -23,6 +23,15 @@ if (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN_SDK\Bin\glslangValidat
 
 New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware", "$Out\translator\Bin", "$Out\room" | Out-Null
 Copy-Item $exe.FullName, "$pkg\*.dll" $Out -Force
+# the Visual C++ runtime next to the exe (app-local, as Microsoft allows), so players need no redistributable;
+# the UCRT (api-ms-win-crt-*) is part of Windows 10 and 11
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vs = if (Test-Path $vswhere) { & $vswhere -latest -products * -property installationPath }
+$crt = if ($vs) { Get-ChildItem "$vs\VC\Redist\MSVC" -Directory -ErrorAction SilentlyContinue |
+    ForEach-Object { Get-ChildItem "$($_.FullName)\x64" -Directory -Filter 'Microsoft.VC14*.CRT' -ErrorAction SilentlyContinue } |
+    Sort-Object FullName | Select-Object -Last 1 }
+if (-not $crt) { throw "no Visual C++ redistributable folder (VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT) in Visual Studio" }
+$vcrt = 'vcruntime140.dll', 'vcruntime140_1.dll' | ForEach-Object { "$($crt.FullName)\$_" }
 Copy-Item "$tools\shader\translate.py", "$tools\shader\maxwell.py" "$Out\translator" -Force
 Copy-Item "$env:VULKAN_SDK\Bin\glslangValidator.exe" "$Out\translator\Bin" -Force
 if (Test-Path "$Out\translator\python") { Remove-Item -Recurse -Force -Confirm:$false "$Out\translator\python" }
@@ -33,6 +42,8 @@ Add-Content $pth.FullName '..'
 cmd /c "`"$tools\room\build.bat`" `"$Out\room`""
 if ($LASTEXITCODE) { throw 'the room server build failed' }
 Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
+Copy-Item $vcrt $Out -Force
+Copy-Item $vcrt "$Out\room" -Force
 
 $title = $cfg.title
 @"
@@ -59,9 +70,14 @@ are translated as the game first uses them.
 Keys: F3 shows the frame rate. F12 captures the next frame into %LOCALAPPDATA%\$title\dumps: if something
 looks wrong, press it and send that folder's newest files with log.txt.
 
-Multiplayer (local play, Union Circle, Tera raids) goes through a room server: one player runs room\room_server.exe
-(port 24872, UDP; forward it or use a VPN such as Tailscale), everyone else picks that address in the room
-browser when the game starts.
+Multiplayer (local play, Union Circle, Tera raids) goes through a room server that relays the game's traffic: one
+player runs room\room_server.exe (UDP port 24872), everyone else picks that address in the room browser when the
+game starts. On one network nothing needs setting up. Over the internet only the server's machine must be
+reachable: forward UDP 24872, use a UDP tunnel (e.g. playit.gg) or a VPN such as Tailscale. Players need no
+forwarding.
+
+Needs: Windows 10 or 11 (64-bit) and a graphics driver with Vulkan 1.3 (any recent NVIDIA, AMD or Intel driver).
+Nothing else needs installing.
 "@ | Set-Content "$Out\README.txt"
 "Put your NSPs, prod.keys and title.keys here. Firmware .nca files go in the firmware folder." | Set-Content "$Out\game\PUT YOUR FILES HERE.txt"
 $size = (Get-ChildItem $Out -Recurse -File | Measure-Object Length -Sum).Sum / 1MB

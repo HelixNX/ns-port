@@ -76,7 +76,7 @@ static void window_icon(void) {
 
 void window_init(void) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) fatal("SDL_Init: %s", SDL_GetError());
-    if (!SDL_Vulkan_LoadLibrary(NULL)) fatal("no Vulkan: %s", SDL_GetError());
+    if (!SDL_Vulkan_LoadLibrary(NULL)) fatal("Vulkan is not available (%s).\n\nInstall or update your graphics driver: the game needs a GPU with Vulkan 1.3.", SDL_GetError());
     window = SDL_CreateWindow(NX_TITLE, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) fatal("SDL_CreateWindow: %s", SDL_GetError());
     window_icon();
@@ -280,7 +280,7 @@ static VkPhysicalDevice pick_device(void) {
              VK_API_VERSION_MINOR(p.apiVersion), ok ? "" : ": missing features");
         if (ok && (!best || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) best = devs[i];
     }
-    if (!best) fatal("no Vulkan 1.3 device with the extensions we need");
+    if (!best) fatal("No graphics card with Vulkan 1.3 and the extensions the game needs was found.\n\nUpdate your graphics driver; older GPUs are not supported.");
     return best;
 }
 
@@ -927,15 +927,22 @@ static bool overlay_draw(u32 f) {
 static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
 
 /* "COMPILING SHADERS <n>" in the bottom-left corner while the translator has shaders to do (whatever F3 says): the
- * first start draws little until thousands are done */
+ * first start draws little until thousands are done. F12's "CAPTURING FRAME..." / "FRAME CAPTURED" go there too
+ * (the glyphs have no B, J, Q or Y). */
 #define MSG_W 360
 #define MSG_H 22
 static VkBuf msg_buf[PRESENT_FRAMES];
 bool gpu_shader_progress(u32 *done, u32 *total);
+const char *gpu_capture_status(void);
 
 static bool msg_draw(u32 f) {
     u32 done, total;
-    if (!gpu_shader_progress(&done, &total) || sw.extent.width < MSG_W + 8 || sw.extent.height < MSG_H + 8) return false;
+    char text[40];
+    const char *cap = gpu_capture_status();     /* F12: shown over the shader count while it lasts */
+    if (cap) snprintf(text, sizeof text, "%s", cap);
+    else if (gpu_shader_progress(&done, &total)) snprintf(text, sizeof text, "COMPILING SHADERS: %u/%u", done, total);
+    else return false;
+    if (sw.extent.width < MSG_W + 8 || sw.extent.height < MSG_H + 8) return false;
     bool bgra = sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB;
     if (!bgra && sw.format != VK_FORMAT_R8G8B8A8_UNORM && sw.format != VK_FORMAT_R8G8B8A8_SRGB) return false;
     if (!msg_buf[f].buf)
@@ -943,8 +950,6 @@ static bool msg_draw(u32 f) {
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &msg_buf[f]);
     u32 *px = (u32 *)msg_buf[f].a.map;
     if (!px) return false;
-    char text[40];
-    snprintf(text, sizeof text, "COMPILING SHADERS: %u/%u", done, total);
     for (u32 i = 0; i < MSG_W * MSG_H; i++) px[i] = 0xff181818;
     int x0 = 6;
     for (const char *s = text; *s; s++, x0 += 6 * OV_SCALE) {

@@ -3521,6 +3521,13 @@ static VkPrimitiveTopology topology(u32 mode) {
 static volatile LONG capture_request;      /* F12 (vk.c): dump and trace the next whole frame */
 static u64 capture_frame;
 void gpu_capture_next(void) { InterlockedExchange(&capture_request, 1); }
+static volatile LONG64 capture_done_ms;   /* GetTickCount64 when the last capture was written */
+/* vk.c's message box: what F12 is doing (NULL: nothing to say) */
+const char *gpu_capture_status(void) {
+    if (capture_request || capture_frame) return "CAPTURING FRAME...";
+    LONG64 done = capture_done_ms;
+    return done && GetTickCount64() - (u64)done < 3000 ? "FRAME CAPTURED" : NULL;
+}
 /* F11 (vk.c): upload every texture again from guest memory at the next present (are copies stale?) */
 static volatile LONG reload_request;
 void gpu_reload_textures(void) { InterlockedExchange(&reload_request, 1); }
@@ -5404,6 +5411,10 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     }
     if (image_bytes > budget) images_evict(budget / 4 * 3, false);
     dump_frame(im, frame_no + 1);
+    if (capture_frame && frame_no + 1 >= capture_frame) {
+        capture_frame = 0;
+        InterlockedExchange64(&capture_done_ms, (LONG64)GetTickCount64());
+    }
     if (InterlockedExchange(&capture_request, 0)) {
         capture_frame = frame_no + 2;
         hlog(0, "gpu: F12: frame %llu is traced and dumped to %s", capture_frame, frames_dir());
