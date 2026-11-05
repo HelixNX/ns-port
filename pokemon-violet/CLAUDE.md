@@ -201,7 +201,11 @@ a second backend next to the room. Not started: needs the adapter.
     double and most f16 ops, TLD4 PTP, multisample TLDS. Scripts and counts: the session scratchpad (not kept).
 - Open (seen 2026-11-04): the player portrait is still black (raid member list, map marker; F12 frames 20213 and
   20728 in `build/frames`). Rain: splashes on the ground, rain sheets in the distance and wet surfaces show, but
-  no streaks fall near the camera (needs an F12 capture in rain, camera in the open). Text with letters missing,
+  no streaks fall near the camera. Capture frame 26027 (rain, 2026-11-04; its trace log was overwritten): the
+  half-res effects layer (`960x540 f41 @12f4f6a000`) has 7 lit pixels of 518,400 (beacon frames: 12k-210k), so
+  the streaks are never drawn, not lost later. Next: F12 in rain and keep that session's run.log (the trace
+  lists every draw: are rain emitters drawn at all; if not, CPU side (VFX never makes them) or a skipped draw
+  (unsupported shader, pipeline building, an indirect draw with count 0)). Text with letters missing,
   different ones by position ("Mareep" as " a eep", the link code prompt "   er a co  "), seen before the
   translator fixes too, then not again: suspect the game's run-time glyph atlas (an upload / copy lost or late);
   F12 while it shows.
@@ -210,12 +214,17 @@ a second backend next to the room. Not started: needs the adapter.
   effect manager (`main+2039640`) steps the VFX emitter sets (`b85c44` -> `7e5924`) by speed rate x
   `(int)(clock duration / 16666666.0)`: whole 60 Hz frames, 0 below 16.7 ms (1 at 45 fps for 1.33). Hook
   `fps_effect_frames` (patches.txt `main+20397d0`, fps.c) gives the exact fraction when a non-30 rate is active.
-  - Found with Ghidra headless (the REA MCP failed to connect): a GhidraScript run with `analyzeHeadless <project
-    build/analysis/ghidra> main -process main.elf -noanalysis -readOnly -postScript Decomp.java <out> <addrs>`
-    decompiles (and creates missing functions). Game clocks: the frame update (`main+2b79f60`) gives each clock a
+  - Found with Ghidra headless (the REA MCP failed to connect): `nxrecomp/tools/ghidra/decomp.ps1 <out> <off>...`
+    inside violetrecomp (`-Ghidra D:\ReverseEngineering\ghidra_12.1.3_PUBLIC`; `<off>!` makes a function Ghidra
+    lacks, `x<off>` callers only; ~10 s a run, read-only on build/analysis/ghidra). Game clocks: the frame update (`main+2b79f60`) gives each clock a
     duration from the frame table (`3c2fba8`: 16.7 / 33.3 / 50 / 66.7 / 83.3 ms, by level); readers call
     clock_obj->vtbl[0](obj, 1) and read the duration at +8 (100 sites; `b83cdc`, a sequence player, divides by
     table[its rate] - 1). The Dynamic FPS mod instead clamps the duration to >= 16.7 ms (its 60 cap).
+  - **To check next session (user, uncapped): particles may look too fast.** The time is right (nx_frame_ns is the
+    measured frame time; the game itself keeps speed), so if they are, it is per-update behaviour in the VFX
+    library (spawning, jitter, noise once per call: 3.3x the calls at 200 fps). Ask which: moving faster (log the
+    hook's values) or busier (then step effects in whole 60 Hz frames and carry the remainder, keeping the VFX's
+    own cadence: hook state per manager, x20). Compare one effect with F5 at 60 and uncapped.
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
