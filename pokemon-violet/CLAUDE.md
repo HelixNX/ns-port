@@ -259,6 +259,36 @@ a second backend next to the room. Not started: needs the adapter.
   `timeOfDayHours` / `dayTime` / `nightTime` come from a FlatBuffers parameter file (loader `1513f24`);
   `CFunc_Tml_ResetGameTime` is a Lua command (`main.tml.TimeLineCommand`). The map's clock is a static image. If
   it shows again, note the frame rate and what was happening (a scripted time change is possible).
+- **Shaders in the game files (2026-11-05): all extracted and translated; the package does not use them yet.**
+  Goal: translate at build time, so the package needs no Python / glslang. Tool: `nxrecomp/tools/shader/extract/`
+  (inside violetrecomp: `..\..\nxrecomp\tools\shader\extract\build.bat ..\build\ooz`, then
+  `python ..\..\nxrecomp\tools\shader\extract\extract.py` -> 80 s ->
+  `build/shaders_all/` (23,083 MKSH .bin), then `translate.py --spv ..\build\shaders_all` (340 s, one thread):
+  23,081 translated, 0 glslang failures; the 2 failures (`455b72ede1cc5e2b` TLD, `baacde0ac4bf184d` unknown op)
+  were never created in play. SPIR-V: 3.0 GB as loose files in `build/shaders_all/spv/<translator version>`.
+  - `data.trpfs`: `ONEPACK\0`, u64 offset of a FlatBuffers table {pack hashes u64[], pack offsets u64[]} (23,589
+    packs). Pack hash = FNV-1a 64 with the game's offset basis `0xcbf29ce484222645` (not the standard ...2325) of
+    the name as `data.trpfd` stores it (slashes dropped: `arc/system_resourcegfx2shaderNX64env_titanmaterialstandard.bnsh.trpak`).
+    A pack is a FlatBuffer {file hashes u64[], files[]}; a file {field 1 = 3 / field 2 = 4 when Oodle (absent:
+    stored), u64 decompressed size, data[]}. Data is Oodle Kraken (`8C 06`), decoded with ooz (`deps/ooz`,
+    github.com/powzix/ooz, GPLv3+, cloned 2026-11-05 with the user's OK; not in git, deps/ is ignored) through
+    `oozbatch.exe` (our wrapper; GPLv3 because it includes ooz; a separate process, nothing links it). 408,641
+    files, 34 GB, no failures (29,664 are empty).
+  - Shaders are in BNSH (nn::gfx) files: standalone (`.trsha`, `.bnsh`), inside VFXB effects (`.ptcl`, `.trsot`,
+    `.tracp`, ...) and SARC UI archives (10,472), and 2 embedded in `main.elf` (at file offsets 0x43ec000 and
+    0x43f4000: the engine's own 40 shaders, 36 of them used in play). In a BNSH, u64 pairs {control offset, code
+    offset} (from the BNSH start) then sizes. GLSLC control starts `34 12 76 98`, graphics code `78 56 34 12`.
+    FNV-1a (standard basis) of code[0 : control+0x704 (else 0x30 + control+0x6f8)] is nvn.c's shader hash: all
+    6,032 shaders seen in play are in the set. The same code can come with different control sections; they
+    differ only in bytes the translator does not read (0x18-0x58, 0x6f0, 0x790, 0x7c8).
+  - **Next (agreed with the user, not started):** (1) the package loads the pre-translated set and stops running
+    the translator (a shader with no translation: its draws skipped, logged); (2) pack the SPIR-V into one
+    zstd-compressed file (3.0 GB loose; zstd is linked already); (3) vertex-input variants: only 3 ever needed
+    (mask `01000000`: location 12 unsigned, bone indices of the transform-feedback skinning pass), but skinning
+    breaks without them: plan is translate.py finding at build time which inputs each vertex shader uses as
+    integers and writing those variants (a missing one falls back to float, as now); (4) the one-folder build
+    kit (extract, nso2elf, Ghidra analysis, lift, build, translate, package; the user's open choices: our own NSP
+    extractor instead of nstool, Ghidra + JDK required). Then the user tests the whole player side.
 - **Package for testers (2026-11-05, nxrecomp `nca.c` / `image.c` / `tools/package.ps1`).** The user's call: friends
   test with their own files; requirements are keys, firmware, base + update NSPs (DLC optional). Nothing is extracted:
   - The runtime reads NSPs directly when the game folder has `.nsp` files (any build: `--game <dir>`): prod.keys /
