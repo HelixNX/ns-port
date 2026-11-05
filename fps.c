@@ -43,3 +43,13 @@ void h_fps_timer_step(Ctx *c) {
 
 /* main+2936584 */
 void h_fps_scene_kind(Ctx *c) { scene_kind = (u32)c->x[8]; }
+
+/* main+20397d0 (scvtf s1, w8): the effect manager's step, the number of 60 Hz frames in the clock's duration,
+ * truncated ((int)(duration / 16666666.0), then times the effect speed rate and passed to the VFX emitter sets).
+ * Below 16.7 ms that is 0 and effects froze (raid den beacons, item ball pillars, fade-ins stuck rainbow); at 45 fps
+ * it was 1 for 1.33. With another frame rate, the exact fraction: x0 still points at the clock (duration at +8) */
+void h_fps_effect_frames(Ctx *c) {
+    f32 f = nx_flag_fps ? (f32)((f64)*(s64 *)(uintptr_t)(c->x[0] + 8) / 16666666.0) : (f32)(s32)c->x[8];
+    c->v[1] = (v128){0};
+    memcpy(&c->v[1], &f, sizeof f);
+}
