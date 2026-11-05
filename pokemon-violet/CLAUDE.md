@@ -113,6 +113,48 @@ of collected while playing) and a faster lift/compile (first-run time, now 20-40
 Risks: exceptions (V1) and the size of the build are the unknowns MK8 didn't have; NVN coverage is the largest amount
 of work; online code paths must fail as on a console with no internet, not crash.
 
+## Local multiplayer and frame stalls (2026-11-04)
+
+The user's goal: Tera raids with a real Switch 1 or 2 over local wireless. Switch local play (LDN, `ldn:u`) is
+Wi-Fi, not Bluetooth: action frames (Nintendo OUI 00:22:AA) on channels 1/6/11 to advertise, then a WPA2 network
+whose key comes from a console key (to check: derivable from `prod.keys`), Pia's UDP over it. Windows drivers
+cannot send raw action frames or run such an access point (this machine's RZ616 = MediaTek MT7922 offers only
+`managed` mode through Npcap's WlanHelper, no hosted network). Plan, agreed: a Raspberry Pi 4 (the user has one)
+with a USB MediaTek adapter (mt76: MT7612U or MT7921AU; the Pi's own CYW43455 is FullMAC, no good) runs our daemon
+for the over-the-air protocol (kinnay's LDN docs/library for behaviour only), bridged to the recomp over the LAN as
+a second backend next to the room. Not started: needs the adapter.
+
+- **Done over rooms** (nxrecomp `8b5de5a`, violetrecomp `9ab9a71`): Violet builds with NETPLAY; two instances in
+  one room did Union Circle and a full Tera raid (local mode; link codes typed into the new input box).
+  - Test set-up: `build/room/room_server.exe` (`nxrecomp/tools/room/build.bat <dir>`, vcpkg ENet/zstd), clients
+    with `NX_ROOM=127.0.0.1:24872`, `NX_NICK=A|B`, saves `build/save-net-a` / `save-net-b` (copies of the user's
+    save; the user set music volume in them: don't overwrite). Each instance ~5.3 GB private. A force-killed
+    client keeps its nickname taken until ENet times it out (~30 s): restart the server too.
+  - What it took: nifm accepts preset-1 requests (`SetLocalNetworkMode(true)` -> preset 1, else 4); advertise data
+    is set before CreateNetwork and was wiped by it; the software keyboard returned "Player" as the link code, so
+    searches never matched (now a Win32 input box, swkbd.c); the NG word filter aborts the game without system
+    data `0100000000000823` (NgWord2: `build/sysdata/`, from the firmware); bsd eventfd; ConnectPrivate (layout as
+    Ryujinx's, from memory: not called yet, unchecked).
+  - Raid lag: the room client sent each packet at its next ENet tick (up to 15.6 ms a hop): now at once, and the
+    traffic line gives the round trip to the server. Not yet measured with two clients.
+  - Open: ConnectPrivate unverified; the Pi bridge; the room latency check.
+- **Frame stalls** (nxrecomp `3e6100f`). Overworld at 60 fps had 1% lows of 20-47 ms (12 fps at 30). Found with
+  NX_HITCH_MS=20 plus the new per-frame thread lines and NX_PROFILE's slow-frame tables:
+  1. New pipelines compiled in the draw, ~100 ms each on amdvlk (0.1-1 s hitches): now built by 2 workers, the
+     draw skipped meanwhile (with NX_ASYNC_SHADERS, on in netplay builds; compute pipelines still built inline).
+  2. Main waited for emulated core 0, held by the render thread (5c, same core, same priority 44) blocked in
+     `gpu_fence` on gpu_cs, which loader threads held while importing streamed pools into Vulkan. The import now
+     runs outside gpu_cs and nvnQueueFenceSync gives up the core. Also svcSleepThread spins its last 0.25 ms.
+  Result: slow frames after loading 255 -> 12 (21-27 ms, plain work), every 600-frame window's 1% low 17.0 ms
+  (locked 60). Not yet run: the stand-still benchmark (bench.ps1 sets NX_NOPACE).
+  - Reading slow frames: `gpu:   threads this frame:` gives each thread's exact core hold (the scheduler's, not
+    Windows' 15.6 ms CPU times) and core wait; NX_PROFILE=<up to 4 threads> adds per-thread tables of samples
+    from slow frames only, with the runtime function that called out. NX_PROFILE's own report hitches its frame
+    every 600 frames (it runs on the render thread): ignore frames 600k and 600k+1.
+- Default frame rate is now 60 (`game.json` "framerate"; user's call: higher isn't worth it).
+- Open (seen 2026-11-04): the player portrait is still black (raid member list, map marker; F12 frames 20213 and
+  20728 in `build/frames`); no rain drawn while the weather says rain (needs an F12 capture in rain).
+
 ## Next (written 2026-10-22, updated 2026-10-31)
 
 Where things stand (2026-10-22, RX 7800 XT + Ryzen 7 7800X3D, stand-still benchmark below): ~170 fps uncapped,
