@@ -152,6 +152,21 @@ a second backend next to the room. Not started: needs the adapter.
     from slow frames only, with the runtime function that called out. NX_PROFILE's own report hitches its frame
     every 600 frames (it runs on the render thread): ignore frames 600k and 600k+1.
 - Default frame rate is now 60 (`game.json` "framerate"; user's call: higher isn't worth it).
+- **Item ball light pillars fixed (2026-11-04, nxrecomp `dfe3ea7`, user-checked: red and gold).** Two bugs, both in every soft
+  particle of the half-res effects layer (960x540 f41 `12f4f6a000`, composited by `acbcacd1…`): before, every
+  draw into it passed 0 samples (F12 sample counts; true in October's captures too).
+  1. translate.py dropped IPA.MULTIPLY's multiplier, assuming it is always w. Soft particles (pillar: vs
+     `7a1f81cac22350a1` fs `df61a3468379ebd4`) pass 1 / (own w attribute / w) to get screen UV and NDC depth
+     from `in_a4.xyz / in_a4.w`; undivided, the depth fade read the wrong place and was 0 from most angles
+     (pillar shown only from some, or cut off). Now `in * gl_FragCoord.w * R(multiplier)` for perspective inputs.
+  2. Their depth (`960x540 f53 @12f10ac600`) is a CopyTextureToTexture from the 1080p depth: a scaled depth
+     blit, which AMD cannot do (no depth format is a blit destination), so it was skipped. gpu.c `depth_blit`
+     now draws it (`runtime/shaders/depth_blit.*`, nearest; regenerate depth_blit_spv.h with glslangValidator).
+  - Debugging added: NX_DEBUG_RT=<rt0 addr>:<bits> (draws into that target: 1 discards off, 2 depth test off, 4
+    depth clamp on), NX_TRACE_VCB=<c>:<row>,..;.. (vertex stage uniform rows and each stream's first element in
+    traced frames), traced frames log unbound uniform buffers, texture copies and downsamples, and each draw's
+    depth clamp. Found by swapping a hand-edited SPIR-V into `build/shaders/spv/<version>/` that wrote the fade's
+    factors instead of discarding (move `pipelines.bin*` aside for such runs).
 - Open (seen 2026-11-04): the player portrait is still black (raid member list, map marker; F12 frames 20213 and
   20728 in `build/frames`); no rain drawn while the weather says rain (needs an F12 capture in rain).
 
