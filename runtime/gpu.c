@@ -25,7 +25,7 @@ static bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers, async_shaders;
+        view_log, mutable_all, full_barriers, async_shaders, refresh_wait;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -5025,11 +5025,14 @@ static u64 *scan_pages;
 static size_t scan_n, scan_cap;
 static double scan_mb;
 static HANDLE scan_go, scan_done;
+static double scan_ms, scan_ms_max;     /* the scans' time (the thread's), for the report every 600 frames */
+static u64 scan_skips;                  /* presents that found the last scan still running and did not wait */
 
 static unsigned __stdcall scan_thread(void *arg) {
     (void)arg;
     for (;;) {
         WaitForSingleObject(scan_go, INFINITE);
+        double t0 = ms_now();
         /* the ranges sorted and merged (here, not on the render thread: ~0.1 ms a frame) */
         qsort(scan_rs, scan_nr, sizeof *scan_rs, range_cmp);
         int m = 0;
@@ -5043,6 +5046,9 @@ static unsigned __stdcall scan_thread(void *arg) {
         for (int i = 0; i < scan_nr; i++) n = written_pages(scan_rs[i].lo, scan_rs[i].hi, &scan_pages, &scan_cap, n, &mb);
         scan_n = n;
         scan_mb = mb;
+        double t = ms_now() - t0;
+        scan_ms += t;
+        if (t > scan_ms_max) scan_ms_max = t;
         SetEvent(scan_done);
     }
 }
@@ -5053,7 +5059,11 @@ static void refresh_scan(void) {
         scan_done = CreateEventW(NULL, FALSE, TRUE, NULL);
         _beginthreadex(NULL, 0, scan_thread, NULL, 0, NULL);
     }
-    WaitForSingleObject(scan_done, INFINITE);       /* the scan started at the last present */
+    /* the scan started at an earlier present. While it is still running (GetWriteWatch took 5-20 ms a scan in
+     * Violet's loads and area streaming, the render thread waiting for it at each present), this present goes on
+     * without it: its pages are taken at a later present. Nothing is lost (the write watch keeps the bits of pages
+     * not asked about yet); rewritten textures show a frame or more later then. NX_REFRESH_WAIT waits as before */
+    if (WaitForSingleObject(scan_done, env.refresh_wait ? INFINITE : 0) != WAIT_OBJECT_0) { scan_skips++; return; }
     refresh_mb += scan_mb;
     scan_mb = 0;
     if (scan_n) {
@@ -5238,7 +5248,9 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
     double t_present0 = ms_now();
     EnterCriticalSection(&gpu_cs);
+    double t_cs = ms_now();             /* the steps' times for the slow-frame line (NX_HITCH_MS) */
     refresh_cpu_textures();
+    double t_refresh = ms_now();
     if (InterlockedExchange(&reload_request, 0)) {
         int n = 0;
         for (int b = 0; b < IMAGE_BUCKETS; b++)
@@ -5248,7 +5260,9 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     }
     Image *im = image_get(&w->info[index]);
     if (im) image_upload(im);
+    double t_flush0 = ms_now();
     flush();
+    double t_flush = ms_now();
     ind_log_report();
     query_report();
     static u64 budget;
@@ -5269,7 +5283,11 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
                                   draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
     if (frames % 600 == 0) {
-        hlog(1, "gpu: CPU-written texture check %.2f ms/frame over %.0f MB", refresh_ms / 600, refresh_mb / 600);
+        hlog(1, "gpu: CPU-written texture check %.2f ms/frame over %.0f MB; its thread %.2f ms/frame (longest %.1f), "
+                "%llu presents did not wait for it", refresh_ms / 600, refresh_mb / 600, scan_ms / 600, scan_ms_max,
+             scan_skips);
+        scan_ms = scan_ms_max = 0;
+        scan_skips = 0;
         if (nmirrors) hlog(1, "gpu: pool mirrors: %.2f MB/frame copied in, render thread %.2f ms/frame on them", mirror_mb / 600, mirror_ms / 600);
         mirror_mb = mirror_ms = 0;
         static u64 dropped0;
@@ -5286,6 +5304,7 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     s32 ch = w->crop[3] > 0 ? w->crop[3] : (s32)w->info[index].height;
     /* lower-left origin: row 0 is the bottom of the picture */
     u64 v = submitted;
+    double t_vk = ms_now();
     vk_present(im ? im->image : NULL, w->crop[0], w->crop[1], cw, ch, window_origin == 0, timeline, v);
     double t_end = ms_now();
     t_present_ms += t_end - t_present0;
@@ -5299,6 +5318,15 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
              frames, frame, hf.submit, hf.present, hf.wait, frame - hf.submit - hf.present - hf.wait, hf.shader,
              hf.nshader, hf.jit, hf.njit, hf.pipe, hf.npipe, hf.image, hf.nimage, hf.upload, hf.nupload, hf.slot,
              hf.mirror);
+    if (env.hitch_ms > 0 && frame > env.hitch_ms) {
+        /* this present's steps (the frame's last one; earlier presents in it are in hf.present only) */
+        const VkPresentTimes *pt = &vk_present_times;
+        hlog(0, "gpu:   presenting: gpu_cs wait %.2f, texture check %.2f, before the flush %.2f, flush %.2f, "
+                "before vk_present %.2f, vk_present %.2f (sw_lock %.2f, last present %.2f, fence %.2f, acquire %.2f, "
+                "submit %.2f) ms", t_cs - t_present0, t_refresh - t_cs, t_flush0 - t_refresh, t_flush - t_flush0,
+             t_vk - t_flush, t_end - t_vk, pt->lock, pt->present, pt->fence, pt->acquire, pt->submit);
+    }
+    memset(&vk_present_times, 0, sizeof vk_present_times);
     if (env.hitch_ms > 0) {
         /* which guest threads ran (or waited for a core) in a slow frame */
         char busy[512];
@@ -5339,6 +5367,7 @@ static void env_init(void) {
         env.debug_rt_bits = *end == ':' ? (u32)strtoul(end + 1, NULL, 10) : 1;
     }
     env.refresh_pools = getenv("NX_REFRESH_POOLS") != NULL;
+    env.refresh_wait = getenv("NX_REFRESH_WAIT") != NULL;
     /* Mirrors pay where the GPU reads host memory slowly (the GTX 1650 Ti laptop's x8 link: ~3 GB/s of pool reads
      * at 25 fps) and cost fps where it reads it fast (RX 7800 XT: 155-205 fps off vs 137-167 on). So they are on for
      * discrete GPUs on links under 20 GB/s (PCIe 4.0 x16 is 31.5) or whose link is not known; integrated GPUs read

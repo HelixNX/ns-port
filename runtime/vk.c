@@ -872,15 +872,29 @@ static bool overlay_draw(u32 f) {
 
 static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
 
+VkPresentTimes vk_present_times;
+
+static double pt_ms(void) {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
+}
+
 void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (!sw.fence[0]) present_init();
     /* uncapped, with a present thread: a frame that comes while the last one is still being presented is not shown
      * (as MAILBOX would replace it; under Optimus even MAILBOX waits for the display) */
+    double t0 = pt_ms();
     if (unthrottled) {
         if (!TryAcquireSRWLockExclusive(&sw_lock)) { present_dropped++; return; }
         if (pq.tail != pq.head) { ReleaseSRWLockExclusive(&sw_lock); present_dropped++; return; }
     } else AcquireSRWLockExclusive(&sw_lock);
+    double t1 = pt_ms();
+    vk_present_times.lock += t1 - t0;
     present_pending();                  /* the last frame's, if its thread has not got to it */
+    vk_present_times.present += pt_ms() - t1;
     present_locked(src, x, y, w, h, flip_y, wait, wait_value);
     bool queued = pq.tail != pq.head;
     ReleaseSRWLockExclusive(&sw_lock);
@@ -896,9 +910,13 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
     }
     if (!sw.sc || !sw.extent.width) return;
     u32 f = sw.frame++ % PRESENT_FRAMES;
+    double t0 = pt_ms();
     VKCHECK(vkWaitForFences(vk.dev, 1, &sw.fence[f], 1, UINT64_MAX));
+    double t1 = pt_ms();
+    vk_present_times.fence += t1 - t0;
     u32 idx;
     VkResult r = vkAcquireNextImageKHR(vk.dev, sw.sc, UINT64_MAX, sw.acquired[f], NULL, &idx);
+    vk_present_times.acquire += pt_ms() - t1;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { InterlockedExchange(&resized, 1); return; }
     if (r < 0) fatal("vkAcquireNextImageKHR: %d", r);
     VKCHECK(vkResetFences(vk.dev, 1, &sw.fence[f]));
@@ -946,6 +964,8 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 2 : 1,
                         .pWaitSemaphoreInfos = waits, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    double t2 = pt_ms();
     VKCHECK(vk_submit(&si, sw.fence[f]));
+    vk_present_times.submit += pt_ms() - t2;
     pq.idx[pq.head++ % MAX_IMAGES] = idx;
 }
