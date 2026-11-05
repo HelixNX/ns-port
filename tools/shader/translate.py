@@ -1257,11 +1257,18 @@ class Translator:
         if bits(w, 38, 1):
             raise Unsupported('IPA indexed')
         e, generic = self.attr_in(attr)
-        # GLSL inputs are already perspective-correct, so IPA.MULTIPLY's multiplier (w, from RCP of IPA a[0x7c]) is
-        # not needed. IPA.PASS of a perspective attribute is the raw interpolant, attribute / w: shaders that read it
-        # multiply by w themselves (perspective-projected UI does)
-        if generic and mode == 0 and self.in_attrs.get((attr - 0x80) >> 4) == 'smooth':
+        # The interpolator gives a perspective attribute as attribute / w (linear in screen space): IPA.PASS returns
+        # that, IPA.MULTIPLY that times its multiplier register. GLSL inputs are already perspective-correct, so
+        # attribute / w is the input times gl_FragCoord.w. The multiplier is usually w (RCP of IPA a[0x7c]), but not
+        # always: soft particles pass 1 / (their own w attribute / w) to divide by it, for screen coordinates and
+        # depth (dropping it put the item ball light pillars' depth fade at the wrong place: the pillar showed only
+        # from some angles)
+        persp = generic and self.in_attrs.get((attr - 0x80) >> 4) == 'smooth'
+        if mode == 0 and persp:
             e = 'U(F(%s) * gl_FragCoord.w)' % e
+        elif mode == 1:
+            mul = bits(w, 20, 8)
+            e = 'U(F(%s)%s * F(%s))' % (e, ' * gl_FragCoord.w' if persp else '', self.R(mul))
         if sat:
             e = 'U(clamp(F(%s), 0.0, 1.0))' % e
         self.set_r(d, e)
