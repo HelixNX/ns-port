@@ -168,52 +168,28 @@ a second backend next to the room. Not started: needs the adapter.
     depth clamp. Found by swapping a hand-edited SPIR-V into `build/shaders/spv/<version>/` that wrote the fade's
     factors instead of discarding (move `pipelines.bin*` aside for such runs).
   - The Tera raid den beacons were fixed by the same change (user-checked).
-- **Translator scan (2026-11-04): to fix next.** Four read-only subagents compared translate.py with the hardware
-  (Eden's shader_recompiler as the behaviour reference) and counted uses in the 6,009 dumped shaders. Clean: stage
-  I/O (IPA modes / sat, vertex and instance ids, layer, depth output, S2R), MUFU, .FMZ (never used: every FMUL /
-  FFMA is .FTZ), TEXS encodings, LDG / STG, ATOM, SUST / SURED. After any fix: `translate.py --spv` (all must
-  compile), then play and compare. In order:
-  1. **NaN behaviour (user: top priority, NaN has odd effects and kills frame rates).** GLSL leaves these undefined
-     for NaN; Maxwell defines them:
-     - `.SAT` (FADD / FMUL / FFMA / F2F, ~29.8k insts, >= 3,329 shaders, e.g. `0018bfd302e99e01`) is emitted as
-       `clamp(x, 0, 1)`; hardware gives 0 for NaN. Fix: a helper `sat(x) = x > 0.0 ? min(x, 1.0) : 0.0`.
-     - FMNMX (~54k insts) as GLSL min / max; hardware returns the non-NaN operand. Fix: pick explicitly
-       (`isnan(a) ? b : isnan(b) ? a : min(a, b)`) or SPIR-V NMin / NMax.
-     - F2I.F32 -> I32 of NaN: we give 0, hardware 0x80000000 (signed and unsigned I32; ~52k F2Is).
-     - .FTZ (on nearly every float op) is ignored: denormals are whatever the driver does. Request flush-to-zero
-       (SPIR-V float controls, VK_KHR_shader_float_controls DenormFlushToZero, where the device supports it).
-  2. **I2I.CC never sets the flags** (2,518 insts, 688 shaders, mostly vertex: `001a5366c9f47183` @0x1c48,
-     `0031621ba50b10c9`, `004c664a728e3217`). The game tests "Rx != 0" with `I2I.U32.U32 RZ.CC, Rx` then
-     `CSETP.NE`; `cc_z` stays false, so those tests are always true. Fix in op_I2I when bit 47 is set: cc_z =
-     result == 0, cc_s = sign bit, cc_c = cc_o = false.
-  3. **TLD4S coordinates without AOFFI / DC** read (Ra, Ra+1); hardware takes y from Rb (Ra+1 only in the AOFFI or
-     DC forms). 720 insts in 165 shaders, wrong y in 61 (599 insts) where Rb != Ra+1: `06cc7dfada4ef793` @0x758,
-     `0b88f93a2f1aa383`, `0c7b7167c9fd986e`. Fix: `vec2(F(Ra), F(Rb))` when neither is set.
-  4. **TXQ of integer textures returns 1x1x1, 1 level** (probable: depends on run-time formats). gpu.c `tex_write`
-     puts UINT / SINT / stencil textures only in ut2d / ut2da (t2da gets the 1x1 dummy) and translate.py's txq()
-     reads t2da / t3d without checking INT_FLAG (bit 19). 1,056 shaders TXQ a handle they then TLDS, e.g.
-     `00499a2334820880` (TXQ 0xd30, TLDS 0xf30, slot 0x42: the terrain material map). Fix: size through ut2da when
-     INT_FLAG is set.
-  5. **IADD3.RS loses the carry** of a + b (GLSLC's XMAD high multiply, umulhi): 263 insts in 28 shaders
-     (`08244fd8faa27fe4` @0xf0, hash constants like 0xe2c4a689): high word 0x10000 too small. Fix: `s = a + b;
-     (s >> 16) + (s < a ? 0x10000u : 0u) + c`.
-  6. **STS / LDS (shared memory) missing**: compute `649613193167ca03` (32x1x1) is the one shader that does not
-     translate (STS 0x5d0 / 0x5e8, LDS 0x2990 / 0x2a30, B32 per-thread scratch, no BAR). Size: GLSLC control word
-     at 0x754 (after the workgroup size at 0x748; 384 here, 0 in the other 27 compute shaders). Declare `shared
-     uint smem[size / 4]`; address = Ra + sign-extended bits 20-43 (unsigned 24-bit when Ra is RZ); sizes as
-     LDL / STL (8 / 16-bit by extract / insert); LDS bit 44 (.U) can be ignored.
-  7. **TMML** (171 insts, 129 shaders, all mask .y, e.g. `03f3086af9ed989e` @0x78) emits `uint(v_[1] * 256.0)`:
-     textureQueryLod's .y is negative under magnification and float -> uint of a negative is undefined. Fix:
-     `uint(int(...))` (check whether hardware clamps at 0).
+- **Translator scan (2026-11-04).** Four read-only subagents compared translate.py with the hardware (Eden's
+  shader_recompiler as the behaviour reference) and counted uses in the 6,009 dumped shaders. Clean: stage I/O (IPA
+  modes / sat, vertex and instance ids, layer, depth output, S2R), MUFU, .FMZ (never used: every FMUL / FFMA is
+  .FTZ), TEXS encodings, LDG / STG, ATOM, SUST / SURED. After any fix: `translate.py --spv` (all must compile),
+  then play and compare.
+  **Fixed (2026-11-04, nxrecomp to its next commit; all 6,009 translate and compile; user-played, no new issues,
+  "looks way better": a tower that was flat grey now shows bricks, likely the TXQ fix):**
+  1. NaN: `.SAT` -> `sat()` (0 for NaN; also IPA / MUFU / F2F / HADD2), FMNMX -> `nmin` / `nmax` (the operand
+     that is not NaN), F2I to 32 bits gives 0x80000000 for NaN (as Eden). Every shader declares DenormFlushToZero
+     32 and SignedZeroInfNanPreserve 32 (GL_EXT_spirv_intrinsics execution modes; vk.c logs a device without
+     them). The last can cost speed: the driver may not fold x * 0 and the like.
+  2. I2I.CC sets cc_z / cc_s (c, o clear). 3. TLD4S without AOFFI / DC takes y from Rb. 4. txq() sizes integer
+     textures (INT_FLAG) through ut2da. 5. IADD3.RS adds the carry of a + b (Eden's 33-bit edge case).
+  6. STS / LDS: `shared uint smem[]` sized from control 0x754, out of range reads 0 / writes dropped; 8 / 16-bit
+     sizes by extract / insert. `649613193167ca03` translates now. 7. TMML: `uint(max(lod * 256, 0))` (the game
+     converts it with I2F.U32, so taken as clamped at 0; Eden drops the fraction).
+  9. FMUL.RZ -> `fmul_rz` (fma error term, one ulp toward 0; overflow to the largest finite), I2F.RZ of 32-bit
+     integers keeps the top 24 significant bits (`i2f_rz`). Checked in Python against exact rounding (200k cases).
+  Left:
   8. Not taken yet, measure first (costs speed): no `precise` on FADD / FMUL, so the driver may fuse a multiply
      and an add the console rounds apart (positions shared between passes may differ: z-fighting, EQUAL depth
      tests). Eden marks them NoContraction (Next, shader quality item e).
-  9. **Round toward zero ignored** (user: do it, it can be slow too): FMUL.RZ (bits 39-40; 5,526 insts, 708
-     shaders, e.g. `001a5366c9f47183` @0x17a8) and I2F.U32.RZ (3,648 insts, ~693 shaders) round to nearest. Almost
-     all are GLSLC's integer division (I2F.RZ, MUFU.RCP, -2 ulp, FMUL.RZ, F2I.TRUNC, then a +1 correction):
-     round-to-nearest can make the first quotient one too high, which the correction cannot undo. Simulated: no
-     error below 2^24, ~2 in 4M for 32-bit dividends. Fix: FMUL.RZ as `p = a * b; e = fma(a, b, -p)`, then step
-     p one ulp toward 0 when e has the opposite sign; I2F.RZ truncates above 2^24.
   - Latent (wrong, unused in the dump): HSETP2 immediate / cbuf compare-op bits (49-52, H_AND 53), HSETP2 H_AND
     with XOR, F2F f16 rounding modes, I2F.U32.NEG >= 2^31, FMUL scale 7 (KeyError), PSETP second destination,
     ISCADD .PO, SHFL UP / IDX lane masks, BFE.S offset >= 32, MOV lane mask, IPA centroid / offset sample modes,
@@ -222,7 +198,11 @@ a second backend next to the room. Not started: needs the adapter.
     and LDC out-of-bounds behaviour. Raised as Unsupported (fail loudly): IMAD, IMUL, PRMT, SHF, P2R, CSET, the
     double and most f16 ops, TLD4 PTP, multisample TLDS. Scripts and counts: the session scratchpad (not kept).
 - Open (seen 2026-11-04): the player portrait is still black (raid member list, map marker; F12 frames 20213 and
-  20728 in `build/frames`); no rain drawn while the weather says rain (needs an F12 capture in rain).
+  20728 in `build/frames`). Rain: splashes on the ground, rain sheets in the distance and wet surfaces show, but
+  no streaks fall near the camera (needs an F12 capture in rain, camera in the open). Text with letters missing,
+  different ones by position ("Mareep" as " a eep", the link code prompt "   er a co  "), seen before the
+  translator fixes too, then not again: suspect the game's run-time glyph atlas (an upload / copy lost or late);
+  F12 while it shows.
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
