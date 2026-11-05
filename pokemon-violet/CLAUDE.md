@@ -203,6 +203,12 @@ a second backend next to the room. Not started: needs the adapter.
   different ones by position ("Mareep" as " a eep", the link code prompt "   er a co  "), seen before the
   translator fixes too, then not again: suspect the game's run-time glyph atlas (an upload / copy lost or late);
   F12 while it shows.
+- **Effects freeze above ~60 fps** (seen 2026-11-04 in bench.ps1 runs, NX_NOPACE ~200 fps; fine at 30 and 60):
+  raid den beacons and item ball pillars stand still, and objects loading in keep a rainbow fade-in look (rocks,
+  the den's base). A capture's long frame makes the beacon jump ahead, so effect time advances by frame time in
+  whole steps (likely floor(dt * 60), the remainder dropped). Uncapped benchmarks therefore don't animate
+  effects (small workload difference). To fix for frame rates above 60: find the step in the effect update and
+  patch it to carry the remainder. Not started.
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
