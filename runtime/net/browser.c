@@ -6,6 +6,7 @@
  * Settings (nickname, filters, last direct address) persist in <save dir>/netplay.ini. */
 #include "net.h"
 #include "game_config.h"
+#include "../nca.h"
 #include <stdlib.h>
 #include <process.h>
 #include <windows.h>
@@ -545,6 +546,13 @@ static void nacp_version(const char *game_dir, char *out, size_t n) {
     char path[1100];
     snprintf(path, sizeof path, "%s/control/control.nacp", game_dir);
     out[0] = 0;
+    if (nx_from_nsp()) {                            /* from the user's NSPs (nca.c) */
+        u64 sz;
+        char *nacp = nx_game_control_file("control.nacp", &sz);
+        if (nacp && sz >= 0x3070) snprintf(out, n, "%.15s", nacp + 0x3060);
+        free(nacp);
+        return;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) return;
     char v[0x10] = {0};

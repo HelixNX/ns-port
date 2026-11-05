@@ -12,6 +12,7 @@
 #include "vk.h"
 #include "audio_dsp.h"
 #include "game_config.h"
+#include "nca.h"
 #ifdef NX_NETPLAY
 #include "net/net.h"
 #endif
@@ -85,16 +86,87 @@ static void exe_relative(char *out, size_t n, const char *rel) {
     snprintf(out, n, "%s\\%s", exe, rel);
 }
 
+/* Where things live. A development build keeps everything in the build folder (the executable's parent): module
+ * images, shaders, pipeline caches, saves. A packaged build (NX_PACKAGE) is one folder for players: the game's
+ * files in game\ next to the executable, the shader translator in translator\, and everything the game writes
+ * under %LOCALAPPDATA%\<title>\ (save\, cache\, log.txt) */
+static char cache_dir[1024], data_dir[1024];
+const char *nx_cache_dir(void) { return cache_dir; }
+const char *nx_data_dir(void) { return data_dir; }
+static bool from_nsp;                                   /* the game is read from the user's NSPs (nca.c) */
+bool nx_from_nsp(void) { return from_nsp; }
+
+static void make_dirs(const char *path) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s", path);
+    for (char *s = p + 3; *s; s++)
+        if (*s == '\\' || *s == '/') { char c = *s; *s = 0; CreateDirectoryA(p, NULL); *s = c; }
+    CreateDirectoryA(p, NULL);
+}
+
+static void paths_init(void) {
+#ifdef NX_PACKAGE
+    const char *la = getenv("LOCALAPPDATA");
+    snprintf(data_dir, sizeof data_dir, "%s\\%s", la ? la : ".", NX_TITLE);
+    snprintf(cache_dir, sizeof cache_dir, "%s\\cache", data_dir);
+    snprintf(save_dir, sizeof save_dir, "%s\\save", data_dir);
+    snprintf(image_dir, sizeof image_dir, "%s\\image", cache_dir);
+    exe_relative(game_dir, sizeof game_dir, "game");
+    make_dirs(cache_dir);
+    char log[1100];                                     /* no console: the log goes to a file */
+    snprintf(log, sizeof log, "%s\\log.txt", data_dir);
+    freopen(log, "w", stderr);
+    setvbuf(stderr, NULL, _IONBF, 0);
+#else
+    exe_relative(game_dir, sizeof game_dir, NX_GAME_DIR);
+    exe_relative(image_dir, sizeof image_dir, "..\\image");
+    exe_relative(save_dir, sizeof save_dir, "..\\save");
+    exe_relative(cache_dir, sizeof cache_dir, "..");
+    exe_relative(data_dir, sizeof data_dir, "..");
+#endif
+}
+
+/* the game from NSPs: open them, and build the module images once (into the cache); a problem is shown to the
+ * player and ends the program */
+static void nsp_open(void) {
+    if (!nx_game_present(game_dir)) {
+#ifdef NX_PACKAGE
+        char msg[1400];
+        snprintf(msg, sizeof msg, "Put your own %s files in\n%s\n\nSee README.txt.", NX_TITLE, game_dir);
+        MessageBoxA(NULL, msg, NX_TITLE, MB_ICONINFORMATION);
+        exit(1);
+#endif
+        return;                                         /* a development build: the extracted dump */
+    }
+    char err[1024];
+    from_nsp = true;
+    if (!nx_game_open(game_dir, err, sizeof err) || (make_dirs(image_dir), !image_build(image_dir, err, sizeof err))) {
+        hlog(0, "%s", err);
+        MessageBoxA(NULL, err, NX_TITLE, MB_ICONERROR);
+        exit(1);
+    }
+}
+
 typedef struct Npdm { u8 prio, core; u32 stack_size, system_resource_size; } Npdm;
 
 static Npdm read_npdm(void) {
     char path[1100];
     snprintf(path, sizeof path, "%s/exefs/main.npdm", game_dir);
-    FILE *f = fopen(path, "rb");
-    if (!f) fatal("cannot open %s", path);
     u8 meta[0x80];
-    if (fread(meta, 1, sizeof meta, f) != sizeof meta || memcmp(meta, "META", 4)) fatal("%s: not an NPDM", path);
-    fclose(f);
+    if (from_nsp) {
+        u64 n;
+        u8 *p = nx_game_exefs_file("main.npdm", &n);
+        if (!p || n < sizeof meta) fatal("the game's ExeFS has no main.npdm");
+        memcpy(meta, p, sizeof meta);
+        free(p);
+        snprintf(path, sizeof path, "main.npdm");
+    } else {
+        FILE *f = fopen(path, "rb");
+        if (!f) fatal("cannot open %s", path);
+        if (fread(meta, 1, sizeof meta, f) != sizeof meta) memset(meta, 0, sizeof meta);
+        fclose(f);
+    }
+    if (memcmp(meta, "META", 4)) fatal("%s: not an NPDM", path);
     Npdm n = {meta[0xe], meta[0xf], 0};
     memcpy(&n.stack_size, meta + 0x1c, 4);
     memcpy(&n.system_resource_size, meta + 0x14, 4);
@@ -102,9 +174,7 @@ static Npdm read_npdm(void) {
 }
 
 int main(int argc, char **argv) {
-    exe_relative(game_dir, sizeof game_dir, NX_GAME_DIR);
-    exe_relative(image_dir, sizeof image_dir, "..\\image");
-    exe_relative(save_dir, sizeof save_dir, "..\\save");
+    paths_init();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game") && i + 1 < argc) snprintf(game_dir, sizeof game_dir, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) snprintf(image_dir, sizeof image_dir, "%s", argv[++i]);
@@ -114,6 +184,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: " NX_NAME " [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
+    nsp_open();
 #ifdef NX_NETPLAY
     netplay_startup(save_dir, game_dir);                /* the room browser, before anything else opens */
 #endif

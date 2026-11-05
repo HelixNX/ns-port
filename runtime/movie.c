@@ -26,7 +26,7 @@
 #define ST_AGAIN 0x5003u
 #define FLAG_EOS 4u
 
-const char *fs_romfs_dir(void);
+bool fs_host_file(const char *rel, char *out, size_t n);   /* services/fs.c */
 
 static const char *const extractor_names[18] = {0, 0, "~Extractor", "~Extractor (delete)", "SetDataSource(path)",
     "SetDataSource(data, size)", "GetTrackCount", "GetTrackConfiguration", "SelectTrack", "UnselectTrack", "SeekTo",
@@ -491,7 +491,7 @@ static void extractor_call(Ctx *c, int slot, Stream *s) {
         const char *rel = strstr(p, ":/");
         rel = rel ? rel + 2 : p;
         char host[1400];
-        snprintf(host, sizeof host, "%s/%s", fs_romfs_dir(), rel);
+        if (!fs_host_file(rel, host, sizeof host)) hlog(0, "movie: %s is not in the RomFS", rel);
         mp4_probe(s, host);
         Video *v = video_open(host);
         if (v) current_video = v;       /* earlier movies' readers stay open (decoders may hold them) */

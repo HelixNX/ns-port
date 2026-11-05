@@ -6,8 +6,12 @@
 #include <stdlib.h>
 #include <windows.h>
 
+#include "../nca.h"
+
 typedef struct RomFs RomFs;
 RomFs *romfs_open(const char *dir);
+RomFs *romfs_from_storage(NxStorage *st);
+NxStorage *romfs_storage(RomFs *fs);
 u64 romfs_size(RomFs *fs);
 bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size);
 
@@ -307,10 +311,14 @@ static RomFs *open_sysdata(u64 id) {
     for (int i = 0; i < nsysdata; i++)
         if (sysdata_ids[i] == id) return sysdata[i];
     char dir[1100];
+    RomFs *fs = NULL;
+    /* from NSPs: add-on content (the DLC's NSP) or system data (the user's firmware) with that id */
+    if (nx_from_nsp() && (fs = romfs_from_storage(nx_data_romfs(id))) != NULL)
+        hlog(1, "fs: data %016llx from the NSPs / firmware", id);
     /* add-on content: the DLC's data extracted to <dump>/aoc/<data id>/ */
     snprintf(dir, sizeof dir, "%s/%016llx", aoc_root, id);
-    RomFs *fs = GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES ? romfs_open(dir) : NULL;
-    if (fs) hlog(1, "fs: add-on content %016llx from %s", id, dir);
+    if (!fs && GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES && (fs = romfs_open(dir)) != NULL)
+        hlog(1, "fs: add-on content %016llx from %s", id, dir);
     if (!fs) {
         snprintf(dir, sizeof dir, "%s/%016llx", sysdata_root, id);
         fs = romfs_open(dir);
@@ -373,14 +381,45 @@ static const Iface iface_fsp = {"fsp-srv", (const IpcCmd[]){
 static SvcObj *open_fsp(const char *name) { return svcobj_new(&iface_fsp, NULL, name); }
 
 static char romfs_dir[1100];
-const char *fs_romfs_dir(void) { return romfs_dir; }      /* the host folder behind the game's RomFS (movie.c) */
+
+/* a host path for a file of the game's RomFS (movie.c: Media Foundation reads files): the dump's file, or from
+ * NSPs a copy in the cache (romfs\<path>), made the first time */
+bool fs_host_file(const char *rel, char *out, size_t n) {
+    if (!nx_from_nsp()) { snprintf(out, n, "%s/%s", romfs_dir, rel); return true; }
+    snprintf(out, n, "%s\\romfs\\%s", nx_cache_dir(), rel);
+    for (char *p = out; *p; p++) if (*p == '/') *p = '\\';
+    u64 off, size;
+    char path[1100];
+    snprintf(path, sizeof path, "/%s", rel);
+    if (!nx_romfs_find(romfs_storage(game_romfs), path, &off, &size)) return false;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesExA(out, GetFileExInfoStandard, &a) && ((u64)a.nFileSizeHigh << 32 | a.nFileSizeLow) == size)
+        return true;
+    for (char *p = out + 3; *p; p++)
+        if (*p == '\\') { *p = 0; CreateDirectoryA(out, NULL); *p = '\\'; }
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s.tmp", out);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return false;
+    u8 *buf = malloc(1 << 20);
+    for (u64 d = 0; d < size;) {
+        u64 m = size - d < (1 << 20) ? size - d : (1 << 20);
+        romfs_read(game_romfs, off + d, buf, m);
+        fwrite(buf, 1, m, f);
+        d += m;
+    }
+    free(buf);
+    fclose(f);
+    hlog(1, "fs: %s copied to the cache for playback (%llu MB)", rel, size >> 20);
+    return MoveFileExA(tmp, out, MOVEFILE_REPLACE_EXISTING) != 0;
+}
 
 void fs_register(const char *game_dir, const char *save_dir) {
     snprintf(romfs_dir, sizeof romfs_dir, "%s/romfs", game_dir);
     snprintf(save_root, sizeof save_root, "%s", save_dir);
     snprintf(sysdata_root, sizeof sysdata_root, "%s/../sysdata", save_dir);
     snprintf(aoc_root, sizeof aoc_root, "%s/aoc", game_dir);
-    game_romfs = romfs_open(romfs_dir);
+    game_romfs = nx_from_nsp() ? romfs_from_storage(nx_game_romfs()) : romfs_open(romfs_dir);
     if (!game_romfs) hlog(0, "fs: no RomFS at %s", romfs_dir);
     service_register("fsp-srv", open_fsp);
 }

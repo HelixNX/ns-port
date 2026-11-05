@@ -737,11 +737,7 @@ static char shader_dir[MAX_PATH];
 
 static void shader_dump(const ShaderCode *s, const void *control) {
     if (!shader_dir[0]) {
-        char exe[MAX_PATH];
-        GetModuleFileNameA(NULL, exe, sizeof exe);
-        char *slash = strrchr(exe, '\\');
-        if (slash) *slash = 0;
-        snprintf(shader_dir, sizeof shader_dir, "%s\\..\\shaders", exe);
+        snprintf(shader_dir, sizeof shader_dir, "%s\\shaders", nx_cache_dir());
         CreateDirectoryA(shader_dir, NULL);
     }
     char path[MAX_PATH + 32];

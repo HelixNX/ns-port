@@ -7,6 +7,7 @@
  * Layout: header (0x50) | directory hash table | directory entries | file hash table | file entries |
  *         (aligned to 0x200) file data, each file aligned to 0x10. */
 #include "hos.h"
+#include "nca.h"
 #include <stdlib.h>
 #include <windows.h>
 
@@ -17,7 +18,19 @@ typedef struct RomFs {
     u64 meta_size, data_offset, total_size;
     RomFile *files;
     int nfiles, capfiles;
+    NxStorage *st;                              /* the real image, from an NCA (nca.c): read as it is */
 } RomFs;
+
+/* a RomFS image read straight from an NCA section */
+RomFs *romfs_from_storage(NxStorage *st) {
+    if (!st) return NULL;
+    RomFs *fs = calloc(1, sizeof *fs);
+    fs->st = st;
+    fs->total_size = nx_storage_size(st);
+    return fs;
+}
+
+NxStorage *romfs_storage(RomFs *fs) { return fs ? fs->st : NULL; }
 static RomFs *B;                                /* the image being built (start-up, one at a time) */
 static SRWLOCK open_lock = SRWLOCK_INIT;
 
@@ -244,6 +257,7 @@ static HANDLE file_handle(RomFile *f) {
 bool romfs_read(RomFs *fs, u64 off, void *dst, u64 size) {
     u8 *out = dst;
     if (off + size > fs->total_size || off + size < off) return false;
+    if (fs->st) return nx_storage_read(fs->st, off, dst, size);
     while (size) {
         if (off < fs->data_offset) {                     /* tables, and the padding after them */
             u64 n = fs->data_offset - off < size ? fs->data_offset - off : size;

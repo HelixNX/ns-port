@@ -207,6 +207,7 @@ static void prof_report(u64 frames) {
 
 /* the render thread's time per frame in our code, for the report every 600 frames */
 static double t_submit_ms, t_present_ms, t_wait_ms;
+static const char *frames_dir(void);
 
 /* NX_HITCH_MS=<ms>: each frame longer than that (present to present) is logged with where the render thread's time
  * went in it (gpu_present), to tell which work makes the frame-time spikes */
@@ -1251,13 +1252,8 @@ static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
             astc_decode(blocks, lv->w, lv->h, L->bw, L->bh, srgb, dst + layer * lsize, w, h);
             static int dumped;
             if (l == 0 && layer == 0 && env.dump_astc && dumped < 40) {
-                char path[MAX_PATH], exe[MAX_PATH];
-                GetModuleFileNameA(NULL, exe, sizeof exe);
-                char *slash = strrchr(exe, '\\');
-                if (slash) *slash = 0;
-                snprintf(path, sizeof path, "%s\\..\\frames", exe);
-                CreateDirectoryA(path, NULL);
-                snprintf(path, sizeof path, "%s\\..\\frames\\astc_%02d_%ux%u_f%u.pam", exe, dumped++, w, h,
+                char path[MAX_PATH];
+                snprintf(path, sizeof path, "%s\\astc_%02d_%ux%u_f%u.pam", frames_dir(), dumped++, w, h,
                          im->info.format);
                 FILE *f = fopen(path, "wb");
                 if (f) {
@@ -1975,11 +1971,35 @@ static SRWLOCK pcache_lock = SRWLOCK_INIT;
 
 /* a file in the build folder (the executable's parent folder) */
 static void build_file(char *path, size_t size, const char *name) {
+    snprintf(path, size, "%s\\%s", nx_cache_dir(), name);
+}
+
+/* F12 captures and other image dumps: build\frames, or in a package %LOCALAPPDATA%\<title>\dumps (made on use) */
+static const char *frames_dir(void) {
+    static char dir[MAX_PATH];
+    if (!dir[0]) {
+#ifdef NX_PACKAGE
+        snprintf(dir, sizeof dir, "%s\\dumps", nx_data_dir());
+#else
+        snprintf(dir, sizeof dir, "%s\\frames", nx_data_dir());
+#endif
+    }
+    CreateDirectoryA(dir, NULL);
+    return dir;
+}
+
+/* the shader translator: tools/shader/translate.py in a development build; in a package (NX_PACKAGE) its copy in
+ * translator\ next to the executable, run by the Python there (translator\python\python.exe) */
+static void translator_path(char *out, size_t n) {
+#ifdef NX_PACKAGE
     char exe[MAX_PATH];
     GetModuleFileNameA(NULL, exe, sizeof exe);
     char *slash = strrchr(exe, '\\');
     if (slash) *slash = 0;
-    snprintf(path, size, "%s\\..\\%s", exe, name);
+    snprintf(out, n, "%s\\translator\\translate.py", exe);
+#else
+    snprintf(out, n, "%s/tools/shader/translate.py", NX_ROOT);
+#endif
 }
 
 static void pcache_load(void) {
@@ -2463,15 +2483,14 @@ static char spv_dir[MAX_PATH];
 
 static void spv_path(char *path, size_t size, u64 hash) {
     if (!spv_dir[0]) {
-        char exe[MAX_PATH];
-        GetModuleFileNameA(NULL, exe, sizeof exe);
-        char *slash = strrchr(exe, '\\');
-        if (slash) *slash = 0;
-        snprintf(spv_dir, sizeof spv_dir, "%s\\..\\shaders\\spv", exe);
+        snprintf(spv_dir, sizeof spv_dir, "%s\\shaders", nx_cache_dir());
+        CreateDirectoryA(spv_dir, NULL);
+        strcat(spv_dir, "\\spv");
+        CreateDirectoryA(spv_dir, NULL);
         /* translations live in a folder per translator version (FNV-1a of translate.py, as translate.py names it):
          * after a translator change every shader is translated again, nothing stale is used */
         char tp[MAX_PATH];
-        snprintf(tp, sizeof tp, "%s/tools/shader/translate.py", NX_ROOT);
+        translator_path(tp, sizeof tp);
         FILE *f = fopen(tp, "rb");
         if (f) {
             u32 h = 2166136261u;
@@ -2496,12 +2515,54 @@ static void spv_path(char *path, size_t size, u64 hash) {
 static struct { u64 *q; u32 *qm, n, cap; u64 seq; SRWLOCK lock; HANDLE wake; } jit = {.lock = SRWLOCK_INIT};
 static volatile u64 jit_done;          /* the last request a finished batch covered */
 
+static volatile u64 jit_last_request_ms;   /* GetTickCount64 of the last request */
+
+/* the translator's progress through the current burst of requests (vk.c: "COMPILING SHADERS done/total"); false
+ * when it has nothing to do */
+bool gpu_shader_progress(u32 *done, u32 *total) {
+    static u64 base;                    /* jit.seq when the burst began */
+    u64 seq = __atomic_load_n(&jit.seq, __ATOMIC_ACQUIRE), fin = __atomic_load_n(&jit_done, __ATOMIC_ACQUIRE);
+    if (fin >= seq) { base = seq; return false; }
+    if (base > fin) base = fin;
+    *done = (u32)(fin - base);
+    *total = (u32)(seq - base);
+    return true;
+}
+
+/* the start-up's shaders: true until the translator first has nothing to do and nothing new came for 2 s (input is
+ * held until then: the first start draws little while thousands are translated); false for good after that */
+bool gpu_shaders_starting(void) {
+    static volatile bool over;
+    static u64 t0;
+    if (over) return false;
+    u64 now = GetTickCount64();
+    if (!t0) t0 = now;
+    u64 last = jit_last_request_ms ? jit_last_request_ms : t0;
+    if (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&jit.seq, __ATOMIC_ACQUIRE) && now - last > 2000)
+        over = true;
+    return !over;
+}
+
 static unsigned __stdcall jit_thread(void *p) {
     char dir[MAX_PATH];
     snprintf(dir, sizeof dir, "%s", spv_dir);
     char *slash = strstr(dir, "\\spv");                   /* the shader dir: above spv\<version> */
     if (slash) *slash = 0;
     const char *py = getenv("NX_PYTHON") ? getenv("NX_PYTHON") : "python";
+    char tp[MAX_PATH];
+    translator_path(tp, sizeof tp);
+#ifdef NX_PACKAGE
+    char pkpy[MAX_PATH];                                  /* the package's own Python, next to translate.py */
+    snprintf(pkpy, sizeof pkpy, "%s", tp);
+    char *ts = strrchr(pkpy, '\\');
+    if (ts) snprintf(ts, sizeof pkpy - (size_t)(ts - pkpy), "\\python\\python.exe");
+    if (!getenv("NX_PYTHON")) py = pkpy;
+    /* translate.py takes glslang from %VULKAN_SDK%\Bin\glslangValidator.exe: the package's copy, translator\Bin\ */
+    char sdk[MAX_PATH];
+    snprintf(sdk, sizeof sdk, "%s", tp);
+    if ((ts = strrchr(sdk, '\\')) != NULL) *ts = 0;
+    SetEnvironmentVariableA("VULKAN_SDK", sdk);
+#endif
     for (;;) {
         WaitForSingleObject(jit.wake, INFINITE);
         AcquireSRWLockExclusive(&jit.lock);
@@ -2521,10 +2582,9 @@ static unsigned __stdcall jit_thread(void *p) {
                 if (ms[i]) fprintf(lf, "%016llx:%08x\n", hs[i], ms[i]);
                 else fprintf(lf, "%016llx\n", hs[i]);
             if (lf) fclose(lf);
-            size_t len = strlen(py) + strlen(NX_ROOT) + 3 * strlen(dir) + 128;
+            size_t len = strlen(py) + strlen(tp) + 3 * strlen(dir) + 128;
             char *cmd = malloc(len);
-            snprintf(cmd, len, "\"%s\" \"%s/tools/shader/translate.py\" --spv \"--only=@%s\" \"%s\" \"%s\\glsl\"", py,
-                     NX_ROOT, list, dir, dir);
+            snprintf(cmd, len, "\"%s\" \"%s\" --spv \"--only=@%s\" \"%s\" \"%s\\glsl\"", py, tp, list, dir, dir);
             u64 t0 = GetTickCount64();
             /* its output through a pipe of our own (_popen needs the CRT's stdin/stdout, which may not be there) */
             SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
@@ -2618,6 +2678,7 @@ static u64 jit_request_variant(u64 hash, u32 mask) {
     jit.qm[jit.n] = mask;
     jit.q[jit.n++] = hash;
     u64 seq = ++jit.seq;
+    jit_last_request_ms = GetTickCount64();
     ReleaseSRWLockExclusive(&jit.lock);
     SetEvent(jit.wake);
     return seq;
@@ -4894,22 +4955,18 @@ static void dump_image_as(Image *im, const char *name, bool raw, VkFormat fmt) {
     vkCmdCopyImageToBuffer(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, b.buf, 1, &r);
     flush();
     gpu_wait(submitted, UINT64_MAX);
-    char path[MAX_PATH], exe[MAX_PATH];
-    GetModuleFileNameA(NULL, exe, sizeof exe);
-    char *slash = strrchr(exe, '\\');
-    if (slash) *slash = 0;
-    snprintf(path, sizeof path, "%s\\..\\frames", exe);
-    CreateDirectoryA(path, NULL);
+    char path[MAX_PATH];
+    const char *dir = frames_dir();
     if (im->format == VK_FORMAT_R32G32B32A32_SFLOAT && w * h <= 4) {       /* tiny float targets (exposure): logged */
         const float *v = (const float *)b.a.map;
         for (u32 i = 0; i < w * h; i++) hlog(0, "gpu: %s texel %u = %g %g %g %g", name, i, v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
     }
     if (raw) {
-        snprintf(path, sizeof path, "%s\\..\\frames\\%s.raw", exe, name);  /* float targets: exact values too */
+        snprintf(path, sizeof path, "%s\\%s.raw", dir, name);              /* float targets: exact values too */
         FILE *rf = fopen(path, "wb");
         if (rf) { fwrite(b.a.map, 1, (size_t)w * h * bpp, rf); fclose(rf); }
     }
-    snprintf(path, sizeof path, "%s\\..\\frames\\%s.ppm", exe, name);
+    snprintf(path, sizeof path, "%s\\%s.ppm", dir, name);
     FILE *f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%u %u\n255\n", w, h);
@@ -4951,7 +5008,7 @@ static void dump_frame(Image *win, u64 frame) {
         snprintf(name, sizeof name, "frame_%llu", frame);
         dump_image(win, name, true);
     }
-    hlog(1, "gpu: frame %llu and %d render targets written to build/frames", frame, n);
+    hlog(1, "gpu: frame %llu and %d render targets written to %s", frame, n, frames_dir());
 }
 
 /* textures the CPU rewrote since the last frame (write watch over the GPU-visible pools): upload them again */
@@ -5277,7 +5334,7 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     dump_frame(im, frame_no + 1);
     if (InterlockedExchange(&capture_request, 0)) {
         capture_frame = frame_no + 2;
-        hlog(0, "gpu: F12: frame %llu is traced and dumped to build/frames", capture_frame);
+        hlog(0, "gpu: F12: frame %llu is traced and dumped to %s", capture_frame, frames_dir());
     }
     u64 frames = ++frame_no;
     if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",

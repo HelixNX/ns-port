@@ -107,6 +107,7 @@ void vk_buffer_free(VkBuf *b);
 /* window: created on the host's main thread, which then runs window_loop until the guest exits */
 void window_init(void);
 void window_loop(void *guest_main_thread);
+bool gpu_shaders_starting(void);    /* gpu.c: the start-up's shaders are still being translated (input held) */
 void vk_init(void);
 
 /* swapchain: present `src` (in GENERAL layout, the region given) scaled into the window. Called by the

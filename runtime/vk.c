@@ -13,6 +13,10 @@
 #include <initguid.h>
 #include <devpkey.h>
 #include <pciprop.h>
+#include <wincodec.h>
+#include "nca.h"
+
+#pragma comment(lib, "windowscodecs.lib")
 
 #define VK_DEFINE(f) PFN_##f f;
 VK_GLOBAL_FNS(VK_DEFINE)
@@ -35,11 +39,47 @@ void overlay_toggle(void);
 static volatile LONG resized;
 
 /* ---------------------------------------------------------------------------------------------- window */
+/* the game's own icon (its control data, from the user's NSPs: a JPEG) as the window's, decoded by WIC */
+static void window_icon(void) {
+    if (!nx_from_nsp()) return;
+    u64 size;
+    void *jpg = nx_game_control_file("icon_AmericanEnglish.dat", &size);
+    if (!jpg) return;
+    IWICImagingFactory *wic = NULL;
+    IWICStream *st = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *cv = NULL;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    UINT w = 0, h = 0;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&wic)) &&
+        SUCCEEDED(wic->lpVtbl->CreateStream(wic, &st)) &&
+        SUCCEEDED(st->lpVtbl->InitializeFromMemory(st, jpg, (DWORD)size)) &&
+        SUCCEEDED(wic->lpVtbl->CreateDecoderFromStream(wic, (IStream *)st, NULL, WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->lpVtbl->GetFrame(dec, 0, &fr)) &&
+        SUCCEEDED(wic->lpVtbl->CreateFormatConverter(wic, &cv)) &&
+        SUCCEEDED(cv->lpVtbl->Initialize(cv, (IWICBitmapSource *)fr, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
+                                         NULL, 0, WICBitmapPaletteTypeCustom)) &&
+        SUCCEEDED(cv->lpVtbl->GetSize(cv, &w, &h)) && w && h) {
+        SDL_Surface *s = SDL_CreateSurface((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888);     /* bytes R, G, B, A */
+        if (s && SUCCEEDED(cv->lpVtbl->CopyPixels(cv, NULL, (UINT)s->pitch, (UINT)(s->pitch * h), s->pixels)))
+            SDL_SetWindowIcon(window, s);
+        if (s) SDL_DestroySurface(s);
+    }
+    if (cv) cv->lpVtbl->Release(cv);
+    if (fr) fr->lpVtbl->Release(fr);
+    if (dec) dec->lpVtbl->Release(dec);
+    if (st) st->lpVtbl->Release(st);
+    if (wic) wic->lpVtbl->Release(wic);
+    free(jpg);
+}
+
 void window_init(void) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) fatal("SDL_Init: %s", SDL_GetError());
     if (!SDL_Vulkan_LoadLibrary(NULL)) fatal("no Vulkan: %s", SDL_GetError());
     window = SDL_CreateWindow(NX_TITLE, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) fatal("SDL_CreateWindow: %s", SDL_GetError());
+    window_icon();
 }
 
 /* the host's main thread: window events until the guest's main thread ends or the window is closed */
@@ -48,6 +88,9 @@ void window_loop(void *guest_main_thread) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 8)) {
             do {
+#ifdef NX_PACKAGE                                       /* no input while the start-up's shaders are translated */
+                if (!gpu_shaders_starting())
+#endif
                 input_event(&e);
                 if (e.type == SDL_EVENT_QUIT) {
                     hlog(1, "window closed");
@@ -56,12 +99,18 @@ void window_loop(void *guest_main_thread) {
                     ExitProcess(0);
                 }
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
+                /* F12: a capture of the next frame (players send it with log.txt when something looks wrong) */
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
+#ifndef NX_PACKAGE                                      /* developer keys: not in a package for players */
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F11 && !e.key.repeat) gpu_reload_textures();
-                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F5 && !e.key.repeat) nx_framerate_cycle();
+#endif
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
             } while (SDL_PollEvent(&e));
         }
+#ifdef NX_PACKAGE
+        if (!gpu_shaders_starting())
+#endif
         input_poll();
         if (WaitForSingleObject((HANDLE)guest_main_thread, 0) == WAIT_OBJECT_0) return;
     }
@@ -784,6 +833,7 @@ static const struct { char c; u8 rows[7]; } glyphs[] = {
     {'Z', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f}}, {'E', {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}},
     {'D', {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}}, {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
     {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}}, {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
+    {':', {0, 0x0c, 0x0c, 0, 0x0c, 0x0c, 0}}, {'/', {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}},
 };
 
 void overlay_toggle(void) {
@@ -826,7 +876,11 @@ static void overlay_stats(void) {
 static bool overlay_draw(u32 f) {
     if (overlay_on < 0) {
         const char *e = getenv("NX_FPS");
+#ifdef NX_PACKAGE
+        InterlockedExchange(&overlay_on, e && *e && *e != '0');          /* off unless NX_FPS=1; F3 shows it */
+#else
         InterlockedExchange(&overlay_on, !(e && *e == '0'));
+#endif
     }
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -871,6 +925,39 @@ static bool overlay_draw(u32 f) {
 }
 
 static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
+
+/* "COMPILING SHADERS <n>" in the bottom-left corner while the translator has shaders to do (whatever F3 says): the
+ * first start draws little until thousands are done */
+#define MSG_W 360
+#define MSG_H 22
+static VkBuf msg_buf[PRESENT_FRAMES];
+bool gpu_shader_progress(u32 *done, u32 *total);
+
+static bool msg_draw(u32 f) {
+    u32 done, total;
+    if (!gpu_shader_progress(&done, &total) || sw.extent.width < MSG_W + 8 || sw.extent.height < MSG_H + 8) return false;
+    bool bgra = sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!bgra && sw.format != VK_FORMAT_R8G8B8A8_UNORM && sw.format != VK_FORMAT_R8G8B8A8_SRGB) return false;
+    if (!msg_buf[f].buf)
+        vk_buffer(MSG_W * MSG_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &msg_buf[f]);
+    u32 *px = (u32 *)msg_buf[f].a.map;
+    if (!px) return false;
+    char text[40];
+    snprintf(text, sizeof text, "COMPILING SHADERS: %u/%u", done, total);
+    for (u32 i = 0; i < MSG_W * MSG_H; i++) px[i] = 0xff181818;
+    int x0 = 6;
+    for (const char *s = text; *s; s++, x0 += 6 * OV_SCALE) {
+        const u8 *rows = NULL;
+        for (size_t g = 0; g < sizeof glyphs / sizeof *glyphs; g++)
+            if (glyphs[g].c == *s) rows = glyphs[g].rows;
+        if (!rows || x0 + 5 * OV_SCALE > MSG_W) continue;
+        for (int r = 0; r < 7 * OV_SCALE; r++)
+            for (int c = 0; c < 5 * OV_SCALE; c++)
+                if (rows[r / OV_SCALE] >> (4 - c / OV_SCALE) & 1) px[(4 + r) * MSG_W + x0 + c] = 0xffffffff;
+    }
+    return true;
+}
 
 VkPresentTimes vk_present_times;
 
@@ -950,6 +1037,12 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
         VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageOffset = {8, 8, 0}, .imageExtent = {OV_W, OV_H, 1}};
         vkCmdCopyBufferToImage(cmd, ov.buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    }
+    if (msg_draw(f)) {
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageOffset = {8, (s32)sw.extent.height - MSG_H - 8, 0}, .imageExtent = {MSG_W, MSG_H, 1}};
+        vkCmdCopyBufferToImage(cmd, msg_buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     }
     image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     VKCHECK(vkEndCommandBuffer(cmd));

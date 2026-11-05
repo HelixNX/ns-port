@@ -228,6 +228,10 @@ void host_thread_init(Ctx *c);                         /* per host thread: FP st
 
 /* ---------------------------------------------------------------------------------------------- logging */
 extern int log_level;                                  /* 0 errors, 1 info, 2 trace (SVCs, IPC) */
+/* main.c: where things live (see paths_init) */
+const char *nx_cache_dir(void);     /* shaders, pipeline caches, module images: the build folder, or the package's */
+const char *nx_data_dir(void);      /* the build folder, or %LOCALAPPDATA%\<title> */
+bool nx_from_nsp(void);             /* the game is read from the user's NSPs (nca.c), not an extracted dump */
 void hlog(int level, const char *fmt, ...);
 __declspec(noreturn) void fatal(const char *fmt, ...);
 void dump_ctx(Ctx *c);
