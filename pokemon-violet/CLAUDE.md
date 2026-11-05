@@ -205,12 +205,17 @@ a second backend next to the room. Not started: needs the adapter.
   different ones by position ("Mareep" as " a eep", the link code prompt "   er a co  "), seen before the
   translator fixes too, then not again: suspect the game's run-time glyph atlas (an upload / copy lost or late);
   F12 while it shows.
-- **Effects freeze above ~60 fps** (seen 2026-11-04 in bench.ps1 runs, NX_NOPACE ~200 fps; fine at 30 and 60):
-  raid den beacons and item ball pillars stand still, and objects loading in keep a rainbow fade-in look (rocks,
-  the den's base). A capture's long frame makes the beacon jump ahead, so effect time advances by frame time in
-  whole steps (likely floor(dt * 60), the remainder dropped). Uncapped benchmarks therefore don't animate
-  effects (small workload difference). To fix for frame rates above 60: find the step in the effect update and
-  patch it to carry the remainder. Not started.
+- **Effects froze above ~60 fps: fixed (2026-11-04, user-checked uncapped: beacons animate).** Seen in bench.ps1
+  runs (NX_NOPACE ~200 fps): raid den beacons and item ball pillars stood still, fade-ins stayed rainbow. The
+  effect manager (`main+2039640`) steps the VFX emitter sets (`b85c44` -> `7e5924`) by speed rate x
+  `(int)(clock duration / 16666666.0)`: whole 60 Hz frames, 0 below 16.7 ms (1 at 45 fps for 1.33). Hook
+  `fps_effect_frames` (patches.txt `main+20397d0`, fps.c) gives the exact fraction when a non-30 rate is active.
+  - Found with Ghidra headless (the REA MCP failed to connect): a GhidraScript run with `analyzeHeadless <project
+    build/analysis/ghidra> main -process main.elf -noanalysis -readOnly -postScript Decomp.java <out> <addrs>`
+    decompiles (and creates missing functions). Game clocks: the frame update (`main+2b79f60`) gives each clock a
+    duration from the frame table (`3c2fba8`: 16.7 / 33.3 / 50 / 66.7 / 83.3 ms, by level); readers call
+    clock_obj->vtbl[0](obj, 1) and read the duration at +8 (100 sites; `b83cdc`, a sequence player, divides by
+    table[its rate] - 1). The Dynamic FPS mod instead clamps the duration to >= 16.7 ms (its 60 cap).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
