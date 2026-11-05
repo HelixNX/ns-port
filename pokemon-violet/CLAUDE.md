@@ -252,6 +252,38 @@ a second backend next to the room. Not started: needs the adapter.
   `timeOfDayHours` / `dayTime` / `nightTime` come from a FlatBuffers parameter file (loader `1513f24`);
   `CFunc_Tml_ResetGameTime` is a Lua command (`main.tml.TimeLineCommand`). The map's clock is a static image. If
   it shows again, note the frame rate and what was happening (a scripted time change is possible).
+- **Package for testers (2026-11-05, nxrecomp `nca.c` / `image.c` / `tools/package.ps1`).** The user's call: friends
+  test with their own files; requirements are keys, firmware, base + update NSPs (DLC optional). Nothing is extracted:
+  - The runtime reads NSPs directly when the game folder has `.nsp` files (any build: `--game <dir>`): prod.keys /
+    title.keys there or in `%USERPROFILE%\.switch`, tickets from the NSPs, NCA3 header XTS, AES-CTR, the update's
+    BKTR (indirect + AES-CTR-EX tables) over the base RomFS, IVFC level 6; DLC and system data (NgWord2) by data
+    id from the NSPs / `game\firmware\*.nca`; ExeFS (main.npdm, NSOs); control.nacp (room version) and the icon
+    (window icon, WIC). Checked: 14 RomFS files (8 GB data.trpfs included) byte-identical with `dump/romfs`, ~600
+    MB/s. Each thread decrypts with its own copy of the CNG key (BCryptDuplicateKey).
+  - Module images are built from the ExeFS NSOs at first start (image.c: nso2elf + a64image in C), byte-identical
+    with `build/image`, 156 ms; a different game version stops with a message (text size check).
+  - `violetrecomp_pkg` target (NX_PACKAGE, `Pokemon Violet.exe`, no console, lifted code and runtime at -O3, own
+    `lifted_o3` library): game files in `game\` next to the exe; save, cache (images, shaders, pipeline caches,
+    movie copies), log.txt and F12 `dumps\` under `%LOCALAPPDATA%\Pokemon Violet\`; F3 overlay off by default; F5
+    and F11 off, F12 kept for testers' captures. The translator runs from `translator\` (embeddable Python
+    3.12.10 from `deps/python-embed`, translate.py + maxwell.py, glslangValidator found through VULKAN_SDK set to
+    that folder). `nxrecomp/tools/package.ps1 -Out <dir> -PythonZip <zip>` (inside violetrecomp) builds it and
+    assembles the folder with room\room_server.exe and README.txt. Development builds keep build\ for everything.
+    -O3's speed is not measured yet. The user's test folder: `H:\ns-porting\violet-package\Pokemon Violet` (its
+    game\ has hard links to rom\'s NSPs, a copy of prod.keys and the NgWord2 NCA: empty it before sending).
+  - First start (empty cache): nothing draws until the title's shaders are translated (~400-1,900, 10-40 s in
+    batches); the package shows "COMPILING SHADERS: done/total" bottom-left and holds input until the start-up's
+    burst is over (gpu.c `gpu_shaders_starting`: nothing pending and no request for 2 s). Idea for later (user):
+    translate everything before the first play, which needs the shaders' locations in the game's archives (parse
+    them, or ship an index of RomFS file + offset per shader hash: no game data) - not looked into.
+  - Graphics patches (gfx.c, patches.txt): Improved Graphic Quality (two quality values -1.0, `if gfx`; NX_QUALITY=0)
+    and no depth-of-field blur (`if nodof`; NX_DOF=1) are on. **2K shadows (`if shadow`) are off by default: opening
+    the map crashed with them** (null read at main+c281d0, every time; user-bisected: quality off still crashed,
+    all off fine, shadows off fine). Why not looked into: the patched code compares a size against 0x800 first.
+  - Open from the session: the black portrait (plan: NX_DUMP_DRAWS=12fb5aa000,12ef662600 + F12 with the map open
+    and in the second place the user knows; the final target is still 12fb5aa000); a Fletchinder flew very fast at
+    60 fps (title / overworld, extracted dump; likely the movement scaling the Dynamic FPS patch does at `cce37c`,
+    not ported).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
