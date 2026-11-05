@@ -199,8 +199,15 @@ a second backend next to the room. Not started: needs the adapter.
     mrt_enable 0, depth-compare sampling with LL / bias / 1D, AOFFI emulation for non-integer fetches, LDL / STL
     and LDC out-of-bounds behaviour. Raised as Unsupported (fail loudly): IMAD, IMUL, PRMT, SHF, P2R, CSET, the
     double and most f16 ops, TLD4 PTP, multisample TLDS. Scripts and counts: the session scratchpad (not kept).
-- Open (seen 2026-11-04): the player portrait is still black (raid member list, map marker; F12 frames 20213 and
-  20728 in `build/frames`). Rain: splashes on the ground, rain sheets in the distance and wet surfaces show, but
+- **Black profile photo and player icon: fixed (2026-11-05, user-checked: new photos and the map marker show).**
+  The game's screen capture (`ui_utility/screen_capture.cpp`, `main+187bf80` UpdateCapture) renders into a
+  pitch-linear 1920x1080 RGBA8 texture, then the CPU BC1-encodes that memory into the save's pictures (profile
+  1440x864 f66, the icon used by the map marker and raid list). The runtime kept GPU writes in Vulkan images only,
+  so the CPU read zeros. Now gpu.c `linear_wrote` / `linear_writeback` copy GPU-written linear textures back to
+  guest memory at the end of the submission (log: `linear ... copied back to guest memory`; nothing in normal
+  play). Pictures saved before the fix stay black: the user's save's default photo (taken at its new game) can't
+  be re-taken; Change Photo makes a good one.
+- Rain: splashes on the ground, rain sheets in the distance and wet surfaces show, but
   no streaks fall near the camera. Capture frame 26027 (rain, 2026-11-04; its trace log was overwritten): the
   half-res effects layer (`960x540 f41 @12f4f6a000`) has 7 lit pixels of 518,400 (beacon frames: 12k-210k), so
   the streaks are never drawn, not lost later. Next: F12 in rain and keep that session's run.log (the trace
@@ -280,8 +287,7 @@ a second backend next to the room. Not started: needs the adapter.
     and no depth-of-field blur (`if nodof`; NX_DOF=1) are on. **2K shadows (`if shadow`) are off by default: opening
     the map crashed with them** (null read at main+c281d0, every time; user-bisected: quality off still crashed,
     all off fine, shadows off fine). Why not looked into: the patched code compares a size against 0x800 first.
-  - Open from the session: the black portrait (plan: NX_DUMP_DRAWS=12fb5aa000,12ef662600 + F12 with the map open
-    and in the second place the user knows; the final target is still 12fb5aa000); a Fletchinder flew very fast at
+  - Open from the session: a Fletchinder flew very fast at
     60 fps (title / overworld, extracted dump; likely the movement scaling the Dynamic FPS patch does at `cce37c`,
     not ported).
 
@@ -709,7 +715,7 @@ In order:
     was also seen with a blue outline. Next: F12 with
     `NX_DUMP_DRAWS` on the lit scene buffer (12f5ee2000) and on the effects layer (12f4f6a000) to find the draw
     that adds them.
-  - **Open (next, 2026-10-19): the player's portrait is black** on the map marker (frame 50234, the circle
+  - **Fixed 2026-11-05 (linear capture write-back, see above): the player's portrait was black** on the map marker (frame 50234, the circle
     under the eyes) and on the enrollment form (probably the same cause). What is known: a 360x360 f56 target
     `12ef662600` (portrait-sized) is cleared to (0,0,0,0) in every traced frame, and no draw in those frames
     renders into it or samples it. Either the portrait is rendered once before that and lost, or the marker
@@ -939,7 +945,7 @@ In order:
     device losses go on.
   - Fail-fast (0xC0000409) codes seen: 5 is the CRT's invalid parameter (ours), 7 is amdvlk's lost device. A
     run under a Win32 debugger got VK_ERROR_UNKNOWN on an image bind, so don't trust debugger runs for GPU work.
-  - Open: the black portrait on the enrollment form, lighting (LUT slices one off? 8/16-bit integer textures
+  - Open: lighting (LUT slices one off? 8/16-bit integer textures
     read as float), hwopus silent, storage images (set 3) still share one array across dimensions.
     Commits: nxrecomp `e122065` (translator), `abb28ce` (runtime fixes), `dda831d` (storage images), `8024860`
     (lifter jump tables), `576381c` (audren work buffer), `f408ac0` (debugging tools).
