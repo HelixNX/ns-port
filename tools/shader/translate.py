@@ -186,7 +186,8 @@ class Translator:
 
     @staticmethod
     def sat(x, s):
-        return 'clamp(%s, 0.0, 1.0)' % x if s else x
+        """.SAT: NaN gives 0 on the hardware (GLSL's clamp leaves it undefined); sat() is in the preamble"""
+        return 'sat(%s)' % x if s else x
 
     # ------------------------------------------------------------------ comparisons
     @staticmethod
@@ -420,6 +421,17 @@ class Translator:
             fmz, sat, nb, scale = bits(w, 44, 2), bits(w, 50, 1), bits(w, 48, 1), bits(w, 41, 3)
             if bits(w, 47, 1):
                 raise Unsupported('FMUL.CC')
+            if bits(w, 39, 2) == 3:
+                # .RZ (round toward zero): GLSLC's integer division takes its first quotient this way, and rounding
+                # to nearest can make it one too high, which the correction step after it cannot undo
+                if fmz == 2:
+                    raise Unsupported('FMUL.RZ.FMZ')
+                self.uses.add('rz')
+                x = 'fmul_rz(%s, %s)' % (self.Rf(a), self.fmod(self.op_b_f(w, form), nb, 0))
+                if scale:
+                    x = '(%s) * %s' % (x, {1: '0.5', 2: '0.25', 3: '0.125', 4: '8.0', 5: '4.0', 6: '2.0'}[scale])
+                self.set_rf(d, self.sat('(%s)' % x, sat))
+                return
         x = self.fmul_expr(self.Rf(a), self.fmod(self.op_b_f(w, form), nb, 0), fmz)
         if scale:
             x = '(%s) * %s' % (x, {1: '0.5', 2: '0.25', 3: '0.125', 4: '8.0', 5: '4.0', 6: '2.0'}[scale])
@@ -471,12 +483,13 @@ class Translator:
         p = self.P(bits(w, 39, 3), bits(w, 42, 1))
         if bits(w, 47, 1):
             raise Unsupported('FMNMX.CC')
+        # the hardware returns the operand that is not NaN (GLSL's min / max leave it undefined): nmin / nmax
         if p == 'true':
-            self.set_rf(d, 'min(%s, %s)' % (av, bv))
+            self.set_rf(d, 'nmin(%s, %s)' % (av, bv))
         elif p == 'false':
-            self.set_rf(d, 'max(%s, %s)' % (av, bv))
+            self.set_rf(d, 'nmax(%s, %s)' % (av, bv))
         else:
-            self.set_rf(d, '(%s ? min(%s, %s) : max(%s, %s))' % (p, av, bv, av, bv))
+            self.set_rf(d, '(%s ? nmin(%s, %s) : nmax(%s, %s))' % (p, av, bv, av, bv))
 
     def op_FSETP(self, w, form, pc):
         av = self.fmod(self.Rf(bits(w, 8, 8)), bits(w, 43, 1), bits(w, 7, 1))
@@ -648,7 +661,9 @@ class Translator:
         else:
             hi = 65535.0 if dst == 1 else 4294967040.0
             e = 'uint(clamp(%s, 0.0, %s))' % (x, hi)
-        self.emit('{ float x_ = %s; uint v_ = isnan(x_) ? 0u : %s;' % (x, e.replace(x, 'x_')))
+        # NaN converts to 0x80000000 for 32-bit results (signed or not), else 0
+        self.emit('{ float x_ = %s; uint v_ = isnan(x_) ? %s : %s;' % (x, '0x80000000u' if dst == 2 else '0u',
+                                                                       e.replace(x, 'x_')))
         self.indent += 1
         if signed and dst == 2:
             # values above 2^31 - 128 clamp to INT_MAX
@@ -676,6 +691,10 @@ class Translator:
             v = '(-%s)' % (v if signed else 'int(%s)' % v)
             signed = True
         x = 'float(%s)' % v
+        if width == 32 and bits(w, 39, 2) == 3:
+            # .RZ: values above 2^24 truncate instead of rounding to nearest (GLSLC's integer division)
+            self.uses.add('rz')
+            x = 'i2f_rz(%s)' % v
         if ff == 2:
             self.set_rf(d, x)
         elif ff == 1:
@@ -706,14 +725,28 @@ class Translator:
                 lo, hi = 0, (1 << dw) - 1 if dw < 32 else 0x7fffffff
             if not ssg and sw == 32 and not dsg:
                 v = 'uint(%s)' % src
-                self.set_r(d, v if dw == 32 else 'min(%s, %du)' % (v, (1 << dw) - 1))
+                self.i2i_set(w, d, v if dw == 32 else 'min(%s, %du)' % (v, (1 << dw) - 1))
                 return
             v = 'clamp(%s, %d, %d)' % (v, lo, hi)
         if dw < 32:
-            self.set_r(d, 'uint(bitfieldExtract(%s, 0, %d))' % (v, dw) if dsg else
-                       'bitfieldExtract(uint(%s), 0, %d)' % (v, dw))
+            self.i2i_set(w, d, 'uint(bitfieldExtract(%s, 0, %d))' % (v, dw) if dsg else
+                         'bitfieldExtract(uint(%s), 0, %d)' % (v, dw))
         else:
-            self.set_r(d, 'uint(%s)' % v)
+            self.i2i_set(w, d, 'uint(%s)' % v)
+
+    def i2i_set(self, w, d, e):
+        """I2I's result; .CC (bit 47) sets zero and sign from it (the game tests Rx != 0 with I2I RZ.CC, Rx and
+        CSETP.NE), carry and overflow clear"""
+        if not bits(w, 47, 1):
+            self.set_r(d, e)
+            return
+        self.uses.add('cc')
+        self.emit('{ uint v_ = %s;' % e)
+        self.indent += 1
+        self.set_r(d, 'v_')
+        self.emit('cc_z = v_ == 0u; cc_s = (v_ >> 31) != 0u; cc_c = false; cc_o = false;')
+        self.indent -= 1
+        self.emit('}')
 
     # --- integer
     def cc_add(self, a, b, res, x=False):
@@ -762,9 +795,15 @@ class Translator:
             a, b, c = half(a, bits(w, 35, 2)), half(b, bits(w, 33, 2)), half(c, bits(w, 31, 2))
         neg = lambda v, n: '(-%s)' % v if n else v
         a, b, c = neg(a, bits(w, 51, 1)), neg(b, bits(w, 50, 1)), neg(c, bits(w, 49, 1))
-        if form == 'R' and bits(w, 37, 2):
-            sh = bits(w, 37, 2)
-            self.set_r(d, '((%s + %s) %s 16) + %s' % (a, b, '>>' if sh == 1 else '<<', c))
+        if form == 'R' and bits(w, 37, 2) == 1:
+            # .RS shifts the 33-bit sum a + b: its carry is bit 16 of the result (GLSLC's XMAD high multiply)
+            self.emit('{ uint a_ = %s, s_ = a_ + %s;' % (a, b))
+            self.indent += 1
+            self.set_r(d, '(s_ >> 16) + (s_ < a_ ? 0x10000u : 0u) + %s' % c)
+            self.indent -= 1
+            self.emit('}')
+        elif form == 'R' and bits(w, 37, 2):
+            self.set_r(d, '((%s + %s) << 16) + %s' % (a, b, c))
         else:
             self.set_r(d, '%s + %s + %s' % (a, b, c))
 
@@ -1236,6 +1275,55 @@ class Translator:
         self.indent -= 1
         self.emit('}')
 
+    # --- shared memory (compute): `shared uint smem[]`, sized from GLSLC's control word at 0x754
+    def shared_addr(self, w):
+        a, off = bits(w, 8, 8), bits(w, 20, 24)
+        size = struct.unpack_from('<I', self.sh.control, 0x754)[0] if len(self.sh.control) >= 0x758 else 0
+        if self.stage != 'compute' or not size:
+            raise Unsupported('shared memory without a size')
+        self.uses.add('smem')
+        if a == RZ:
+            return '%du' % off
+        return '(%s + %du)' % (self.R(a), sext(off, 24) & 0xffffffff)
+
+    def op_LDS(self, w, form, pc):
+        """bit 44 (.U) can be ignored; out-of-range reads give 0"""
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        self.emit('{ uint sa_ = %s;' % self.shared_addr(w))
+        self.indent += 1
+        word = lambda i: 'smem_ld((sa_ >> 2) + %du)' % i
+        if size in (0, 1, 2, 3):
+            n = 8 if size < 2 else 16
+            sh = '((sa_ & 3u) * 8u)' if n == 8 else '((sa_ & 2u) * 8u)'
+            v = 'bitfieldExtract(%s(%s), int(%s), %d)' % ('int' if size & 1 else '', word(0), sh, n)
+            self.set_r(d, 'uint(%s)' % v if size & 1 else v)
+        else:
+            n = {4: 1, 5: 2, 6: 4}.get(size)
+            if n is None:
+                raise Unsupported('LDS size %d' % size)
+            for i in range(n):
+                self.set_r(d + i, word(i))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_STS(self, w, form, pc):
+        """out-of-range writes are dropped"""
+        s, size = bits(w, 0, 8), bits(w, 48, 3)
+        self.emit('{ uint sa_ = %s;' % self.shared_addr(w))
+        self.indent += 1
+        if size in (0, 1, 2, 3):
+            n = 8 if size < 2 else 16
+            sh = '((sa_ & 3u) * 8u)' if n == 8 else '((sa_ & 2u) * 8u)'
+            self.emit('smem_st(sa_ >> 2, bitfieldInsert(smem_ld(sa_ >> 2), %s, int(%s), %d));' % (self.R(s), sh, n))
+        else:
+            n = {4: 1, 5: 2, 6: 4}.get(size)
+            if n is None:
+                raise Unsupported('STS size %d' % size)
+            for i in range(n):
+                self.emit('smem_st((sa_ >> 2) + %du, %s);' % (i, self.R(s + i if s != RZ else RZ)))
+        self.indent -= 1
+        self.emit('}')
+
     # --- attributes
     def op_ALD(self, w, form, pc):
         d, idx, off, size = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 10), bits(w, 47, 2)
@@ -1270,7 +1358,7 @@ class Translator:
             mul = bits(w, 20, 8)
             e = 'U(F(%s)%s * F(%s))' % (e, ' * gl_FragCoord.w' if persp else '', self.R(mul))
         if sat:
-            e = 'U(clamp(F(%s), 0.0, 1.0))' % e
+            e = 'U(sat(F(%s)))' % e
         self.set_r(d, e)
 
     # --- textures
@@ -1455,8 +1543,11 @@ class Translator:
     def op_TLD4S(self, w, form, pc):
         da, a, b, db = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8), bits(w, 28, 8)
         dc, aoffi, comp, f16 = bits(w, 50, 1), bits(w, 51, 1), bits(w, 52, 2), bits(w, 55, 1)
-        # coordinates in Ra, Ra+1; offsets / reference in Rb (as TEXS lays them out)
-        coords = 'vec2(%s, %s)' % (self.Rf(a), self.Rf(a + 1 if a != RZ else RZ))
+        # coordinates in Ra, Rb; with an offset or a reference in Ra, Ra+1 and those in Rb (Rb+1)
+        if aoffi or dc:
+            coords = 'vec2(%s, %s)' % (self.Rf(a), self.Rf(a + 1 if a != RZ else RZ))
+        else:
+            coords = 'vec2(%s, %s)' % (self.Rf(a), self.Rf(b))
         off = dref = None
         if aoffi:
             off = 'ivec2(bitfieldExtract(int(%s), 0, 6), bitfieldExtract(int(%s), 8, 6))' % (self.R(b), self.R(b))
@@ -1501,7 +1592,9 @@ class Translator:
         for c in range(4):
             if mask >> c & 1:
                 if c < 2:
-                    self.set_r(r, 'uint(v_[%d] * 256.0)' % c)
+                    # 8.8 fixed point; textureQueryLod's .y is negative under magnification, and the game converts
+                    # the result as unsigned (I2F.U32), so it is taken as clamped at 0
+                    self.set_r(r, 'uint(max(v_[%d] * 256.0, 0.0))' % c)
                 else:
                     self.set_r(r, '0u')
                 r += 1
@@ -1520,7 +1613,7 @@ class Translator:
             h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
         # each view type has its own array (runtime/gpu.c TB_*): every 2D image has a 2D array view, a 3D image only
         # a 3D one; the 1x1 black texture where the entry has no view of that type
-        self.uses.update(('tex_t2da', 'tex_t3d', 'txq'))
+        self.uses.update(('tex_t2da', 'tex_t3d', 'tex_ut2da', 'txq'))
         self.emit('{ uint h_ = %s; uvec4 v_ = txq(h_, int(%s));' % (h, lod))
         self.indent += 1
         r = d
@@ -1907,11 +2000,42 @@ class Translator:
                 out.append('#extension GL_KHR_shader_subgroup_%s : require' % ext)
         if 'layer' in self.uses:
             out.append('#extension GL_ARB_shader_viewport_layer_array : require')
+        # float behaviour as the console's: .FTZ is on nearly every float instruction, so denormals flush in the whole
+        # shader; NaN and infinities must be kept, else the driver may assume there are none and fold isnan away
+        # (runtime/vk.c logs whether the device supports both: Vulkan 1.2 float controls)
+        out += ['#extension GL_EXT_spirv_intrinsics : require',
+                'spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4465], 4460, 32);',
+                'spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32);']
         out.append('// translated from Maxwell shader %s (%s)' % (os.path.basename(self.sh.path), self.stage))
         if self.stage == 'compute':
             lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
             out.append('layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;' % (lx, ly, lz))
-        out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }']
+        out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }',
+                # .SAT gives 0 for NaN; FMNMX returns the operand that is not NaN
+                'float sat(float x) { return x > 0.0 ? min(x, 1.0) : 0.0; }',
+                'vec2 sat(vec2 x) { return vec2(sat(x.x), sat(x.y)); }',
+                'float nmin(float a, float b) { return isnan(a) ? b : isnan(b) ? a : min(a, b); }',
+                'float nmax(float a, float b) { return isnan(a) ? b : isnan(b) ? a : max(a, b); }']
+        if 'rz' in self.uses:
+            # round toward zero: the product rounded to nearest, stepped one ulp toward 0 when the exact product
+            # (its error from fma) is smaller in magnitude; an overflow gives the largest finite value. Integers
+            # to float keep their top 24 significant bits
+            out += ['float fmul_rz(float a, float b) {',
+                    '    precise float p = a * b;',
+                    '    precise float e = fma(a, b, -p);',
+                    '    if (isinf(p) && !isinf(a) && !isinf(b)) return uintBitsToFloat(floatBitsToUint(p) - 1u);',
+                    '    if (p != 0.0 && !isinf(p) && e != 0.0 && (e < 0.0) != (p < 0.0))',
+                    '        return uintBitsToFloat(floatBitsToUint(p) - 1u);',
+                    '    return p;',
+                    '}',
+                    'uint trunc24(uint v) { int m = findMSB(v); return m > 23 ? v & ~((1u << uint(m - 23)) - 1u) : v; }',
+                    'float i2f_rz(uint v) { return float(trunc24(v)); }',
+                    'float i2f_rz(int v) { float f = float(trunc24(uint(abs(v)))); return v < 0 ? -f : f; }']
+        if 'smem' in self.uses:
+            words = (struct.unpack_from('<I', self.sh.control, 0x754)[0] + 3) // 4
+            out += ['shared uint smem[%d];' % words,
+                    'uint smem_ld(uint i) { return i < %du ? smem[i] : 0u; }' % words,
+                    'void smem_st(uint i, uint v) { if (i < %du) smem[i] = v; }' % words]
         if self.int_attrs:
             out += ['uint U(uint x) { return x; }', 'uint U(int x) { return uint(x); }']
         if 'fmz' in self.uses:
@@ -1939,10 +2063,15 @@ class Translator:
                     out.append('layout(set = 1, binding = %d) uniform %s %s[];' % (TEX_BINDING[name], typ, name))
             out.append('layout(set = 2, binding = 0) uniform sampler smp[];')
             if 'txq' in self.uses:
-                # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D
+                # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D; integer
+                # textures (INT_FLAG) have their views only in ut2da (t2da holds the black texture)
                 nu = 'nonuniformEXT' if 'txq_nu' in self.uses else ''
                 out += [l.replace('nonuniformEXT', nu) for l in ['uvec4 txq(uint h, int lod) {',
                         '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
+                        '    if (%s) {' % (INT_FLAG % 'h'),
+                        '        ivec3 u = textureSize(ut2da[nonuniformEXT(t)], lod);',
+                        '        return uvec4(uvec3(u), uint(textureQueryLevels(usampler2DArray(ut2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]))));',
+                        '    }',
                         '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
                         '    int l = textureQueryLevels(sampler2DArray(t2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]));',
                         '    if (z.xy == ivec2(1)) {',

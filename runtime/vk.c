@@ -278,7 +278,8 @@ void vk_init(void) {
     VkPhysicalDeviceVulkan13Features has13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 hasf13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &has13};
     vkGetPhysicalDeviceFeatures2(vk.phys, &hasf13);
-    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &p12};
     VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p13};
     VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
     vkGetPhysicalDeviceProperties2(vk.phys, &pp);
@@ -287,6 +288,11 @@ void vk_init(void) {
     hlog(1, "vk: subgroup size %u (%u-%u), 32 required for stages %x", p11.subgroupSize, p13.minSubgroupSize,
          p13.maxSubgroupSize, vk.warp32);
     if (p11.subgroupSize != 32 && !vk.warp32) hlog(0, "vk: subgroups are not 32 wide: warp-level shader code will be wrong");
+    /* translated shaders flush 32-bit denormals (Maxwell's .FTZ) and keep NaN and infinities (the console's NaN
+     * results: .SAT, FMNMX, F2I), as execution modes in every SPIR-V (tools/shader/translate.py) */
+    if (!p12.shaderDenormFlushToZeroFloat32 || !p12.shaderSignedZeroInfNanPreserveFloat32)
+        hlog(0, "vk: no 32-bit float controls (flush to zero %u, NaN preserve %u): shaders may differ from the console",
+             p12.shaderDenormFlushToZeroFloat32, p12.shaderSignedZeroInfNanPreserveFloat32);
 
     /* features: everything the NVN state maps to is dynamic state, so pipelines depend on shaders and formats */
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
