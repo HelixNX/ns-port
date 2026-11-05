@@ -12,3 +12,9 @@ main+170c408 was 52a7f00a  if fps 52a84e0a               # mov w10, #1.0 -> #60.
 main+20a8d3c was 72a8e868  if fps 72a8f868               # 50000.0 -> 100000.0 (both patches; purpose not known yet)
 main+2b7c540 was 1a893100  if fps 52800000               # distance LOD of animation updates -> 0: full rate
 main+20397d0 was 1e220101 call fps_effect_frames      # scvtf s1, w8: the effect manager's whole 60 Hz frames
+#
+# Graphics quality (gfx.c, always on): Fl4sh's Violet 4.0.0 "Improved Graphic Quality" and "2K Shadows" pchtxt mods.
+main+c07dc4  was bd401e60  if gfx 1e3e1000               # ldr s0, [x19, #0x1c] -> fmov s0, #-1.0 (quality value)
+main+7f1a6c  was bd401280  if gfx 1e3e1000               # ldr s0, [x20, #0x10] -> fmov s0, #-1.0 (quality value)
+main+c4d864  was f9001be9  if nodof f9001bff              # str x9, [sp, #0x30] -> str xzr: no depth-of-field blur
+main+146e80c was 52808008  if shadow 52810008              # mov w8, #0x400 -> #0x800: 2048x2048 shadow maps
