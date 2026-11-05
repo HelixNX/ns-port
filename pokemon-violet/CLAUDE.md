@@ -225,6 +225,33 @@ a second backend next to the room. Not started: needs the adapter.
     library (spawning, jitter, noise once per call: 3.3x the calls at 200 fps). Ask which: moving faster (log the
     hook's values) or busier (then step effects in whole 60 Hz frames and carry the remainder, keeping the VFX's
     own cadence: hook state per manager, x20). Compare one effect with F5 at 60 and uncapped.
+- **Where a frame goes (2026-11-05, stand-still benchmark, user past the title by hand: bench.ps1 `'NX_INPUT='`).**
+  4.8-5.3 ms (187-207 fps), **GPU busy 3.1 ms** (was 5.5 on 10-31: the 11-04 translator fixes, user-checked not
+  the driver), translation 2.2 ms. The GPU is now idle ~2.2 ms a frame, ~1.5 of it waiting for the game's next
+  submission: **main is the limit** (running ~71%, ~3.6 ms; lifted code 65% of its samples and flat, the hottest
+  function 2.6%). Main blocked: 16% at the job join `main+b47d18` (~13 waits a frame), ~6% on a mutex at
+  `main+ccc41c` (~10 waits a frame, ~28 us each, ~6 of them wake-up): the game's own lock between main and workers
+  5a / 5b in one parallel loop (`2a78764` steps items by a stride; per item `ccada8` -> `ccc00c` -> `ccdeac`, a
+  physics / character step that locks it around two queries). Not ours; at most a short spin before sleeping
+  (Next, 3) would trim the wake-up. Logs `build/bench_prof1105.log`, `bench_profmain1105.log`; decompiled
+  `build/ghidra_lock*.txt`.
+  - **Present stalls fixed (nxrecomp `f715b4c`)**: "presenting" of 5-20 ms in NX_HITCH_MS lines was the render
+    thread waiting for the CPU-written texture check's scan thread (GetWriteWatch, up to 14.9 ms a scan in loads
+    and area streaming). A present now goes on without it (NX_REFRESH_WAIT=1: the old way). Load / streaming
+    windows 85-112 fps, 1% lows 54-90 ms -> ~205 fps, 7-10 ms. Steady scene 5.00 -> 4.80 ms (noise level).
+  - Frames over 8 ms (the user's line for bad) in the steady scene now: ~0.3%, main bursts of 6-8 ms (game work)
+    and **twice a run ~60 ms with main holding its core the whole time** (frames 17904 and 30458, ~60 s apart at
+    ~205 fps: something once a minute, the game's or ours). Next: NX_PROFILE=main with NX_HITCH_MS=40 to sample
+    one. NX_PROFILE's own report costs ~70-200 ms every 600 frames (it inflates `1% low`: read 1% lows from runs
+    without it).
+- **Day / night speed (2026-11-05): no frame-rate link found.** The user saw a night pass in ~2 minutes (a day is
+  said to be 72 minutes; unconfirmed). Clouds move at 30 fps speed at higher rates (user-checked), so the
+  environment clock looks right. Day / night is the game's own clock, not the system clock (user). Checked: our
+  clocks are real time; `170c408` (1.0 -> 60.0) and `20a8d3c` (50000 -> 100000) are not clocks; the user clock's
+  readers are timestamps; `e0b960` is a real-time 86400 s day; `GlobalTimeSpeed` is a render setting;
+  `timeOfDayHours` / `dayTime` / `nightTime` come from a FlatBuffers parameter file (loader `1513f24`);
+  `CFunc_Tml_ResetGameTime` is a Lua command (`main.tml.TimeLineCommand`). The map's clock is a static image. If
+  it shows again, note the frame rate and what was happening (a scripted time change is possible).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
