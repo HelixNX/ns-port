@@ -365,6 +365,37 @@ a second backend next to the room. Not started: needs the adapter.
       from 120x68 up are made N times larger when first drawn into; translate.py takes bit 18 of a handle and
       pc.scale (FragCoord, texelFetch, TXQ, image coordinates). Smoke test at 2x: title-to-overworld frames match
       1x, sharper, 60 fps. Known: Violet draws 360x360 targets with the 1080p depth bound (that pass runs at 1x).
+    - Downscale (nxrecomp `29f4e94`, user-checked "noticeably smoother"): a frame larger than the window is shrunk
+      by a box-filter pass (vk.c `downscale`, shaders/downscale.*: n x n bilinear taps per window pixel, n =
+      ceil(ratio) up to 8) instead of a linear blit, which skips texels above 2:1. Below the window's size the
+      blit stays (1x in a 1440p window is an upscale). Sharper kernels (Catmull-Rom, CAS) not needed for now.
+    - AA talked over: render scale is supersampling and the best fit for this machine. FSR 2/3 or DLSS would need
+      motion vectors and camera jitter Violet doesn't have (DLSS also needs NVIDIA). Cheap options not done: SMAA on
+      the final image (for weaker GPUs at 1x), FSR 1 for the 1x upscale.
+  - **Performance at 2x (2026-11-05 night; open, the user's priority for next time).**
+    - 60 fps play at 2x, NX_HITCH_MS=20 (logs `build/run-hitch25.log` at 25 ms, then the 20 ms session's
+      run.log, overwritten since by later runs): 26 of 29 windows locked 60.0, 1% lows ~17 ms. Loading the save:
+      ~60 slow frames up to 1.1 s (game code) plus a 1,186-upload burst (42 ms). In play: ~80 slow frames in
+      ~16,000 (0.5%), mostly 20-23 ms, each with **our translation at 5-9 ms instead of ~2.5** (the game waits on
+      it). No pipeline builds (the cache refilled after the translator change), GPU wait ~0. The user's earlier
+      "54 fps average" was the load windows plus pipeline rebuilds right after the translator version change.
+    - Uncapped at 2x (bench.ps1 `scale2 'NX_INPUT=' 'NX_RES_SCALE=2'`, log `build/bench_scale2.log`; the user may
+      have touched the window, so approximate): **146 fps (6.84 ms), GPU busy 5.73 ms: GPU-bound**, steady windows
+      135-150, 1% lows ~8.5-9 ms. The user sees lows of 90-100 fps and wants them up; 120 at 2x is the target.
+      (1x on 11-05: ~200 fps, GPU 3.1 ms, main-thread bound.)
+    - Next, in order: (1) the lows at 2x uncapped: bench with NX_HITCH_MS=10 and NX_GPU_PROF=1 (per pass) to split
+      GPU-heavy frames (which passes swell at 2x: blur / bloom chains need not be scaled?), our translation spikes
+      (then NX_PROFILE='thread 5c' on slow frames) and main-thread bursts; read lows from hitch lines (the
+      profiler's report costs time). (2) 120 and uncapped in the Esc panel's frame rate line (today 30/60; F5 in
+      development builds has them), then play at 120 for things that run at the wrong speed.
+    - **Fletchinder flying too fast** (user, 60 fps): only some Fletchinder, never Hoppip; the user thinks while
+      fleeing. So one movement (a flee or similar behaviour, or a distance-based update rate) steps per frame.
+      Lead from before: the Dynamic FPS mod scales movement at `main+cce37c` (not ported). F12 capture of a frame
+      with one: `build/frames/frame_4272*` (23:14; a still frame, only for finding the model's draws).
+  - **Shadows 2K / 4K toggle (asked by the user, not started):** the `if shadow` patch (`main+146e80c`, mov w8,
+    #0x400 -> #0x800) crashes when the map opens (null read at main+c281d0). Plan: disassemble both (capstone is in
+    `py -3.12`; `build/image/main.img`, offsets = main+x), find what the map allocates or sizes from the shadow
+    size (a fixed pool too small for 2048^2 / 4096^2 maps?), fix that, then a panel line for 1K / 2K / 4K.
   - Asked by the user, not started: setting save flags for the raid star unlocks and every fly point (one tool for
     save flags: in memory, or the save file with the game closed, which needs the save's encryption from the game's
     code); "story completed" as such is not feasible. The mon generator is for later (user's call).
