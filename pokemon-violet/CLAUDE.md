@@ -397,11 +397,79 @@ a second backend next to the room. Not started: needs the adapter.
     first (Vulkan passes through), a native port surveyed in `nxrecomp/docs/PLATFORMS.md` (not started).
   - **Shadows 2K / 4K toggle (asked by the user, not started):** the `if shadow` patch (`main+146e80c`, mov w8,
     #0x400 -> #0x800) crashes when the map opens (null read at main+c281d0). Plan: disassemble both (capstone is in
-    `py -3.12`; `build/image/main.img`, offsets = main+x), find what the map allocates or sizes from the shadow
+    `py -3.12`; `build/image/main.img`: main+x is at file offset 96 + nsym * 16 + strtab size + x, see the header in
+    a64image.py), find what the map allocates or sizes from the shadow
     size (a fixed pool too small for 2048^2 / 4096^2 maps?), fix that, then a panel line for 1K / 2K / 4K.
-  - Asked by the user, not started: setting save flags for the raid star unlocks and every fly point (one tool for
-    save flags: in memory, or the save file with the game closed, which needs the save's encryption from the game's
-    code); "story completed" as such is not feasible. The mon generator is for later (user's call).
+  - Save flags: done for raid levels and ride upgrades (below, "Save edits"); every fly point not yet (PKHeX names
+    them `FSYS_YMAP_FLY_*`: `svedit find` lists them). "Story completed" as such is not feasible. The mon generator
+    is for later (user's call).
+
+## Session 2026-11-06: mods, save edits, item giver (state at the end; next: the Lua bridge)
+
+- **run.ps1 has no time limit now** unless given `-Timeout <s>` (the old 60 s default killed the user's play
+  sessions twice, once mid-save). Play: `violetrecomp\run.ps1 -NoBuild`.
+- **Raid mod fixes (user-checked in game):** the den scan read only the svcSetHeapSize heap, but Violet keeps its
+  data in the alias region (svcMapPhysicalMemory, `NXMOD_ALIAS_BASE` in nxmod.h): both are scanned now (3.5 GB, a
+  few seconds). False runs (zero pages with a 1 every 0x20 bytes: every "den" seed 0, same raid) are dropped: a run
+  counts dens with a seed (`den_live`), allows unused all-zero slots inside (`den_slot`; Paldea had 69 of 72 early in
+  the story) and needs 90% distinct seeds. One Paldea table found (`131ab33050` that run, moves between runs).
+  Species names were looked up by national dex, but raids.dat's name list is in DevID order (= national up to Gen
+  8, not after): a "shiny Koraidon" 6-star was a Baxcalibur (#998 national, DevID 951). Names now by `e.dev`.
+  - Kitakami / Blueberry runs are classed by live den count (<= 72 Paldea): an early Kitakami table may be listed
+    as Paldea; check the area numbers when the DLC is reached.
+- **Save edits** (`violetrecomp/tools/svedit`, .NET 9 + PKHeX.Core 25.12.21 from NuGet with the user's OK; game
+  closed, back up `build/save` first: `build/save-backup-2026-11-06-*` are today's). Done on the user's save: ride
+  upgrades dash / swim / high jump / glide / climb / fly + the flight controls option (user-checked: work), raid
+  levels 3-6 unlocked. Keys are in svedit's header; PKHeX's `KUnlocked*` names equal the game's `FSYS_*_ENABLE` /
+  `FSYS_RAID_DIFFICTLTY*_RELEASE` (key = (uint)FNV-1a-64 of the name). The in-memory flags were not found by
+  hash (searched low 32 / 64-bit / fnv32 forms: no hits), so flags stay a closed-game edit for now.
+- **Item giver (F7, `mods/raids/items.cpp`, same DLL as F6; built, scan user-checked).** The bag is the save's
+  KItem block, kept live in memory (pickups and purchases change it at once): 3000 x 0x10 by item id {pocket,
+  count, flags 1 new / 2 favourite / 4 obtained, 0}; pockets 0 medicine, 1 balls, 2 battle, 3 berries, 4 other,
+  5 TMs, 6 treasures, 7 picnic, 8 key, 9 materials. Found by the Rotom Phone (1829) entry plus every held item in
+  its own pocket (without that, the array shifted 3-4 entries passed: Miraidon's ball and the Tera Orb look like
+  the anchor). Writing an entry works but **shows only after save + restart** (5 Rare Candy, user-checked): the bag
+  screen keeps lists built at load. Give / Set / 999 buttons, key items warned; a debug button arms the new write
+  watch (below) on the Poke Ball count.
+- **nxrecomp: `host->watch_mem(addr, len)`** (NXMOD_VERSION 2; runtime `diag_watch`): NX_WATCH_MEM armed while
+  running, for addresses that move between runs. Mods built against version 1 are declined (raids checks equality).
+- **Instant items: where the work stands (next session).** A shop purchase (watch log, 2026-11-06) writes the
+  entry through `main+1488d18(id, lo64, hi64)` -> `1488dd4(owner + 0x40, id, lo, hi)`: a plain 16-byte store
+  (`if id < 3000`), called from the Lua binding `1488b90` (args: integer 1 = item id, arg 2 a userdata holding the
+  entry, read by `1488c90`). Above it the Lua VM (`main+278b0` / `4487c` / `26c60` recursion = luaV_execute /
+  luaD_call / luaD_precall; `282b0` = luaD_rawrunprotected path) entered from native code through
+  **`main+b5ddd0` = lua_pcallk** (L, nargs, nresults, errfunc, ctx, k; ~300 callers). The game logic is **Haxe
+  compiled to Lua 5.4** (asserts name `haxe_lua/invoker.h`, "CallImpl"); the parser is linked (strings
+  "unexpected symbol", "attempt to load a %s chunk", "=stdin"). So the bag screen's refresh is in the scripts, and
+  instant giving = run the game's own add-item script function. Plan:
+  1. Find the Lua C API in main: `luaL_loadfilex` uses "=stdin" (ref at `main+24818`); `luaL_loadbufferx` and
+     `luaL_loadstring` follow it in lauxlib order; `checkmode` refs "attempt to load ..." at `main+28650` (f_parser
+     in ldo.c -> luaD_protectedparser -> lua_load); also lua_settop, lua_gettop, lua_tolstring, lua_getglobal.
+     Functions are listed in `build/analysis/main_ida.json` ("functions": ea / end); decompile with
+     `nxrecomp/tools/ghidra/decomp.ps1 <abs out path> <off>... -Ghidra D:\ReverseEngineering\ghidra_12.1.3_PUBLIC`
+     (inside violetrecomp; the out path must be absolute). String -> code refs: scan ADRP + ADD pairs over main's
+     text (session script, not kept: 20 lines with the image header above).
+  2. A safe point with the lua_State: a patches.txt `call` hook at lua_pcallk's entry (main thread, x0 = L) that
+     runs what a mod queued (needs re-lift of main + build): luaL_loadbufferx(L, text) + lua_pcallk, stack
+     balanced with lua_settop, through `guest_call()` (dispatch.c) with the Ctx registers saved and restored.
+     Expose it to mods as `host->run_lua(text)` (or a queue the hook drains), results / errors to the log.
+  3. With that, list the scripts' tables from Lua (haxe class names: look for item / bag / pocket) and call the
+     game's add-item function; F7's Give uses it, the direct write stays as the fallback.
+- **Other findings this session:**
+  - Names with the first letter missing (battle labels "oundoom" / "uecoco", F12 frame 33061; the same labels
+    were whole in frame 46067): not skipped shaders (0 skips around it). The trace did not catch the label draws
+    (the UI is drawn around the frame boundary). Suspect, unconfirmed: the run-time glyph atlas (CPU-written)
+    and the CPU-written texture check's scan, which took 248 ms (19 presents did not wait) as that battle loaded.
+    Same family as the earlier "Mareep as ' a eep'" note. Next time: does the letter come back after reopening.
+  - A move's effect drawn partly: draws skipped while their pipelines were built (NX_ASYNC_SHADERS: 118 -> 157
+    pipelines, ~530 draws skipped), once per new effect; the pipeline cache keeps them after.
+  - Local play with a real Switch: the desktop's Wi-Fi is an RZ616 (MT7922). Windows offers only managed mode;
+    under Linux `mt7921e` (mt76) should do AP + monitor, so the desktop booted into Linux could be the bridge
+    instead of the Pi (to test: AP and action-frame injection at once). Desktop as the host (the Switch joins,
+    remote room players appear behind it) is the easy direction: LDN is a star, every guest talks only to the
+    host. The Switch hosting needs one association per remote player. A USB mt76 adapter into WSL2 (usbipd +
+    a kernel with the mt76 USB drivers) would keep it on Windows. Redirecting the Switch's DNS to our own server
+    does not work for unmodified consoles: NPLN is TLS against Nintendo's CA plus Nintendo account / NSO tokens.
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
@@ -721,8 +789,8 @@ In order:
   - Workflow: each run reaches new content and dumps new shaders (their draws are skipped, often a black screen);
     run `translate.py --spv` and run again. Runs: `$env:NX_NOPACE='1'; $env:NX_INPUT='300-30000/60:A'`, about
     4,000 frames in 5 minutes. Skipped draws are counted per reason every 600 frames.
-    `run.ps1` kills the game when `-Timeout` runs out (default 60 s): for play sessions give it hours
-    (`-Timeout 86400`), or a session is cut off without saving (2026-10-19: a 30-minute timeout did that).
+    `run.ps1` runs until the game is closed unless given `-Timeout <s>` (since 2026-11-06; the default was 60 s
+    and cut the user's sessions off): only unattended test runs pass one, as a cut-off session is not saved.
     After pulling a change to translate.py: SPIR-V lives in `build/shaders/spv/<translator version>` (an FNV-1a
     hash of translate.py), so every shader is translated again. Run `translate.py --spv` once (~1 min for 5,000
     shaders) or the first run waits on the JIT for each one.
