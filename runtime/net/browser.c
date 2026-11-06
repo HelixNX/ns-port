@@ -1,8 +1,9 @@
 /* The room browser, shown before the game starts (Win32, like Eden's "Public Room Browser"): the public rooms with
  * their preferred game, name, players and host, filtered by default to rooms for this game by title id (the room's
  * preferred game, or a member playing it; never by name), plus hide-empty / hide-full and a text search. Join (or a
- * double click) asks for the password if the room has one and joins it; Direct Connect joins host[:port]; Play
- * Offline starts without a room. Closing the window quits.
+ * double click) asks for the password if the room has one and joins it; Direct Connect joins host[:port] (and asks
+ * for the password when the room turns it down for one); Play Offline starts without a room. Closing the window
+ * quits.
  * Settings (nickname, filters, last direct address) persist in <save dir>/netplay.ini. */
 #include "net.h"
 #include "game_config.h"
@@ -321,9 +322,13 @@ static void start_join(const char *host, u16 port, const char *password) {
     CloseHandle((HANDLE)_beginthreadex(NULL, 0, join_thread, a, 0, NULL));
 }
 
+static char direct_host[256];          /* the last Direct Connect address ("": the last join was from the list) */
+static u16 direct_port;
+
 static void join_selected(void) {
     int sel = ListView_GetNextItem(h_list, -1, LVNI_SELECTED);
     if (busy || sel < 0 || sel >= nvis) return;
+    direct_host[0] = 0;
     const LobbyRoom *r = &rooms[vis[sel]];
     char pw[128] = "";
     if (r->has_password && !ask_password(r->name, pw, sizeof pw)) return;
@@ -346,6 +351,8 @@ static void join_direct(void) {
     host[strcspn(host, " ")] = 0;
     if (!*host || !port) { MessageBoxW(wnd, L"Enter an address as host or host:port.", L"Direct connect", MB_ICONWARNING); return; }
     char pw[128] = "";
+    snprintf(direct_host, sizeof direct_host, "%s", host);  /* a room with a password: asked for (WM_JOIN_DONE) */
+    direct_port = port;
     start_join(host, port, pw);
 }
 
@@ -486,6 +493,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_JOIN_DONE:
         set_busy(false, "");
         if (w) { result = R_JOINED; DestroyWindow(h); return 0; }
+        if (direct_host[0] && strstr(join_err, "password")) {   /* Direct Connect to a room with a password */
+            char pw[128] = "", title[300];
+            snprintf(title, sizeof title, "%s:%u", direct_host, direct_port);
+            if (ask_password(title, pw, sizeof pw)) start_join(direct_host, direct_port, pw);
+            return 0;
+        }
         {
             wchar_t e[512];
             to_w(join_err, e, 512);
