@@ -392,6 +392,9 @@ a second backend next to the room. Not started: needs the adapter.
       fleeing. So one movement (a flee or similar behaviour, or a distance-based update rate) steps per frame.
       Lead from before: the Dynamic FPS mod scales movement at `main+cce37c` (not ported). F12 capture of a frame
       with one: `build/frames/frame_4272*` (23:14; a still frame, only for finding the model's draws).
+  - Package: `package.ps1 -Out <dir>` (no -ShaderPack / -PythonZip) now translates every shader and builds
+    shaders.pak itself (nxrecomp `6a6a9d0`); the user's test folder was rebuilt that way. Linux: Proton / Wine
+    first (Vulkan passes through), a native port surveyed in `nxrecomp/docs/PLATFORMS.md` (not started).
   - **Shadows 2K / 4K toggle (asked by the user, not started):** the `if shadow` patch (`main+146e80c`, mov w8,
     #0x400 -> #0x800) crashes when the map opens (null read at main+c281d0). Plan: disassemble both (capstone is in
     `py -3.12`; `build/image/main.img`, offsets = main+x), find what the map allocates or sizes from the shadow
