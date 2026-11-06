@@ -32,6 +32,7 @@ const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp32 = {
 static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
+#include "options.h"
 void gpu_capture_next(void);
 void gpu_reload_textures(void);
 void gpu_save_pipelines(void);
@@ -84,14 +85,16 @@ void window_init(void) {
 
 /* the host's main thread: window events until the guest's main thread ends or the window is closed */
 void window_loop(void *guest_main_thread) {
+    options_init();
     for (;;) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 8)) {
             do {
+                bool used = options_event(&e);          /* Esc and the options panel's keys and clicks */
 #ifdef NX_PACKAGE                                       /* no input while the start-up's shaders are translated */
                 if (!gpu_shaders_starting())
 #endif
-                input_event(&e);
+                if (!used) input_event(&e);
                 if (e.type == SDL_EVENT_QUIT) {
                     hlog(1, "window closed");
                     gpu_save_pipelines();
@@ -834,11 +837,33 @@ static const struct { char c; u8 rows[7]; } glyphs[] = {
     {'D', {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}}, {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
     {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}}, {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
     {':', {0, 0x0c, 0x0c, 0, 0x0c, 0x0c, 0}}, {'/', {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}},
+    {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}}, {'J', {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c}},
+    {'Q', {0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d}}, {'Y', {0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04}},
+    {'-', {0, 0, 0, 0x1f, 0, 0, 0}}, {'<', {0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02}},
+    {'>', {0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08}}, {'(', {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}},
+    {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}}, {'=', {0, 0, 0x1f, 0, 0x1f, 0, 0}},
 };
+
+/* text in the 5x7 font, `scale` pixels a dot, into a w x h pixel buffer (options.c's panel too) */
+void ov_text(u32 *px, int w, int h, int x, int y, const char *s, u32 color, int scale) {
+    for (; *s; s++, x += 6 * scale) {
+        const u8 *rows = NULL;
+        for (size_t g = 0; g < sizeof glyphs / sizeof *glyphs; g++)
+            if (glyphs[g].c == *s) rows = glyphs[g].rows;
+        if (!rows || x < 0 || y < 0 || x + 5 * scale > w || y + 7 * scale > h) continue;
+        for (int r = 0; r < 7 * scale; r++)
+            for (int c = 0; c < 5 * scale; c++)
+                if (rows[r / scale] >> (4 - c / scale) & 1) px[(y + r) * w + x + c] = color;
+    }
+}
 
 void overlay_toggle(void) {
     InterlockedExchange(&overlay_on, overlay_on ? 0 : 1);
 }
+
+void overlay_set(bool on) { InterlockedExchange(&overlay_on, on); }
+void vk_swap_extent(u32 *w, u32 *h) { *w = sw.extent.width; *h = sw.extent.height; }
+bool overlay_shown(void) { return overlay_on > 0; }
 
 static int cmp_desc(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -1042,6 +1067,22 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
         VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageOffset = {8, 8, 0}, .imageExtent = {OV_W, OV_H, 1}};
         vkCmdCopyBufferToImage(cmd, ov.buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    }
+    static VkBuf opt_buf[PRESENT_FRAMES];
+    if (options_is_open() && sw.extent.width >= OPT_W + 8 && sw.extent.height >= OPT_H + 8 &&
+        (sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB ||
+         sw.format == VK_FORMAT_R8G8B8A8_UNORM || sw.format == VK_FORMAT_R8G8B8A8_SRGB)) {
+        if (!opt_buf[f].buf)
+            vk_buffer(OPT_W * OPT_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &opt_buf[f]);
+        if (opt_buf[f].a.map) {
+            options_draw((u32 *)opt_buf[f].a.map);
+            image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                    .imageOffset = {(s32)(sw.extent.width - OPT_W) / 2, (s32)(sw.extent.height - OPT_H) / 2, 0},
+                                    .imageExtent = {OPT_W, OPT_H, 1}};
+            vkCmdCopyBufferToImage(cmd, opt_buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+        }
     }
     if (msg_draw(f)) {
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

@@ -1501,14 +1501,18 @@ s32 nx_framerate(void) {
     return framerate;
 }
 
-void nx_framerate_cycle(void) {
-    s32 r = nx_framerate();
-    r = r == FRAMERATE_GAME ? 60 : r == 60 ? 120 : r == 120 ? FRAMERATE_UNCAPPED : FRAMERATE_GAME;
+void nx_framerate_set(s32 r) {
+    nx_framerate();                     /* read the environment first: it would overwrite r later */
     InterlockedExchange(&framerate, r);
     vk_set_unthrottled(r == FRAMERATE_UNCAPPED || r > 60);
     if (r == FRAMERATE_GAME) hlog(0, "frame rate: the game's own");
     else if (r == FRAMERATE_UNCAPPED) hlog(0, "frame rate: uncapped");
     else hlog(0, "frame rate: %d fps", r);
+}
+
+void nx_framerate_cycle(void) {
+    s32 r = nx_framerate();
+    nx_framerate_set(r == FRAMERATE_GAME ? 60 : r == 60 ? 120 : r == 120 ? FRAMERATE_UNCAPPED : FRAMERATE_GAME);
 }
 
 static double game_step_ns = 1e9 / 30;  /* at the game's own rate: its present interval's */

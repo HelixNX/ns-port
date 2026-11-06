@@ -69,7 +69,7 @@ set(NX_RUNTIME_SOURCES
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
-    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c movie.c swkbd.c)
+    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c movie.c swkbd.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
@@ -218,6 +218,17 @@ function(nx_game)
     target_include_directories(a64rt_o3 PUBLIC "${NX_ROOT}/runtime")
     target_compile_options(a64rt_o3 PRIVATE ${lift_o3})
 
+    # zstd: the shader pack (gpu.c) in every build, netplay's compression; ENet with it
+    nx_netplay_libs()
+    # the shader packer (tools/shader/pack.c): translate.py --spv's output in one file for players
+    add_executable(nxshpack "${NX_ROOT}/tools/shader/pack.c")
+    target_link_libraries(nxshpack PRIVATE nx_zstd)
+    target_compile_options(nxshpack PRIVATE /clang:-O2)
+    foreach(_dll ${NX_NETPLAY_DLLS})
+        add_custom_command(TARGET nxshpack POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           "${_dll}" "$<TARGET_FILE_DIR:nxshpack>")
+    endforeach()
+
     # the game: the runtime (kernel, SVCs, services) around the lifted code
     nx_game_exe(${NX_NAME} OFF)
     # the same for players (NX_PACKAGE: the game read from their own NSPs in game\, data under %LOCALAPPDATA%, no
@@ -243,7 +254,7 @@ function(nx_game_exe target package)
     target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
     target_include_directories(${target} PRIVATE "${NX_ROOT}/runtime" "${CMAKE_BINARY_DIR}"
                                "${NX_VULKAN_INCLUDE}" "${NX_SDL3_INCLUDE}")
-    target_link_libraries(${target} PRIVATE ${libs} dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
+    target_link_libraries(${target} PRIVATE ${libs} nx_zstd dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
                           windowscodecs "${NX_SDL3_LIB}")
     add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${NX_SDL3_DLL}" "$<TARGET_FILE_DIR:${target}>")
@@ -255,14 +266,13 @@ function(nx_game_exe target package)
         target_compile_definitions(${target} PRIVATE NX_PACKAGE)
         target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
     endif()
+    foreach(_dll ${NX_NETPLAY_DLLS})            # zstd's (and ENet's) DLLs when they come from vcpkg
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           "${_dll}" "$<TARGET_FILE_DIR:${target}>")
+    endforeach()
     if(G_NETPLAY)
-        nx_netplay_libs()
         target_sources(${target} PRIVATE ${NX_NETPLAY_SOURCES})
         target_compile_definitions(${target} PRIVATE NX_NETPLAY)
-        foreach(_dll ${NX_NETPLAY_DLLS})
-            add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                               "${_dll}" "$<TARGET_FILE_DIR:${target}>")
-        endforeach()
-        target_link_libraries(${target} PRIVATE nx_enet nx_zstd winhttp comctl32)
+        target_link_libraries(${target} PRIVATE nx_enet winhttp comctl32)
     endif()
 endfunction()

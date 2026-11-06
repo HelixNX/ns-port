@@ -17,6 +17,7 @@
 #include <process.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <zstd.h>
 
 static CRITICAL_SECTION gpu_cs;
 static u64 frame_no;                    /* frames presented so far */
@@ -2551,6 +2552,58 @@ static void descset_sync(DescSet *d) {
 
 /* ---- shaders */
 static char spv_dir[MAX_PATH];
+static bool have_translator;            /* translate.py is there (the JIT can run) */
+
+/* The shader pack (tools/shader/pack.c): every shader translated at build time, one zstd frame each, so a package
+ * needs no translator. shaders.pak next to the executable, else in the cache's shaders\ (NX_SHADER_PACK names
+ * another). Used only when it was made by the translator version in use (a package without translate.py takes the
+ * pack's); loose files in spv\<version> (the JIT's) come first */
+typedef struct PakEnt { u64 hash; u32 mask, size; u64 offset; u32 packed, pad; } PakEnt;
+static struct { HANDLE f; PakEnt *ents; u32 n, translator; bool usable; } pak;
+
+static void pak_open(void) {
+    char path[MAX_PATH + 32];
+    const char *e = getenv("NX_SHADER_PACK");
+    if (e) snprintf(path, sizeof path, "%s", e);
+    else {
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        char *s = strrchr(path, '\\');
+        if (s) s[1] = 0;
+        strcat(path, "shaders.pak");
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+            snprintf(path, sizeof path, "%s\\shaders\\shaders.pak", nx_cache_dir());
+    }
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    u32 hdr[4];
+    DWORD got;
+    PakEnt *ents = NULL;
+    if (ReadFile(f, hdr, sizeof hdr, &got, NULL) && got == sizeof hdr && hdr[0] == 0x5053584e && hdr[1] == 1 &&
+        hdr[3] < (1u << 24) && (ents = malloc((size_t)hdr[3] * sizeof *ents + 1)) != NULL &&
+        ReadFile(f, ents, hdr[3] * (DWORD)sizeof *ents, &got, NULL) && got == hdr[3] * sizeof *ents) {
+        pak.f = f;
+        pak.ents = ents;
+        pak.n = hdr[3];
+        pak.translator = hdr[2];
+        hlog(1, "gpu: shader pack %s: %u shaders, translator %08x", path, pak.n, pak.translator);
+        return;
+    }
+    hlog(0, "gpu: %s is not a shader pack", path);
+    free(ents);
+    CloseHandle(f);
+}
+
+static const PakEnt *pak_find(u64 hash, u32 mask) {
+    if (!pak.usable) return NULL;
+    u32 lo = 0, hi = pak.n;
+    while (lo < hi) {
+        u32 mid = (lo + hi) / 2;
+        const PakEnt *p = &pak.ents[mid];
+        if (p->hash < hash || (p->hash == hash && p->mask < mask)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < pak.n && pak.ents[lo].hash == hash && pak.ents[lo].mask == mask ? &pak.ents[lo] : NULL;
+}
 
 static void spv_path(char *path, size_t size, u64 hash) {
     if (!spv_dir[0]) {
@@ -2558,23 +2611,76 @@ static void spv_path(char *path, size_t size, u64 hash) {
         CreateDirectoryA(spv_dir, NULL);
         strcat(spv_dir, "\\spv");
         CreateDirectoryA(spv_dir, NULL);
+        pak_open();
         /* translations live in a folder per translator version (FNV-1a of translate.py, as translate.py names it):
          * after a translator change every shader is translated again, nothing stale is used */
         char tp[MAX_PATH];
         translator_path(tp, sizeof tp);
         FILE *f = fopen(tp, "rb");
+        u32 h = 0;
         if (f) {
-            u32 h = 2166136261u;
+            h = 2166136261u;
             int ch;
             while ((ch = fgetc(f)) != EOF) h = (h ^ (u8)ch) * 16777619u;
             fclose(f);
+            have_translator = true;
+        } else if (pak.f) h = pak.translator;
+        if (pak.f) {
+            pak.usable = pak.translator == h;
+            if (!pak.usable) hlog(0, "gpu: the shader pack is from translator %08x, not %08x: not used", pak.translator, h);
+        }
+        if (f || pak.f) {
             size_t n = strlen(spv_dir);
             snprintf(spv_dir + n, sizeof spv_dir - n, "\\%08x", h);
             CreateDirectoryA(spv_dir, NULL);
-            hlog(1, "gpu: shader translations in %s", spv_dir);
+            hlog(1, "gpu: shader translations in %s%s", spv_dir, have_translator ? "" : " (no translator: the pack only)");
         }
     }
     snprintf(path, size, "%s\\%016llx.spv", spv_dir, hash);
+}
+
+/* a shader's SPIR-V (malloc'd, *n bytes): the loose file, else the pack; NULL if neither has it */
+static u32 *spv_read(u64 hash, long *n) {
+    char path[MAX_PATH + 32];
+    spv_path(path, sizeof path, hash);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        u32 *code = sz > 0 ? malloc(sz) : NULL;
+        size_t got = code ? fread(code, 1, sz, f) : 0;
+        fclose(f);
+        if (code && got == (size_t)sz) { *n = sz; return code; }
+        free(code);
+    }
+    const PakEnt *e = pak_find(hash, 0);
+    if (!e) return NULL;
+    void *z = malloc(e->packed);
+    u32 *code = malloc(e->size + 4);
+    OVERLAPPED ov = {0};                /* reads at an offset: no shared file position, any thread */
+    ov.Offset = (DWORD)e->offset;
+    ov.OffsetHigh = (DWORD)(e->offset >> 32);
+    DWORD got = 0;
+    bool ok = z && code && ReadFile(pak.f, z, e->packed, &got, &ov) && got == e->packed;
+    if (ok) {
+        size_t r = ZSTD_decompress(code, e->size, z, e->packed);
+        ok = !ZSTD_isError(r) && r == e->size;
+    }
+    free(z);
+    if (!ok) {
+        hlog(0, "gpu: shader %016llx: bad entry in the shader pack", hash);
+        free(code);
+        return NULL;
+    }
+    *n = (long)e->size;
+    return code;
+}
+
+static bool spv_exists(u64 hash) {
+    char path[MAX_PATH + 32];
+    spv_path(path, sizeof path, hash);
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES || pak_find(hash, 0);
 }
 
 /* Shaders are translated while the game runs. A shader the game creates with no SPIR-V is queued at once
@@ -2730,7 +2836,10 @@ static u64 jit_request_variant(u64 hash, u32 mask) {
     static volatile LONG state;         /* 0 not started, 1 starting, 2 on, 3 off */
     if (state != 2 && state != 3) {
         if (InterlockedCompareExchange(&state, 1, 0) == 0) {
-            bool on = env.shader_jit;
+            char tmp[MAX_PATH + 32];
+            spv_path(tmp, sizeof tmp, 0);           /* finds the translator and the pack */
+            bool on = env.shader_jit && have_translator;
+            if (!have_translator) hlog(1, "gpu: no shader translator: shaders come from the pack, others are skipped");
             if (on) {
                 jit.wake = CreateEventA(NULL, FALSE, FALSE, NULL);
                 _beginthreadex(NULL, 0, jit_thread, NULL, 0, NULL);
@@ -2759,19 +2868,16 @@ static u64 jit_request(u64 hash) { return jit_request_variant(hash, 0); }
 
 /* nvn.c: the game made a shader (its code is dumped): translate it now if it has no SPIR-V */
 void gpu_shader_created(ShaderCode *s) {
-    char path[MAX_PATH + 32];
-    spv_path(path, sizeof path, s->hash);
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) s->jit_seq = jit_request(s->hash);
+    if (!spv_exists(s->hash)) s->jit_seq = jit_request(s->hash);
 }
 
 static bool jit_pending(u64 seq) { return seq && __atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq; }
 
 /* NULL either for good (s->missing) or, when !wait, while its translation is still running (try again later) */
 static VkShaderModule shader_load(ShaderCode *s, bool wait) {
-    char path[MAX_PATH + 32];
-    spv_path(path, sizeof path, s->hash);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    long n = 0;
+    u32 *code = spv_read(s->hash, &n);
+    if (!code) {
         if (!s->jit_seq) s->jit_seq = jit_request(s->hash);
         u64 seq = s->jit_seq;
         if (!wait && jit_pending(seq)) return NULL;
@@ -2781,20 +2887,15 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
             hlog(1, "gpu: waited %llu ms for shader %016llx", GetTickCount64() - t0, s->hash);
             hf.jit += (double)(GetTickCount64() - t0);
             hf.njit++;
-            f = fopen(path, "rb");
+            code = spv_read(s->hash, &n);
         }
-        if (!f) {
+        if (!code) {
             s->missing = true;
-            hlog(0, "gpu: shader %016llx has no translation%s", s->hash, seq ? " (translate.py failed on it)" : "");
+            hlog(0, "gpu: shader %016llx has no translation%s", s->hash,
+                 seq ? " (translate.py failed on it)" : have_translator ? "" : " (not in the shader pack: its draws are skipped)");
             return NULL;
         }
     }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    u32 *code = malloc(n);
-    fread(code, 1, n, f);
-    fclose(f);
     u32 cb_id[17], ncb = 0;             /* the cbN variables (OpName comes before OpDecorate) */
     u8 cb_n[17];
     for (u32 k = 0; k < 16; k++) s->cb_of_slot[k] = (u8)k;
@@ -2865,65 +2966,8 @@ static VkShaderModule shader_module_w(ShaderCode *s, bool wait) {
 
 static VkShaderModule shader_module(ShaderCode *s) { return shader_module_w(s, true); }
 
-/* A vertex shader fed integer vertex formats (8/16-bit UINT/SINT; 32-bit ones are fetched as float, which keeps
- * the bits) needs those inputs declared uvec4 / ivec4: a variant translated with that mask (translate.py
- * <hash>:<mask>, 2 bits per location: 1 unsigned, 2 signed), loaded or translated on first use */
-typedef struct Variant { u64 hash; u32 mask; VkShaderModule m; bool missing, done; u64 seq; struct Variant *next; } Variant;
-static Variant *variants[256];
-
-/* NULL with !wait while the base shader or the variant is being translated (the draw is skipped and tries again) */
-static VkShaderModule shader_variant(ShaderCode *s, u32 mask, bool wait) {
-    VkShaderModule base = shader_module_w(s, wait);
-    if (!mask || !base) return base;
-    Variant **b = &variants[(s->hash ^ mask) & 255], *v;
-    for (v = *b; v && (v->hash != s->hash || v->mask != mask); v = v->next) {}
-    if (v && v->done) return v->missing ? base : v->m;
-    if (v && !wait && jit_pending(v->seq)) return NULL;
-    if (!v) {
-        v = calloc(1, sizeof *v);
-        v->hash = s->hash;
-        v->mask = mask;
-        v->next = *b;
-        *b = v;
-    }
-    double t0 = ms_now();
-    char path[MAX_PATH + 48];
-    spv_path(path, sizeof path, s->hash);
-    snprintf(path + strlen(path) - 4, 16, "_%08x.spv", mask);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        if (!v->seq) v->seq = jit_request_variant(s->hash, mask);
-        u64 seq = v->seq;
-        if (!wait && jit_pending(seq)) return NULL;
-        if (seq) {
-            double tj = ms_now();
-            while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
-            hf.jit += ms_now() - tj;
-            hf.njit++;
-            f = fopen(path, "rb");
-        }
-    }
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long n = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        u32 *code = malloc(n);
-        fread(code, 1, n, f);
-        fclose(f);
-        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)n, .pCode = code};
-        if (vkCreateShaderModule(vk.dev, &ci, NULL, &v->m) != VK_SUCCESS) v->m = NULL;
-        free(code);
-    }
-    v->missing = !v->m;
-    v->done = true;
-    hf.shader += ms_now() - t0;
-    hf.nshader++;
-    hlog(1, "gpu: shader %016llx with integer inputs %08x%s", s->hash, mask,
-         v->missing ? ": no translation, using the float one" : "");
-    return v->missing ? base : v->m;
-}
-
-/* the integer-input mask of the bound vertex attributes (see shader_variant) */
+/* the integer-input mask of the bound vertex attributes: 2 bits per location, 1 unsigned, 2 signed (8/16-bit
+ * UINT / SINT, fetched as USCALED / SSCALED: the vertex shader's INT_ATTRS specialization constant, translate.py) */
 static u32 int_attr_mask(void) {
     u32 mask = 0;
     for (u32 i = 0; i < st.nattribs && i < 16; i++) {
@@ -2946,7 +2990,7 @@ static u32 int_attr_mask(void) {
  * keys too (compute = 1, the shader in vs). */
 typedef struct PipeKey {
     u64 vs, fs;                         /* shader hashes (fs 0: none) */
-    u32 vs_mask;                        /* the vertex shader's integer inputs (shader_variant) */
+    u32 vs_mask;                        /* the vertex shader's integer inputs (int_attr_mask, INT_ATTRS) */
     VkFormat color[8], depth, stencil;
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
@@ -3030,9 +3074,12 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
         /* the alpha test is a specialization constant, so a draw without one has no discard from it (early depth) */
         VkSpecializationMapEntry sme = {0, 0, sizeof k->alpha_func};
         VkSpecializationInfo spec = {1, &sme, sizeof k->alpha_func, &k->alpha_func};
+        /* the vertex shader's integer inputs (INT_ATTRS, constant 1): which inputs are fetched as USCALED / SSCALED */
+        VkSpecializationMapEntry vsme = {1, 0, sizeof k->vs_mask};
+        VkSpecializationInfo vspec = {1, &vsme, sizeof k->vs_mask, &k->vs_mask};
         VkPipelineShaderStageCreateInfo stages[2] = {
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp32 : NULL,
-             .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+             .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main", .pSpecializationInfo = &vspec},
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp32 : NULL,
              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main", .pSpecializationInfo = &spec}};
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -3271,7 +3318,7 @@ static VkPipeline pipeline_build(const PipeKey *k, VkShaderModule vs, VkShaderMo
     return pipe;
 }
 
-static VkShaderModule spv_module(u64 hash, u32 mask);
+static VkShaderModule spv_module(u64 hash);
 
 /* With NX_ASYNC_SHADERS, a graphics pipeline first needed during play is built by a worker (from the SPIR-V on
  * disk, as the prebuild does) and its draws are skipped until it is ready, as for shaders being translated: the
@@ -3294,7 +3341,7 @@ static unsigned __stdcall async_pipe_thread(void *arg) {
         if (!async_head) async_tail = NULL;
         ReleaseSRWLockExclusive(&async_lock);
         const PipeKey *k = &p->key;
-        VkShaderModule vs = spv_module(k->vs, k->vs_mask), fs = k->fs ? spv_module(k->fs, 0) : NULL;
+        VkShaderModule vs = spv_module(k->vs), fs = k->fs ? spv_module(k->fs) : NULL;
         if (vs && (!k->fs || fs)) {
             p->pipe = pipeline_build(k, vs, fs);
             InterlockedIncrement(&async_built);
@@ -3382,22 +3429,14 @@ static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModu
     return pipe;
 }
 
-/* a module from the SPIR-V on disk (the variant with integer inputs `mask`), for the prebuild; NULL if not there */
-static VkShaderModule spv_module(u64 hash, u32 mask) {
-    char path[MAX_PATH + 48];
-    spv_path(path, sizeof path, hash);
-    if (mask) snprintf(path + strlen(path) - 4, 16, "_%08x.spv", mask);
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    u32 *code = malloc(n);
-    size_t got = fread(code, 1, n, f);
-    fclose(f);
+/* a module from the SPIR-V on disk or in the pack, for the prebuild; NULL if not there */
+static VkShaderModule spv_module(u64 hash) {
+    long n = 0;
+    u32 *code = spv_read(hash, &n);
+    if (!code) return NULL;
     VkShaderModule m = NULL;
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)n, .pCode = code};
-    if (got != (size_t)n || vkCreateShaderModule(vk.dev, &ci, NULL, &m) != VK_SUCCESS) m = NULL;
+    if (vkCreateShaderModule(vk.dev, &ci, NULL, &m) != VK_SUCCESS) m = NULL;
     free(code);
     return m;
 }
@@ -3411,7 +3450,7 @@ static unsigned __stdcall prebuild_thread(void *arg) {
     (void)arg;
     for (LONG i; (i = InterlockedIncrement(&pre_next) - 1) < (LONG)pre_n;) {
         const PipeKey *k = &pre_keys[i];
-        VkShaderModule vs = spv_module(k->vs, k->vs_mask), fs = k->fs ? spv_module(k->fs, 0) : NULL;
+        VkShaderModule vs = spv_module(k->vs), fs = k->fs ? spv_module(k->fs) : NULL;
         bool claimed = false;
         Pipe *p = vs && (!k->fs || fs) ? pipe_claim(k, P_BUILDING, &claimed) : NULL;
         if (claimed) {
@@ -3842,7 +3881,8 @@ static void set_vertex_input(VkCommandBuffer c) {
         /* shader inputs are all float and read as raw bits (Maxwell hands integer attributes over as integers):
          * 32-bit integer formats are fetched as the same-size float format, which keeps the bits (a UINT/SINT
          * format into a float input is undefined; AMD did not keep them and integer-packed meshes vanished).
-         * 8/16-bit integer formats would need integer shader inputs (not done) */
+         * 8/16-bit ones are fetched as USCALED / SSCALED (the same values, exact as floats), which the vertex
+         * shader turns back into integers where the pipeline's INT_ATTRS (int_attr_mask) says so */
         switch (vf) {
         case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: vf = VK_FORMAT_R32_SFLOAT; break;
         case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: vf = VK_FORMAT_R32G32_SFLOAT; break;
@@ -3852,11 +3892,21 @@ static void set_vertex_input(VkCommandBuffer c) {
             static u32 warned[8];      /* VkFormats are below 256 here: one bit each */
             bool small_int = (vf >= VK_FORMAT_R8_UINT && vf <= VK_FORMAT_R8G8B8A8_SINT && ((vf - VK_FORMAT_R8_UNORM) % 7 == 4 || (vf - VK_FORMAT_R8_UNORM) % 7 == 5)) ||
                              (vf >= VK_FORMAT_R16_UNORM && vf <= VK_FORMAT_R16G16B16A16_SFLOAT && ((vf - VK_FORMAT_R16_UNORM) % 7 == 4 || (vf - VK_FORMAT_R16_UNORM) % 7 == 5));
-            if (small_int && vf < 256 && !(warned[vf / 32] >> (vf % 32) & 1)) {
-                warned[vf / 32] |= 1u << (vf % 32);
-                hlog(0, "gpu: vertex attribute format %d (8/16-bit integer): vertex shaders get integer-input variants (first: %016llx)",
-                     vf, st.program && st.program->stage[ST_VERTEX] ? st.program->stage[ST_VERTEX]->hash : 0);
+            if (!small_int) break;
+            VkFormat scaled = (VkFormat)(vf - 2);          /* UINT -> USCALED, SINT -> SSCALED (int_attr_mask) */
+            bool once = vf < 256 && !(warned[vf / 32] >> (vf % 32) & 1);
+            if (once) warned[vf / 32] |= 1u << (vf % 32);
+            if (i >= 16) {             /* INT_ATTRS holds locations 0-15 */
+                if (once) hlog(0, "gpu: 8/16-bit integer vertex format %d at location %u: read as float bits", vf, i);
+                break;
             }
+            if (once) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(vk.phys, scaled, &fp);
+                if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
+                    hlog(0, "gpu: the device cannot fetch vertex format %d (for integer format %d)", scaled, vf);
+            }
+            vf = scaled;
             break;
         }
         }
@@ -4169,7 +4219,7 @@ static void draw_one(u32 op, const void *payload) {
     if (pr->mask & ~(1u << ST_VERTEX | 1u << ST_FRAGMENT)) { skip_draw("geometry or tessellation shaders"); return; }
     u32 vs_mask = int_attr_mask();
     bool wait = !env.async_shaders;
-    VkShaderModule vs = shader_variant(pr->stage[ST_VERTEX], vs_mask, wait);
+    VkShaderModule vs = shader_module_w(pr->stage[ST_VERTEX], wait);
     VkShaderModule fs = pr->stage[ST_FRAGMENT] ? shader_module_w(pr->stage[ST_FRAGMENT], wait) : NULL;
     if (!vs || (pr->stage[ST_FRAGMENT] && !fs)) {
         bool gone = pr->stage[ST_VERTEX]->missing || (pr->stage[ST_FRAGMENT] && pr->stage[ST_FRAGMENT]->missing);

@@ -4,8 +4,9 @@
  * Violet's emotes, so it is not also a stick), Z = A, X = B, C = X, V = Y, Q = L, R = R, 1 = ZL, 3 = ZR,
  * Enter = +, Backspace = -. Gamepads map by label (an Xbox pad's bottom button is A).
  * Mouse: the right stick while captured (a click in the window captures it, Esc or losing focus releases it): the
- * stick follows the mouse's smoothed speed, full at 2000 pixels a second times NX_MOUSE_SENS (default 1); below
- * 150 pixels a second (a resting hand on a high-resolution mouse) it stays centred.
+ * stick follows the mouse's smoothed speed, full at 1000 pixels a second times the sensitivity (options.c: the
+ * options panel Esc opens, settings.ini, NX_MOUSE_SENS; default 1); below 150 pixels a second (a resting hand on a
+ * high-resolution mouse) it stays centred. While the options panel is open the game gets no input.
  * NX_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
  * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
  * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks)
@@ -13,6 +14,7 @@
  * recorded by hand, replayed unattended), on top of live input. */
 #include <math.h>
 #include "hos.h"
+#include "options.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,10 +40,13 @@ static void mouse_capture(SDL_WindowID id, bool on) {
     mouse_dx = mouse_dy = 0;
 }
 
+/* options.c: Esc opens the options panel, which frees the mouse */
+void input_release_mouse(SDL_WindowID id) {
+    if (mouse_captured) mouse_capture(id, false);
+}
+
 void input_event(const SDL_Event *e) {
     if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouse_captured) mouse_capture(e->button.windowID, true);
-    else if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_ESCAPE && mouse_captured)
-        mouse_capture(e->key.windowID, false);
     else if (e->type == SDL_EVENT_WINDOW_FOCUS_LOST && mouse_captured) mouse_capture(e->window.windowID, false);
     else if (e->type == SDL_EVENT_MOUSE_MOTION && mouse_captured) {
         mouse_dx += e->motion.xrel;
@@ -134,6 +139,11 @@ static bool replayed(u64 frame, u64 *b, s32 *lx, s32 *ly, s32 *rx, s32 *ry) {
 }
 
 void input_poll(void) {
+    if (options_is_open()) {                            /* the panel has the keyboard and the mouse */
+        mouse_dx = mouse_dy = 0;
+        hid_set_input(0, 0, 0, 0, 0, 0);
+        return;
+    }
     const bool *k = SDL_GetKeyboardState(NULL);
     u64 b = 0;
     s32 lx = 0, ly = 0, rx = 0, ry = 0;
@@ -173,10 +183,9 @@ void input_poll(void) {
         if (bx * bx + by * by > 6000 * 6000) { rx = axis(bx); ry = axis(-by); }
     }
     {                                                   /* the mouse's speed (pixels a second), smoothed over ~50 ms */
-        static float vx, vy, sens;
+        static float vx, vy;
         static u64 last;
-        if (!sens) sens = getenv("NX_MOUSE_SENS") ? (float)atof(getenv("NX_MOUSE_SENS")) : 1.0f;
-        if (sens <= 0) sens = 1.0f;
+        float sens = options_mouse_sens();
         u64 now = SDL_GetTicksNS();
         float dt = last ? (float)(now - last) * 1e-9f : 0.008f;
         last = now;
@@ -188,7 +197,7 @@ void input_poll(void) {
         }
         mouse_dx = mouse_dy = 0;
         if (!mouse_captured) vx = vy = 0;
-        float mx = vx * sens * (32767.0f / 2000.0f), my = -vy * sens * (32767.0f / 2000.0f);   /* y points down */
+        float mx = vx * sens * (32767.0f / 1000.0f), my = -vy * sens * (32767.0f / 1000.0f);   /* y points down */
         if (vx * vx + vy * vy > 150.0f * 150.0f) {
             rx = mx > 32767 ? 32767 : mx < -32767 ? -32767 : (s32)mx;
             ry = my > 32767 ? 32767 : my < -32767 ? -32767 : (s32)my;

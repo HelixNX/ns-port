@@ -17,7 +17,9 @@ Usage:
     python a64lift.py cover <module> [...]                 coverage statistics, nothing written
     python a64lift.py lift  <outdir> [--only mod:0xOFF,...] lift every module into <outdir>
 Lifting runs in NX_LIFT_PROCS worker processes (default: by free memory, ~3 GB each, at most 8); 1 lifts in this one.
-Modules are read from <dump>/elf/<module>.elf and <analysis>/<module>_ida.json (game.json).
+Modules are read from <dump>/elf/<module>.elf and <analysis>/<module>_ida.json (game.json): an IDA / Ghidra export
+(ida_export.py, tools/ghidra), or, when there is none, written from the module's unwind tables (../funcs.py: the same
+lift without IDA or Ghidra, as players build it).
 """
 import collections
 import concurrent.futures
@@ -57,6 +59,10 @@ class Mod:
         self.name = name
         elf = elf or os.path.join(gamecfg.ELF, name + '.elf')
         ida = ida or os.path.join(gamecfg.ANALYSIS, name + '_ida.json')
+        if not os.path.exists(ida):         # no IDA / Ghidra export: the module's own unwind tables (funcs.py)
+            import funcs
+            os.makedirs(os.path.dirname(ida), exist_ok=True)
+            funcs.export(elf, ida)
         self.m = Module(elf)
         self.base = BASES[name]
         self.text = self.m.text
@@ -74,7 +80,8 @@ class Mod:
         self.analyse(json.load(open(ida)))
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         with open(cache, 'wb') as f:
-            pickle.dump((key, {k: v for k, v in self.__dict__.items() if k != 'm'}), f, pickle.HIGHEST_PROTOCOL)
+            pickle.dump((key, {k: v for k, v in self.__dict__.items() if k not in ('m', '_bt_cache')}), f,
+                        pickle.HIGHEST_PROTOCOL)
 
     def analyse(self, ida):
         data = set()
@@ -186,7 +193,9 @@ class Mod:
                     if w & 0xfffffc1f != 0xd61f0000 or a in self.switches:
                         continue
                     cases = (self.jump_table(range(max(self.text[0], a - 0x800), a, 4), (w >> 5) & 31, inside) or
-                             self.jump_table(range(max(self.text[0], a - 0x4000), a, 4), (w >> 5) & 31, inside))
+                             self.jump_table(range(max(self.text[0], a - 0x4000), a, 4), (w >> 5) & 31, inside) or
+                             self.jump_table(range(max(self.text[0], a - 0x40), a, 4), (w >> 5) & 31, inside,
+                                             self.table_candidates(offs)))
                     if not cases:
                         continue
                     self.switches[a] = cases
@@ -204,6 +213,20 @@ class Mod:
         if found:
             print('%s: %d jump tables found beyond IDA\'s (%d instructions of case code added)' % (self.name, found, grown))
         return found
+
+    def table_candidates(self, offs):
+        """(start, end, addresses in the read-only segment the function builds with ADRP + ADD) for jump_table"""
+        page, addrs = {}, set()
+        for a in offs:
+            w = self.word(a)
+            if w & 0x9f000000 == 0x90000000:                                    # ADRP
+                imm = ((w >> 29) & 3) | (((w >> 5) & 0x7ffff) << 2)
+                page[w & 31] = (a & ~0xfff) + (sext(imm, 21) << 12)
+            elif w & 0xff800000 == 0x91000000 and (w >> 5) & 31 in page:       # ADD (immediate), 64-bit
+                c = page[(w >> 5) & 31] + (((w >> 10) & 0xfff) << (12 if w & (1 << 22) else 0))
+                if self.m.ro[0] <= c < self.m.ro[1]:
+                    addrs.add(c)
+        return offs[0], offs[-1] + 4, sorted(addrs)
 
     def flow(self, starts):
         """Instructions reachable from starts without entering any function's code (as recover_from walks)."""
@@ -223,14 +246,19 @@ class Mod:
             work.append(a + 4)
         return addrs
 
-    def jump_table(self, before, reg, inside):
+    def jump_table(self, before, reg, inside, candidates=None):
         """The cases of `br reg` after the instructions `before` (module offsets, in order), or None. The number of
         entries comes from the index's bound when one is seen (AND with a low mask, UBFX / UXTB / UXTH; a CMP #n
         shortly before the BR, guarding B.HI); without one, up to 256 entries are read while their targets stay
-        within 16 KB."""
+        within 16 KB. When the table's address is not known from the instructions before (another path set it: the
+        register holds different values on different paths, as in main+280318), `candidates` (start, end, addresses)
+        gives the function's bounds and every address it builds with ADRP + ADD: each one whose entries (a known
+        bound needed) all land inside the function is taken, their cases joined (an extra label is harmless; a
+        missing one is a guest trap at run time)."""
         defs = {}                                   # register -> (kind, ...), from the instructions before the BR
         bounds = {}                                 # register -> entries its value can index (AND mask)
         last_cmp = None                             # (offset, n + 1) of the last CMP #n
+        cmps = []                                   # (offset, register, n + 1) of every CMP / CCMP #n
         before = list(before)
         for a in before:
             w = self.word(a)
@@ -253,7 +281,9 @@ class Mod:
                     continue
                 tab = defs.get((w >> 5) & 31)
                 idx = (w >> 16) & 31
-                defs[rd] = ('entry', tab[1], 1 << size, signed, bounds.get(idx)) if tab and tab[0] == 'addr' else None
+                # a table address not known here (loaded on another path) is guessed below (candidates)
+                defs[rd] = ('entry', tab[1] if tab and tab[0] == 'addr' else None, 1 << size, signed, bounds.get(idx),
+                            idx)
             elif w & 0xff200000 == 0x8b000000 and (w >> 22) & 3 == 0:          # ADD (shifted register), LSL
                 defs[rd] = self._table_sum(defs, (w >> 5) & 31, (w >> 16) & 31, (w >> 10) & 63)
             elif w & 0xffe00000 == 0x8b200000 and (w >> 13) & 7 in (2, 6):    # ADD (extended register), UXTW/SXTW
@@ -261,6 +291,9 @@ class Mod:
             else:                                   # anything else: forget what it writes
                 if w & 0x7f80001f == 0x7100001f:                                # CMP (immediate)
                     last_cmp = (a, (((w >> 10) & 0xfff) << (12 if w & (1 << 22) else 0)) + 1)
+                    cmps.append((a, (w >> 5) & 31, last_cmp[1]))
+                elif w & 0x7fe00c10 == 0x7a400800:                              # CCMP (immediate)
+                    cmps.append((a, (w >> 5) & 31, ((w >> 16) & 31) + 1))
                 for r in self._writes(w):
                     defs[r] = None
                     bounds.pop(r, None)
@@ -278,30 +311,126 @@ class Mod:
         d = defs.get(reg)
         if not d or d[0] != 'table':
             return None
-        _, base, tab, esize, signed, shift, bound = d
-        if last_cmp and before and before[-1] - last_cmp[0] <= 0x30 and last_cmp[1] <= 0x10000:
-            bound = min(bound, last_cmp[1]) if bound else last_cmp[1]
-        cases = []
+        _, base, tab, esize, signed, shift, mask_bound, idx = d
+        # Possible sizes, tried largest first, the first whose entries are all valid taken: the index register's
+        # compares shortly before (a chain of CMP / CCMP, main+6d4988; the nearest compare can test another
+        # register, main+e6e5e8), the last compare (the index is often a copy of the compared register,
+        # sdk+4d7dac), each capped by an AND / UBFX bound. Too few entries lose cases (a guest trap at run time),
+        # too many read the next table (rejected when an entry is not code, then a smaller size is tried)
+        sizes = {n for a, r, n in cmps if r == idx and before and before[-1] - a <= 0x48}    # sdk+59c7b8: 0x3c
+        if last_cmp and before and before[-1] - last_cmp[0] <= 0x30:
+            sizes.add(last_cmp[1])
+        sizes = {min(n, mask_bound) if mask_bound else n for n in sizes if n <= 0x10000}
+        if mask_bound and not sizes:
+            sizes = {mask_bound}
         t0, t1 = self.text
-        for k in range(bound if bound else 256):
-            ea = tab + k * esize
-            if not (self.m.ro[0] <= ea < self.m.ro[1] or t0 <= ea < t1):
-                return cases or None
-            e = int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed)
-            t = base + (e << shift)
-            if bound:                               # a known size: every entry must be code nearby
-                if t & 3 or not (t0 <= t < t1) or abs(t - base) >= 0x10000 or not self.word(t):
-                    return None
-            elif t & 3 or not (t in inside or (t0 <= t < t1 and abs(t - base) < 0x4000 and self.word(t))):
+        if tab is None:
+            if not candidates or not sizes:
+                return None
+            fs, fe, addrs = candidates
+            for bound in sorted(sizes, reverse=True):
+                cases = set()
+                for c in addrs:
+                    got = []
+                    for k in range(bound):
+                        ea = c + k * esize
+                        if not self.m.ro[0] <= ea + esize <= self.m.ro[1]:
+                            break
+                        t = base + (int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed) << shift)
+                        if t & 3 or not fs <= t < fe:
+                            break
+                        got.append(t)
+                    else:
+                        cases.update(got)
+                if cases:
+                    return sorted(cases)
+            return None
+        # entries pointing at a zero word are cases that cannot happen (clang's trap for unreachable; sdk+181418)
+        sized = None
+        for bound in sorted(sizes, reverse=True):   # a known size: every entry must be code nearby
+            cases = []
+            for k in range(bound):
+                ea = tab + k * esize
+                if not (self.m.ro[0] <= ea < self.m.ro[1] or t0 <= ea < t1):
+                    break
+                t = base + (int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed) << shift)
+                if t & 3 or not (t0 <= t < t1) or abs(t - base) >= 0x10000:
+                    break
+                cases.append(t)
+            else:
+                if any(self.word(t) for t in cases):
+                    sized = cases
+                    break
+            if len(cases) < bound and not (self.m.ro[0] <= tab + len(cases) * esize < self.m.ro[1] or
+                                           t0 <= tab + len(cases) * esize < t1) and any(self.word(t) for t in cases):
+                sized = cases                       # the table ends at the segment's end
                 break
-            cases.append(t)
-        return cases or None
+        # Also read on to the next data object (an address code builds with ADRP + ADD, mod.ro_refs) while the
+        # targets stay in or near the function: a size from a compare on another path can be too small
+        # (main+3fb1e4: 5 of 6; main+285ab4 has no guard on its path), and reading too far only adds labels (cases
+        # are a C switch on the target address), where a missing case is a guest trap at run time
+        if inside:
+            fs, fe = min(inside), max(inside) + 4
+        else:
+            fs, fe = base - 0x4000, base + 0x4000
+        free = []
+        refs = getattr(self, 'ro_refs', ())
+        for k in range(1024):
+            ea = tab + k * esize
+            if not (self.m.ro[0] <= ea < self.m.ro[1] or t0 <= ea < t1) or (k and ea in refs):
+                break
+            t = base + (int.from_bytes(self.m.bytes(ea, esize), 'little', signed=signed) << shift)
+            # a case that starts another function (a tail block with an unwind entry of its own, main+285ab4's
+            # second entry) does not end the table: the dynamic path enters functions anyway
+            if t & 3 or not (t0 <= t < t1) or not (t in inside or fs <= t < fe or abs(t - base) < 0x400 or
+                                                   (t in self.funcs and abs(t - base) < 0x10000) or
+                                                   (fe <= t < fe + 0x10 and not self.word(t)) or
+                                                   (not inside and abs(t - base) < 0x4000 and self.word(t))):
+                break
+            free.append(t)
+        if sized is None and sizes and not free:
+            return None
+        cases = list(dict.fromkeys((sized or []) + free))
+        if not any(self.word(t) for t in cases):
+            return None
+        if esize == 1 and shift == 2 and inside:
+            cases += self.byte_table_blocks(base, inside)
+        return list(dict.fromkeys(cases))
+
+    def byte_table_blocks(self, base, inside):
+        """Every possible case of a byte table (base + 4 * 0..255) that starts a block of the function (a branch
+        target in it, or after an unconditional branch / return): complete whatever size was guessed, the table's
+        address included (main+4ee014's comes from another path). Extra labels cost little."""
+        out = []
+        for t in range(base, base + 0x400, 4):
+            if t not in inside:
+                continue
+            p = self.word(t - 4)
+            if p & 0xfffffc1f in (0xd65f0000, 0xd61f0000) or p & 0xfc000000 == 0x14000000 or \
+                    p & 0xffe0001f in (0xd4200000, 0xd4000001) or p == 0:
+                out.append(t)
+        targets = self._branch_targets_in(inside)
+        out += [t for t in range(base, base + 0x400, 4) if t in targets]
+        return out
+
+    def _branch_targets_in(self, inside):
+        key = min(inside)
+        cache = self.__dict__.setdefault('_bt_cache', {})
+        if key not in cache:
+            cache.clear()                           # one function at a time (recover_switches' order)
+            ts = set()
+            for a in inside:
+                w = self.word(a)
+                if w & 0xfc000000 != 0x94000000:
+                    ts.update(t - self.base for t in branch_targets(w, self.base + a))
+            cache[key] = ts
+        return cache[key]
 
     @staticmethod
     def _table_sum(defs, rn, rm, shift):
         b, e = defs.get(rn), defs.get(rm)
         if b and e and b[0] == 'addr' and e[0] == 'entry':
-            return ('table', b[1], e[1], e[2], e[3], shift, e[4])
+            return ('table', b[1], e[1], e[2], e[3], shift, e[4], e[5])     # e[1] None: table address unknown
         return None
 
     @staticmethod
@@ -590,10 +719,13 @@ def secondary_entries(mod):
 
 
 def code_address_refs(mod):
-    """Text addresses computed by ADR, or by ADRP followed by ADD to the same register."""
+    """Text addresses computed by ADR, or by ADRP followed by ADD to the same register. The read-only addresses
+    computed by ADRP + ADD go to mod.ro_refs: where data objects start (jump_table ends a table at the next one)."""
     def sx(v, b):
         return v - (1 << b) if v >> (b - 1) & 1 else v
     out = set()
+    ro = set()
+    r0, r1 = mod.m.ro
     t0, t1 = mod.text
     for a in range(t0, t1 - 4, 4):
         w = mod.word(a)
@@ -608,6 +740,8 @@ def code_address_refs(mod):
                     t = page + ((w2 >> 10) & 0xfff)
                     if t0 <= t < t1 and not t & 3:
                         out.add(t)
+                    elif r0 <= t < r1:
+                        ro.add(t)
                 if w2 & 0xfc000000 in (0x14000000, 0x94000000) or w2 & 0xfffffc1f == 0xd65f0000 or \
                         (w2 & 0x9f000000 == 0x90000000 and w2 & 31 == rd):
                     break             # B, BL, RET or a new ADRP to rd end the search (extra hits only add entries)
@@ -616,6 +750,7 @@ def code_address_refs(mod):
             continue
         if t0 <= t < t1 and not t & 3:
             out.add(t)
+    mod.ro_refs = ro
     return out
 
 

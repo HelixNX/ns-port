@@ -1,11 +1,16 @@
 # A folder for players (run inside a game's repo): the packaged executable (NX_PACKAGE: the game read from the
-# player's own NSPs and keys in game\, data under %LOCALAPPDATA%\<title>\), its DLLs, the shader translator (an
-# embeddable Python, translate.py, glslang) and the room server. Nothing from the game goes in it.
-# Usage: package.ps1 -Out <dir> -PythonZip <python-3.x-embed-amd64.zip> [-NoBuild]
-#   -PythonZip  Python's official "Windows embeddable package (64-bit)" (python.org), unpacked into translator\python
-#   glslang comes from %VULKAN_SDK%\Bin\glslangValidator.exe
-param([Parameter(Mandatory)] [string]$Out, [Parameter(Mandatory)] [string]$PythonZip, [switch]$NoBuild)
+# player's own NSPs and keys in game\, data under %LOCALAPPDATA%\<title>\), its DLLs, the shaders (translated
+# beforehand in shaders.pak, or the translator: an embeddable Python, translate.py, glslang) and the room server.
+# Usage: package.ps1 -Out <dir> (-ShaderPack <shaders.pak> | -PythonZip <python-3.x-embed-amd64.zip>) [-NoBuild]
+#   -ShaderPack  every shader translated beforehand (translate.py --spv, then nxshpack: tools/shader/pack.c), next to
+#                the exe; no translator in the package. Built from the game's files, as the exe's lifted code is
+#   -PythonZip   Python's official "Windows embeddable package (64-bit)" (python.org), unpacked into translator\python:
+#                shaders translated on the player's PC as the game first uses them; glslang comes from
+#                %VULKAN_SDK%\Bin\glslangValidator.exe
+param([Parameter(Mandatory)] [string]$Out, [string]$ShaderPack, [string]$PythonZip, [switch]$NoBuild)
 $ErrorActionPreference = 'Stop'
+if (-not $ShaderPack -and -not $PythonZip) { throw 'give -ShaderPack (shaders translated beforehand) or -PythonZip (the translator)' }
+if ($ShaderPack -and -not (Test-Path $ShaderPack)) { throw "no $ShaderPack" }
 $tools = $PSScriptRoot
 $d = (Get-Location).Path
 while ($d -and -not (Test-Path "$d\game.json")) { $d = Split-Path -Parent $d }
@@ -19,9 +24,11 @@ if (-not $NoBuild) {
 }
 $exe = Get-ChildItem $pkg -Filter *.exe | Select-Object -First 1
 if (-not $exe) { throw "no packaged executable in $pkg" }
-if (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN_SDK\Bin\glslangValidator.exe")) { throw 'no %VULKAN_SDK%\Bin\glslangValidator.exe' }
+if (-not $ShaderPack -and (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN_SDK\Bin\glslangValidator.exe"))) {
+    throw 'no %VULKAN_SDK%\Bin\glslangValidator.exe'
+}
 
-New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware", "$Out\translator\Bin", "$Out\room" | Out-Null
+New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware", "$Out\room" | Out-Null
 Copy-Item $exe.FullName, "$pkg\*.dll" $Out -Force
 # the Visual C++ runtime next to the exe (app-local, as Microsoft allows), so players need no redistributable;
 # the UCRT (api-ms-win-crt-*) is part of Windows 10 and 11
@@ -32,13 +39,21 @@ $crt = if ($vs) { Get-ChildItem "$vs\VC\Redist\MSVC" -Directory -ErrorAction Sil
     Sort-Object FullName | Select-Object -Last 1 }
 if (-not $crt) { throw "no Visual C++ redistributable folder (VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT) in Visual Studio" }
 $vcrt = 'vcruntime140.dll', 'vcruntime140_1.dll' | ForEach-Object { "$($crt.FullName)\$_" }
-Copy-Item "$tools\shader\translate.py", "$tools\shader\maxwell.py" "$Out\translator" -Force
-Copy-Item "$env:VULKAN_SDK\Bin\glslangValidator.exe" "$Out\translator\Bin" -Force
-if (Test-Path "$Out\translator\python") { Remove-Item -Recurse -Force -Confirm:$false "$Out\translator\python" }
-Expand-Archive $PythonZip "$Out\translator\python"
-# the embeddable Python's search path is its ._pth file: add translator\ (translate.py imports maxwell.py)
-$pth = Get-ChildItem "$Out\translator\python" -Filter 'python*._pth' | Select-Object -First 1
-Add-Content $pth.FullName '..'
+if ($ShaderPack) {
+    # the pack replaces the translator: without translate.py the runtime takes shaders from the pack only (gpu.c)
+    if (Test-Path "$Out\translator") { Remove-Item -Recurse -Force -Confirm:$false "$Out\translator" }
+    Copy-Item $ShaderPack "$Out\shaders.pak" -Force
+} else {
+    if (Test-Path "$Out\shaders.pak") { Remove-Item -Force -Confirm:$false "$Out\shaders.pak" }
+    New-Item -ItemType Directory -Force "$Out\translator\Bin" | Out-Null
+    Copy-Item "$tools\shader\translate.py", "$tools\shader\maxwell.py" "$Out\translator" -Force
+    Copy-Item "$env:VULKAN_SDK\Bin\glslangValidator.exe" "$Out\translator\Bin" -Force
+    if (Test-Path "$Out\translator\python") { Remove-Item -Recurse -Force -Confirm:$false "$Out\translator\python" }
+    Expand-Archive $PythonZip "$Out\translator\python"
+    # the embeddable Python's search path is its ._pth file: add translator\ (translate.py imports maxwell.py)
+    $pth = Get-ChildItem "$Out\translator\python" -Filter 'python*._pth' | Select-Object -First 1
+    Add-Content $pth.FullName '..'
+}
 cmd /c "`"$tools\room\build.bat`" `"$Out\room`""
 if ($LASTEXITCODE) { throw 'the room server build failed' }
 Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
@@ -46,6 +61,14 @@ Copy-Item $vcrt $Out -Force
 Copy-Item $vcrt "$Out\room" -Force
 
 $title = $cfg.title
+$shaders = if ($ShaderPack) { @"
+The game's shaders come translated for PC already (shaders.pak, next to the exe). The first time an area is
+shown it can stutter briefly while your graphics driver compiles what it needs; later starts reuse that work.
+"@ } else { @"
+The first start shows a black window for about a minute: the game's shaders are translated for your PC as they are
+first needed (thousands at the title screen). Later starts reuse them. New areas can stutter the first time too.
+The translator folder is needed while playing: new shaders are translated as the game first uses them.
+"@ }
 @"
 $title (Windows)
 
@@ -59,16 +82,16 @@ Setup:
   2. Put the firmware's .nca files in game\firmware.
   3. Run "$title.exe".
 
-The first start shows a black window for about a minute: the game's shaders are translated for your PC as they are
-first needed (thousands at the title screen). Later starts reuse them. New areas can stutter the first time too.
+$shaders
+Nothing is extracted or installed: the game is read from your NSPs as it runs. Saves, caches, settings and the log
+are in %LOCALAPPDATA%\$title\ (save\, cache\, settings.ini, log.txt). Deleting cache\ is safe; it is rebuilt (the
+first minutes of play stutter again).
 
-Nothing is extracted or installed: the game is read from your NSPs as it runs. Saves, caches and the log are in
-%LOCALAPPDATA%\$title\ (save\, cache\, log.txt). Deleting cache\ is safe; it is rebuilt (the first minutes of
-play stutter again while shaders are translated). The translator folder is needed while playing: new shaders
-are translated as the game first uses them.
-
-Keys: F3 shows the frame rate. F12 captures the next frame into %LOCALAPPDATA%\$title\dumps: if something
-looks wrong, press it and send that folder's newest files with log.txt.
+Controls: WASD moves, the mouse looks (click in the window to capture it), Z = A, X = B, C = X, V = Y, Q = L,
+R = R, 1 = ZL, 3 = ZR, Enter = +, Backspace = -, arrow keys = D-pad. A gamepad works too.
+Esc opens the options (mouse sensitivity, 30 or 60 fps, FPS counter); Esc again closes them.
+F3 shows the frame rate. F12 captures the next frame into %LOCALAPPDATA%\$title\dumps: if something looks wrong,
+press it and send that folder's newest files with log.txt.
 
 Multiplayer (local play, Union Circle, Tera raids) goes through a room server that relays the game's traffic: one
 player runs room\room_server.exe (UDP port 24872), everyone else picks that address in the room browser when the

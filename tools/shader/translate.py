@@ -66,11 +66,8 @@ def flit(u):
 
 
 class Translator:
-    def __init__(self, sh, int_attrs=0):
+    def __init__(self, sh):
         self.sh = sh
-        # vertex inputs fed from integer formats: 2 bits per location (1 unsigned, 2 signed), declared uvec4 / ivec4
-        # (a UINT/SINT format into a float input is undefined in Vulkan; NVIDIA keeps the bits, AMD does not)
-        self.int_attrs = int_attrs
         self.stage = sh.stage
         self.lines = []
         self.regs = set()
@@ -237,7 +234,7 @@ class Translator:
             k, c = (off - 0x80) >> 4, (off >> 2) & 3
             if self.stage == 'vertex':
                 self.in_attrs.setdefault(k, 'smooth')
-                return 'U(in_a%d[%d])' % (k, c), True
+                return 'ia(in_a%d[%d], %du)' % (k, c, k), True
             self.in_attrs.setdefault(k, self.interp_of(k, c))
             return 'U(in_a%d[%d])' % (k, c), True
         if self.stage == 'fragment':
@@ -2036,8 +2033,15 @@ class Translator:
             out += ['shared uint smem[%d];' % words,
                     'uint smem_ld(uint i) { return i < %du ? smem[i] : 0u; }' % words,
                     'void smem_st(uint i, uint v) { if (i < %du) smem[i] = v; }' % words]
-        if self.int_attrs:
-            out += ['uint U(uint x) { return x; }', 'uint U(int x) { return uint(x); }']
+        if self.stage == 'vertex' and self.in_attrs:
+            # Vertex inputs are float; Maxwell hands 8/16-bit integer attributes over as integers. The runtime fetches
+            # those as USCALED / SSCALED (the same values as floats) and says which they are in INT_ATTRS (2 bits per
+            # location: 1 unsigned, 2 signed), a specialization constant: one SPIR-V for every vertex format
+            out += ['layout(constant_id = 1) const uint INT_ATTRS = 0u;',
+                    'uint ia(float v, uint k) {',
+                    '    uint m = (INT_ATTRS >> (2u * k)) & 3u;',
+                    '    return m == 0u ? floatBitsToUint(v) : m == 1u ? uint(v) : uint(int(v));',
+                    '}']
         if 'fmz' in self.uses:
             out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                     'float ffmz(float a, float b, float c) { return (a == 0.0 || b == 0.0) ? c : fma(a, b, c); }']
@@ -2092,8 +2096,7 @@ class Translator:
                 out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMemI { int v; };')
         if self.stage == 'vertex':
             for k in sorted(self.in_attrs):
-                ty = {1: 'uvec4', 2: 'ivec4'}.get(self.int_attrs >> (2 * k) & 3, 'vec4')
-                out.append('layout(location = %d) in %s in_a%d;' % (k, ty, k))
+                out.append('layout(location = %d) in vec4 in_a%d;' % (k, k))
             for k in sorted(self.out_attrs):
                 out.append('layout(location = %d) out vec4 out_a%d;' % (k, k))
             loc = 31        # capture outputs take the locations from the top, which the game's varyings leave free
@@ -2182,13 +2185,7 @@ def main():
                 with open(v[1:]) as f:
                     v = f.read().replace('\n', ',')
             only |= {h.strip() for h in v.split(',') if h.strip()}
-    variants = {}                       # <hash>:<hex mask> asks for a variant with integer inputs (Translator int_attrs)
-    for e in list(only):
-        if ':' in e:
-            h, m = e.split(':', 1)
-            only.discard(e)
-            only.add(h)
-            variants.setdefault(h, set()).add(int(m, 16))
+    only = {e.split(':')[0] for e in only}      # <hash>:<mask> (integer-input variants) from older runtimes
     here = os.path.dirname(os.path.abspath(__file__))
     if args:
         src = args[0]
@@ -2205,17 +2202,16 @@ def main():
             continue
         sh = Shader(os.path.join(src, name))
         h = name[:-4]
-        for mask in sorted(variants.get(h, {0})):     # a variant is written as <hash>_<mask>
-            try:
-                text = Translator(sh, mask).generate()
-            except Unsupported as e:
-                failed.setdefault(str(e), []).append(h)
-                continue
-            path = os.path.join(dst, '%s.%s' % (h if not mask else '%s_%08x' % (h, mask), STAGE_EXT[sh.stage]))
-            with open(path, 'w', newline='\n') as f:
-                f.write(text)
-            outputs.append(path)
-            ok += 1
+        try:
+            text = Translator(sh).generate()
+        except Unsupported as e:
+            failed.setdefault(str(e), []).append(h)
+            continue
+        path = os.path.join(dst, '%s.%s' % (h, STAGE_EXT[sh.stage]))
+        with open(path, 'w', newline='\n') as f:
+            f.write(text)
+        outputs.append(path)
+        ok += 1
     print('%d translated, %d not' % (ok, sum(len(v) for v in failed.values())))
     for why, hs in sorted(failed.items(), key=lambda kv: -len(kv[1])):
         print('  %4d  %s  (e.g. %s)' % (len(hs), why, hs[0]))
