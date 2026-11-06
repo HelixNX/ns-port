@@ -133,6 +133,33 @@ function(nx_netplay_libs)
     target_compile_options(nx_zstd PRIVATE /clang:-O2 /clang:-Wno-everything)
 endfunction()
 
+# libopus for hwopus (services/hwopus.c): vcpkg (x64-windows: `vcpkg install opus`), in the vcpkg tree SDL3 came
+# from, then $VCPKG_ROOT and $VCPKG_INSTALLATION_ROOT. Defines nx_opus; NX_OPUS_DLL is copied next to the exe.
+function(nx_opus_lib)
+    if(TARGET nx_opus)
+        return()
+    endif()
+    get_filename_component(_sdl_base "${NX_SDL3_INCLUDE}" DIRECTORY)
+    set(_bases "${_sdl_base}")
+    foreach(_v "$ENV{VCPKG_ROOT}" "$ENV{VCPKG_INSTALLATION_ROOT}")
+        if(_v)
+            file(TO_CMAKE_PATH "${_v}/installed/x64-windows" _b)
+            list(APPEND _bases "${_b}")
+        endif()
+    endforeach()
+    foreach(_b ${_bases})
+        if(EXISTS "${_b}/include/opus/opus.h" AND EXISTS "${_b}/lib/opus.lib")
+            message(STATUS "nxrecomp: libopus from vcpkg (${_b})")
+            add_library(nx_opus INTERFACE)
+            target_include_directories(nx_opus INTERFACE "${_b}/include")
+            target_link_libraries(nx_opus INTERFACE "${_b}/lib/opus.lib")
+            set(NX_OPUS_DLL "${_b}/bin/opus.dll" CACHE INTERNAL "")
+            return()
+        endif()
+    endforeach()
+    message(FATAL_ERROR "No libopus (hwopus): `vcpkg install opus` (x64-windows)")
+endfunction()
+
 function(nx_game)
     cmake_parse_arguments(G "NETPLAY" "GAME_JSON" "SOURCES" ${ARGN})
     get_filename_component(G_GAME_JSON "${G_GAME_JSON}" ABSOLUTE)
@@ -221,6 +248,7 @@ function(nx_game)
 
     # zstd: the shader pack (gpu.c) in every build, netplay's compression; ENet with it
     nx_netplay_libs()
+    nx_opus_lib()
     # the shader packer (tools/shader/pack.c): translate.py --spv's output in one file for players
     add_executable(nxshpack "${NX_ROOT}/tools/shader/pack.c")
     target_link_libraries(nxshpack PRIVATE nx_zstd)
@@ -255,10 +283,12 @@ function(nx_game_exe target package)
     target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
     target_include_directories(${target} PRIVATE "${NX_ROOT}/runtime" "${CMAKE_BINARY_DIR}"
                                "${NX_VULKAN_INCLUDE}" "${NX_SDL3_INCLUDE}")
-    target_link_libraries(${target} PRIVATE ${libs} nx_zstd dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
+    target_link_libraries(${target} PRIVATE ${libs} nx_zstd nx_opus dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
                           windowscodecs "${NX_SDL3_LIB}")
     add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${NX_SDL3_DLL}" "$<TARGET_FILE_DIR:${target}>")
+    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                       "${NX_OPUS_DLL}" "$<TARGET_FILE_DIR:${target}>")
     # /DEBUG: a PDB whose public symbols name the lifted functions (f_<guest address>) in crash reports
     # /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
     # /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)
