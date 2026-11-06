@@ -320,6 +320,26 @@ a second backend next to the room. Not started: needs the adapter.
   - Open from the session: a Fletchinder flew very fast at
     60 fps (title / overworld, extracted dump; likely the movement scaling the Dynamic FPS patch does at `cce37c`,
     not ported).
+- **Mods and the Tera raid editor (2026-11-05, not yet tested in game).** The user's call: tools like this are mods,
+  apart from the main program. nxrecomp `runtime/nxmod.h` + `mods.c`: DLLs in `<exe>\mods\` (NX_MODS=0: none) get
+  window events after the options panel, can hold the game's input, and draw over the swapchain image in the present;
+  `modkit/` is Dear ImGui for them (vcpkg `imgui[vulkan-binding]`, the user's choice of vcpkg; ImGui's SDL3 backend is
+  not used: events are on the window thread, drawing on the render thread). `nx_mod()` in nxrecomp.cmake; the
+  project needs CXX (build.bat passes clang-cl for both).
+  - `violetrecomp/mods/raids/` (F6): finds the raid blocks by scanning the guest heap for runs of den-shaped 0x20
+    entries (layout from PKHeX's RaidSpawnList9: Paldea 72 after a 0x10 seed header, Kitakami 100 + Blueberry 80),
+    shows each den's raid from its seed and writes seeds found for a chosen species / shiny / Tera type. Algorithm
+    as PKHeX's Tera9RNG / Encounter9RNG describe it (our own code); the user picks the story progress (the 1-5 star
+    roll depends on it: must match the save's for standard dens; black dens have no roll).
+  - Data from the game's files: `python mods/raids/raiddata.py` -> `build/mods/raids.dat` (needs `build/ooz`).
+    `nxrecomp/tools/trinity.py` reads any romfs file by path (data.trpfd: file hash -> pack). Raid tables:
+    `world/data/raid/{,su1_,su2_}raid_enemy_0N/..._array.bin` (all 18 rate totals equal PKHeX's constants); ROM
+    type 1 = Scarlet, 2 = Violet. `avalon/data/personal_array.bin` field 0 = {DevID, form, national, ?}; gender
+    {group 0 ratio (% female) / 1 male / 2 female / 3 genderless, ratio}. Names: `message/dat/English/common/*.dat`.
+  - Not known yet: whether written seeds show without reloading the area; the raid unlock flags
+    (`FSYS_RAID_DIFFICTLTY3..6_RELEASE`) and fly points live in save flag blocks: the user asked about setting them
+    (and "story completed": not feasible as such).
+  - The user's old save is in `build/save-backup-2026-11-05/` (a new save started 2026-11-05).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
