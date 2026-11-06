@@ -234,8 +234,21 @@ static u32 request_update(ArRenderer *r, const u8 *in, u64 in_size, u8 *out, u64
     }
     oh.effects_size = neffects * 0x10;
     ip += h.splitter_size;                                             /* splitters: the game uses none */
-    for (u32 i = 0; i < nmixes; i++, ip += MIX_IN)                     /* mixes */
-        if (i < r->mix_count) update_mix(r, &r->mixes[i], ip);
+    /* mixes. REV7 on: only the changed ones, after a 0x20-byte header {u32 magic (0xCAFEBABE), u32 count}, each with
+     * its mix id at +0x10 (read as the final mix before, its volume was the magic: -8346975, every sample of Bink's
+     * movie sound times that) */
+    const u8 *mix_end = ip + h.mix_size;
+    if (rev >= 7 && h.mix_size >= 0x20) {
+        u32 count = rd32(ip + 4);
+        ip += 0x20;
+        for (u32 i = 0; i < count && ip + MIX_IN <= mix_end; i++, ip += MIX_IN) {
+            u32 id = rd32(ip + 0x10);
+            if (id < r->mix_count) update_mix(r, &r->mixes[id], ip);
+        }
+    } else
+        for (u32 i = 0; i < nmixes; i++, ip += MIX_IN)
+            if (i < r->mix_count) update_mix(r, &r->mixes[i], ip);
+    ip = mix_end;
     for (u32 i = 0; i < nsinks; i++, ip += SINK_IN, op += 0x20) {     /* sinks: a circular buffer's position */
         if (i >= r->sink_count) continue;
         update_sink(&r->sinks[i], ip);
