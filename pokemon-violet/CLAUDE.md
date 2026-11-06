@@ -455,7 +455,32 @@ a second backend next to the room. Not started: needs the adapter.
      Expose it to mods as `host->run_lua(text)` (or a queue the hook drains), results / errors to the log.
   3. With that, list the scripts' tables from Lua (haxe class names: look for item / bag / pocket) and call the
      game's add-item function; F7's Give uses it, the direct write stays as the fallback.
+- **Instant items: built (2026-11-06 afternoon), not yet checked in game.** Done as planned above, with these specifics:
+  - Lua C API in main: lua_load `232e0` (L, reader, data, chunkname, mode), getS `24b90` (no luaL_loadbufferx in
+    main: inlined), lua_gettop `b5d980`, lua_settop `b5db00`, lua_tolstring `b646d0`, lua_pushstring `b85bd0`,
+    lua_rotate `b5dcd0`, lua_pushfstring `1a2cd10`, lua_pcallk `b5ddd0`.
+  - `violetrecomp/lua.c` + patches.txt `after lua_pcall_entry` at b5ddd0; nxrecomp nxmod.h **version 3**:
+    `host->run_script(text, done, ud)` (the game's code registers the runner with `mods_set_script_runner`); a chunk
+    returning `NXMOD_SCRIPT_AGAIN` is retried at a later safe point. F7 has a "Lua (the game's VM)" console.
+  - Scripts: romfs `script/lua/bin/release/{main,main_dynamic,dll_*}/*.blua`, plain Lua 5.4 bytecode with debug
+    info but obfuscated names (classes `C<hash>` are globals, statics `S<hash>`, methods `F<hash>`, natives
+    `c<hash>`/`f<hash>`); extracted to `build/lua/` with trinity.py. A small bytecode reader (session script,
+    not kept) finds functions by their constants.
+  - Bag: `C14A8D35D72F56FE9.S90D73F1D715BCBF4()` = the bag; `:FB01A9B29CD4CC6CB(id, n)` add (pocket list + save,
+    clamped), `:FE027A297CCA14276(id, n)` remove, `:F13D72EF77582090D(id)` list index (-1 none), `b[6][i].num`.
+    The native store binding 1488b90 is registered as `cACA3F5A6.f445BD6CD` (luaL_Reg table at main+4420320).
+  - F6 and F7 now start a full rescan every time their window opens (no "still in place" shortcut).
+- **Mons from the closed game: `svedit addmon`** (PKHeX.Core; full IVs, the save's OT, party or first free box slot).
+  Used for "FakeEspathra" (user's request; backup `build/save-backup-2026-11-06-1151-premon`).
+- **Mon spawner while playing (asked, not started).** Lead: the in-game NPC trade. `P2882` (trade class method
+  `FA1D3529002C3A75C(tray, pos, receivePoke)`) makes the mon with `CF7739C6C4D25CC45.S470187B7637D37DC(spec)`
+  (spec = a FlatBuffers PokeData record from eventTradeList, through natives c919391D3 / cA20E9FCA / c5F9AB88A and
+  `C9021E7F99581DB97.SDA35F5D36FE7531F`) and stores it with `CD081B219DEE96EEF.S644D748FB7CE5439(tray, pos, mon)`.
+  Plan: an existing trade record as the template, fields patched; or the native mon object's setters.
 - **Other findings this session:**
+  - Text with letters missing again (frame 26050, 11:42): "Maschiff" -> "as hiff", "Skeledirge" -> "kele irge":
+    whole glyphs (M, c, S, d) are blank wherever they appear, not only first letters. So the run-time glyph atlas,
+    CPU-written, misses some writes on our side. The F12 capture has only render targets, not the atlas.
   - Names with the first letter missing (battle labels "oundoom" / "uecoco", F12 frame 33061; the same labels
     were whole in frame 46067): not skipped shaders (0 skips around it). The trace did not catch the label draws
     (the UI is drawn around the frame boundary). Suspect, unconfirmed: the run-time glyph atlas (CPU-written)
