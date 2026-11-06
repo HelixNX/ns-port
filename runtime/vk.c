@@ -969,7 +969,8 @@ static bool overlay_draw(u32 f) {
     return true;
 }
 
-static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
+static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, s32 x, s32 y, s32 w, s32 h,
+                           bool flip_y, VkSemaphore wait, u64 wait_value);
 
 /* "COMPILING SHADERS <n>" in the bottom-left corner while the translator has shaders to do (whatever F3 says): the
  * first start draws little until thousands are done. F12's "CAPTURING FRAME..." / "FRAME CAPTURED" go there too
@@ -1019,7 +1020,8 @@ static double pt_ms(void) {
     return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
 }
 
-void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
+void vk_present(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, s32 x, s32 y, s32 w, s32 h, bool flip_y,
+                VkSemaphore wait, u64 wait_value) {
     if (!sw.fence[0]) present_init();
     /* uncapped, with a present thread: a frame that comes while the last one is still being presented is not shown
      * (as MAILBOX would replace it; under Optimus even MAILBOX waits for the display) */
@@ -1032,13 +1034,130 @@ void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphor
     vk_present_times.lock += t1 - t0;
     present_pending();                  /* the last frame's, if its thread has not got to it */
     vk_present_times.present += pt_ms() - t1;
-    present_locked(src, x, y, w, h, flip_y, wait, wait_value);
+    present_locked(src, src_fmt, src_w, src_h, x, y, w, h, flip_y, wait, wait_value);
     bool queued = pq.tail != pq.head;
     ReleaseSRWLockExclusive(&sw_lock);
     if (queued) SetEvent(pq.go);
 }
 
-static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value) {
+/* Shrinking the frame into the window (a render scale above the window's size): drawn by a built-in pass
+ * (shaders/downscale.*) that averages each window pixel's whole footprint, where a linear blit reads only 2 x 2
+ * source texels per pixel and skips the rest (aliasing back what the larger render took away) */
+#include "shaders/downscale_spv.h"
+static struct {
+    VkFormat fmt;                       /* the swapchain format the pipeline was made for */
+    VkPipeline pipe;
+    VkPipelineLayout layout;
+    VkDescriptorSetLayout set;
+    VkSampler smp;
+    VkImageView src[PRESENT_FRAMES];    /* each frame slot's view of its source (remade every frame) */
+} ds;
+
+static bool downscale_init(void) {
+    if (ds.pipe && ds.fmt == sw.format) return true;
+    if (!ds.layout) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo sci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 1, .pBindings = &b};
+        VKCHECK(vkCreateDescriptorSetLayout(vk.dev, &sci, NULL, &ds.set));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 28};
+        VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                          .pSetLayouts = &ds.set, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+        VKCHECK(vkCreatePipelineLayout(vk.dev, &lci, NULL, &ds.layout));
+        VkSamplerCreateInfo smci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR,
+            .minFilter = VK_FILTER_LINEAR, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
+        VKCHECK(vkCreateSampler(vk.dev, &smci, NULL, &ds.smp));
+    }
+    if (ds.pipe) { vkDestroyPipeline(vk.dev, ds.pipe, NULL); ds.pipe = NULL; }    /* (the device is idle: a new swapchain) */
+    VkShaderModule m[2];
+    VkShaderModuleCreateInfo mci[2] = {
+        {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof downscale_vs, .pCode = downscale_vs},
+        {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof downscale_fs, .pCode = downscale_fs}};
+    VKCHECK(vkCreateShaderModule(vk.dev, &mci[0], NULL, &m[0]));
+    VKCHECK(vkCreateShaderModule(vk.dev, &mci[1], NULL, &m[1]));
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = m[0], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = m[1], .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState att = {.colorWriteMask = 0xf};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = 1, .pAttachments = &att};
+    static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+                                           .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                        .pColorAttachmentFormats = &sw.format};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, .stageCount = 2,
+        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
+        .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dy,
+        .layout = ds.layout};
+    VkResult r = vkCreateGraphicsPipelines(vk.dev, NULL, 1, &ci, NULL, &ds.pipe);
+    vkDestroyShaderModule(vk.dev, m[0], NULL);
+    vkDestroyShaderModule(vk.dev, m[1], NULL);
+    if (r != VK_SUCCESS) { hlog(0, "vk: downscale pipeline failed (%d): blitting instead", r); ds.pipe = NULL; return false; }
+    ds.fmt = sw.format;
+    hlog(1, "vk: frames larger than the window are shrunk by the downscale pass");
+    return true;
+}
+
+/* src (sw x sh texels, format fmt; the rectangle x, y, w, h of it) into the window rectangle dx, dy, dw, dh of
+ * swapchain image idx (TRANSFER_DST before and after); false: not done (blit instead) */
+static bool downscale(VkCommandBuffer cmd, u32 f, u32 idx, VkImage src, VkFormat fmt, u32 sw_, u32 sh_, s32 x, s32 y,
+                      s32 w, s32 h, bool flip_y, s32 dx, s32 dy, u32 dw, u32 dh) {
+    if (!fmt || !sw_ || !sh_ || !downscale_init()) return false;
+    VkImage dst = sw.images[idx];
+    if (!sw.views[idx]) {
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = dst, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = sw.format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VKCHECK(vkCreateImageView(vk.dev, &vi, NULL, &sw.views[idx]));
+    }
+    if (ds.src[f]) { vkDestroyImageView(vk.dev, ds.src[f], NULL); ds.src[f] = NULL; }    /* (slot f's fence waited) */
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = src, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
+    vi.pNext = &uci;
+    if (vkCreateImageView(vk.dev, &vi, NULL, &ds.src[f]) != VK_SUCCESS) { ds.src[f] = NULL; return false; }
+    float u0 = (float)x / sw_, u1 = (float)(x + w) / sw_;
+    float v0 = (float)(flip_y ? y + h : y) / sh_, v1 = (float)(flip_y ? y : y + h) / sh_;
+    float rx = (float)w / dw, ry = (float)h / dh, r = rx > ry ? rx : ry;
+    int n = (int)r + (r > (float)(int)r);      /* taps per axis: at most a source texel apart */
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    struct { float src[4], step[2]; s32 n; } pc = {{u0, v0, u1, v1}, {(u1 - u0) / dw, (v1 - v0) / dh}, n};
+    image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = sw.views[idx],
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRect2D area = {{dx, dy}, {dw, dh}};
+    VkRenderingInfo rinfo = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = area, .layerCount = 1,
+                             .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cmd, &rinfo);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds.pipe);
+    VkViewport vpt = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1};
+    vkCmdSetViewportWithCount(cmd, 1, &vpt);
+    vkCmdSetScissorWithCount(cmd, 1, &area);
+    VkDescriptorImageInfo ii = {ds.smp, ds.src[f], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds.layout, 0, 1, &wd);
+    vkCmdPushConstants(cmd, ds.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    return true;
+}
+
+static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, s32 x, s32 y, s32 w, s32 h,
+                           bool flip_y, VkSemaphore wait, u64 wait_value) {
     if (InterlockedExchange(&resized, 0) || !sw.sc) {
         AcquireSRWLockExclusive(&queue_lock);     /* every queue: the render thread's too */
         vkDeviceWaitIdle(vk.dev);
@@ -1074,6 +1193,8 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
         u32 dw = W, dh = (u32)((u64)W * h / w);
         if (dh > H) { dh = H; dw = (u32)((u64)H * w / h); }
         s32 dx = (s32)(W - dw) / 2, dy = (s32)(H - dh) / 2;
+        bool shrink = (u32)w > dw || (u32)h > dh;
+        if (!(shrink && downscale(cmd, f, idx, src, src_fmt, src_w, src_h, x, y, w, h, flip_y, dx, dy, dw, dh))) {
         VkImageBlit blit = {
             .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .srcOffsets = {{x, flip_y ? y + h : y, 0}, {x + w, flip_y ? y : y + h, 1}},
@@ -1081,6 +1202,7 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
             .dstOffsets = {{dx, dy, 0}, {dx + (s32)dw, dy + (s32)dh, 1}}};
         vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                        &blit, VK_FILTER_LINEAR);
+        }
     }
     if (overlay_draw(f)) {
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

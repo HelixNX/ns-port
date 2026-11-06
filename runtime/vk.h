@@ -113,7 +113,9 @@ void vk_init(void);
 /* swapchain: present `src` (in GENERAL layout, the region given) scaled into the window. Called by the
  * thread that owns the queue (gpu.c), after the work that rendered src has been submitted. */
 void vk_set_unthrottled(bool on);  /* present without waiting for the display's refresh (a new swapchain) */
-void vk_present(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y, VkSemaphore wait, u64 wait_value);
+/* src: its format and size (frames larger than the window are shrunk by a filtering pass, else blitted) */
+void vk_present(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, s32 x, s32 y, s32 w, s32 h, bool flip_y,
+                VkSemaphore wait, u64 wait_value);
 /* vk.queue's submissions, which the present thread shares when the family has one queue (AMD) */
 VkResult vk_submit(const VkSubmitInfo2 *si, VkFence fence);
 u64 vk_presents_dropped(void);         /* frames not shown, uncapped (the display was busy with the last one) */

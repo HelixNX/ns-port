@@ -5781,7 +5781,8 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     u64 v = submitted;
     double t_vk = ms_now();
     s32 S = im ? (s32)im->scale : 1;    /* the crop is in the game's pixels */
-    vk_present(im ? im->image : NULL, w->crop[0] * S, w->crop[1] * S, cw * S, ch * S, window_origin == 0, timeline, v);
+    vk_present(im ? im->image : NULL, im ? im->format : VK_FORMAT_UNDEFINED, im ? lvl_w(im, 0) : 0, im ? lvl_h(im, 0) : 0,
+               w->crop[0] * S, w->crop[1] * S, cw * S, ch * S, window_origin == 0, timeline, v);
     double t_end = ms_now();
     t_present_ms += t_end - t_present0;
     hf.present += t_end - t_present0;
