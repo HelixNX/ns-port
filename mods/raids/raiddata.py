@@ -15,7 +15,7 @@ Schemas (FlatBuffers; field = vtable slot, a missing field is its default 0):
     {u32 offset, u16 length, u16 flags} a line; each line's u16s XOR a key that starts at 0x7C89 + line * 0x2983
     and rotates left 3 bits a character.
 
-raids.dat (little-endian): "NXRD", u32 version 1; five name lists (species by national dex, moves, abilities,
+raids.dat (little-endian): "NXRD", u32 version 1; five name lists (species by the game's internal number (DevID: the National Dex up to Gen 8, not after), moves, abilities,
 natures, types), each u32 count then {u16 length, UTF-8}; u32 count of raid entries, 38 bytes each:
   u8 region (0 Paldea, 1 Kitakami, 2 Blueberry), stars, rom, rate; u16 national, form; u8 level, gem, ability
   kind, flawless; u8 shiny kind, nature (0 random), type 1, type 2; u8 gender group, gender ratio, 0, 0;

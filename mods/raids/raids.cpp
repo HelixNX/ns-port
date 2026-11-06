@@ -17,8 +17,10 @@
  * types). The tables come from the game's files (raiddata.py -> <build>\mods\raids.dat).
  *
  * The finder searches seeds for a species (and shiny / Tera type) and writes them into dens. The world's crystals
- * show a den's new raid once the area reloads. */
+ * show a den's new raid once the area reloads. F7 opens the item giver (items.cpp) in the same DLL. */
+#include "items.h"
 #include "modkit.h"
+#include <algorithm>
 #include <atomic>
 #include <ctype.h>
 #include <mutex>
@@ -223,6 +225,14 @@ static bool den_shape(const u32 *w) {
     return w[0] <= 1 && w[1] >= 1 && w[1] <= 64 && w[2] < 256 && w[3] < 4096 && w[5] == 0 && w[6] <= 3 && w[7] <= 1;
 }
 
+/* a den with a raid: memory of zeros with a 1 every 0x20 bytes has the shape too (seed 0: every "den" the same raid) */
+static bool den_live(const u32 *w) { return den_shape(w) && w[4] != 0; }
+
+/* a slot of a table: a den, or unused (all zero: Paldea had 69 dens of 72 early in the story) */
+static bool den_slot(const u32 *w) {
+    return den_shape(w) || !(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]);
+}
+
 static bool mem_read(u64 addr, void *out, size_t n) {
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)addr, out, n, &got) && got == n;
@@ -239,11 +249,28 @@ static std::atomic<bool> g_scanning;
 static std::atomic<u64> g_scan_done, g_scan_total;
 static std::string g_scan_msg;
 
-/* runs of den-shaped 0x20-byte entries on the guest heap: Paldea 72-99 long, Kitakami + Blueberry 100+ */
+enum { MIN_LIVE = 20, MAX_GAP = 8 };
+struct Run { u64 start; u32 live, gap; std::vector<u32> seeds; };
+
+/* a run ends: kept when long enough and its seeds mostly distinct (real dens' are random) */
+static void run_end(Run &r, std::vector<std::pair<u64, u32>> &runs) {
+    if (r.live >= MIN_LIVE) {
+        std::sort(r.seeds.begin(), r.seeds.end());
+        size_t distinct = std::unique(r.seeds.begin(), r.seeds.end()) - r.seeds.begin();
+        if (distinct * 10 >= (size_t)r.live * 9) runs.push_back({r.start, r.live});
+    }
+    r.live = r.gap = 0;
+}
+
+/* runs of dens in guest memory (live dens, up to MAX_GAP unused slots between them; mostly distinct seeds), classed by
+ * live count: up to 72 Paldea, more Kitakami (+ Blueberry 100 slots on when over 100). Violet keeps
+ * its data in the alias region (svcMapPhysicalMemory, its own allocator), not the svcSetHeapSize heap: both are
+ * scanned, contiguous (alias then heap) */
 static void scan_thread() {
     std::vector<u64> found[N_REGIONS];
     std::vector<std::pair<u64, u32>> runs;
-    const u64 lo = NXMOD_HEAP_BASE, hi = NXMOD_HEAP_BASE + NXMOD_HEAP_MAX;
+    const u64 lo = NXMOD_ALIAS_BASE, hi = NXMOD_HEAP_BASE + NXMOD_HEAP_MAX;
+    static_assert(NXMOD_ALIAS_BASE + NXMOD_ALIAS_SIZE == NXMOD_HEAP_BASE, "alias region ends where the heap starts");
     u64 total = 0;
     for (u64 a = lo; a < hi;) {
         MEMORY_BASIC_INFORMATION mi;
@@ -264,11 +291,11 @@ static void scan_thread() {
         bool rw = mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
                   (mi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE));
         if (rw) {
-            u64 run_start[8] = {}; u32 run_len[8] = {};
+            Run run[8] = {};
             for (u64 c = a; c < rend; c += CH) {
                 size_t n = (size_t)(rend - c < CH + 32 ? rend - c : CH + 32);
                 if (!mem_read(c, buf.data(), n)) {          /* freed under us: end the runs here */
-                    for (int p = 0; p < 8; p++) run_len[p] = 0;
+                    for (int p = 0; p < 8; p++) run_end(run[p], runs);
                     g_scan_done += n < CH ? n : CH;
                     continue;
                 }
@@ -276,27 +303,28 @@ static void scan_thread() {
                 const u32 *w = (const u32 *)buf.data();
                 size_t avail = n / 4;
                 for (size_t i = 0; i < words; i++) {
-                    int p = (int)(i & 7);       /* c is page-aligned: the word index's low bits are the phase */
-                    if (i + 8 <= avail && den_shape(w + i)) {
-                        if (!run_len[p]) run_start[p] = c + i * 4;
-                        run_len[p]++;
-                    } else if (run_len[p]) {
-                        if (run_len[p] >= 72) runs.push_back({run_start[p], run_len[p]});
-                        run_len[p] = 0;
-                    }
+                    Run &r = run[i & 7];        /* c is page-aligned: the word index's low bits are the phase */
+                    if (i + 8 > avail) { run_end(r, runs); continue; }
+                    if (den_live(w + i)) {
+                        if (!r.live) { r.start = c + i * 4; r.seeds.clear(); }
+                        r.live++;
+                        r.gap = 0;
+                        r.seeds.push_back(w[i + 4]);
+                    } else if (r.live && den_slot(w + i) && r.gap < MAX_GAP) {
+                        r.gap++;
+                    } else run_end(r, runs);
                 }
                 g_scan_done += words * 4;
             }
-            for (int p = 0; p < 8; p++)
-                if (run_len[p] >= 72) runs.push_back({run_start[p], run_len[p]});
+            for (int p = 0; p < 8; p++) run_end(run[p], runs);
         }
         a = rend;
     }
     for (auto &r : runs) {
-        if (r.second < 100) found[R_PALDEA].push_back(r.first);
+        if (r.second <= 72) found[R_PALDEA].push_back(r.first);
         else {
             found[R_KITAKAMI].push_back(r.first);
-            if (r.second >= 180) found[R_BLUEBERRY].push_back(r.first + 100 * 0x20);
+            if (r.second > 100) found[R_BLUEBERRY].push_back(r.first + 100 * 0x20);
         }
     }
     char msg[256];
@@ -323,7 +351,7 @@ static bool read_dens(int region, Den *out) {
     for (u64 a : g_blocks[region]) {
         if (!mem_read(a, out, region_dens[region] * sizeof(Den))) continue;
         bool ok = true;
-        for (u32 i = 0; i < region_dens[region] && ok; i++) ok = den_shape(&out[i].enabled);
+        for (u32 i = 0; i < region_dens[region] && ok; i++) ok = den_slot(&out[i].enabled);
         if (ok) return true;
     }
     return false;
@@ -408,7 +436,7 @@ static bool contains_nocase(const char *s, const char *sub) {
 
 static void stats_line(const Result &r) {
     const Raid &e = *r.raid;
-    ImGui::Text("%s%s  Lv.%u  %d stars  Tera %s", name_of(D.species, e.national), r.shiny ? "  (shiny)" : "",
+    ImGui::Text("%s%s  Lv.%u  %d stars  Tera %s", name_of(D.species, e.dev), r.shiny ? "  (shiny)" : "",
                 e.level, r.stars, name_of(D.types, (u32)r.tera));
     ImGui::Text("IVs %d/%d/%d/%d/%d/%d   %s   %s   %s", r.ivs[0], r.ivs[1], r.ivs[2], r.ivs[3], r.ivs[4], r.ivs[5],
                 name_of(D.natures, (u32)r.nature), name_of(D.abilities, e.abilities[r.ability < 3 ? r.ability : 0]),
@@ -466,7 +494,7 @@ static void ui() {
             ImGui::TableNextColumn(); ImGui::Text("%08X", d.seed);
             if (r.raid) {
                 ImGui::TableNextColumn(); ImGui::Text("%d", r.stars);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(name_of(D.species, r.raid->national));
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(name_of(D.species, r.raid->dev));
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(name_of(D.types, (u32)r.tera));
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(r.shiny ? "SHINY" : "");
             } else {
@@ -507,7 +535,7 @@ static void ui() {
     char preview[96] = "(choose)";
     if (g_want.raid >= 0 && g_want.raid < (int)D.raids.size()) {
         const Raid &e = D.raids[g_want.raid];
-        snprintf(preview, sizeof preview, "%s  %d stars%s", name_of(D.species, e.national), e.stars,
+        snprintf(preview, sizeof preview, "%s  %d stars%s", name_of(D.species, e.dev), e.stars,
                  e.form ? " (form)" : "");
     }
     ImGui::SetNextItemWidth(320);
@@ -516,7 +544,7 @@ static void ui() {
             for (u32 i : D.table[g_region][s]) {
                 const Raid &e = D.raids[i];
                 if (e.rom != 0 && e.rom != g_rom) continue;
-                const char *nm = name_of(D.species, e.national);
+                const char *nm = name_of(D.species, e.dev);
                 if (g_filter[0] && !contains_nocase(nm, g_filter)) continue;
                 char lbl[128];
                 snprintf(lbl, sizeof lbl, "%s  %d stars%s  Lv.%u  (%u%%)##%u", nm, e.stars, e.form ? " (form)" : "",
@@ -604,21 +632,27 @@ static void ui() {
 }
 
 /* ---------------------------------------------------------------------------------------------- the mod */
+static bool any_open() { return g_open || items_open(); }
+
 static bool mod_event(const SDL_Event *e) {
-    if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F6) {
-        if (!e->key.repeat) g_open = !g_open;
-        modkit::set_open(g_open);
+    if (e->type == SDL_EVENT_KEY_DOWN && (e->key.scancode == SDL_SCANCODE_F6 || e->key.scancode == SDL_SCANCODE_F7)) {
+        if (!e->key.repeat) {
+            if (e->key.scancode == SDL_SCANCODE_F6) g_open = !g_open;
+            else items_toggle();
+        }
+        modkit::set_open(any_open());
         return true;
     }
-    modkit::set_open(g_open);               /* after the window's close button (render thread): SDL calls here */
-    return modkit::event(e, g_open);
+    modkit::set_open(any_open());           /* after a window's close button (render thread): SDL calls here */
+    return modkit::event(e, any_open());
 }
 
-static bool mod_wants_input(void) { return g_open; }
+static bool mod_wants_input(void) { return any_open(); }
 
 static void mod_draw(const NxModFrame *f) {
-    if (!g_open || !modkit::begin(f)) return;
-    ui();
+    if (!any_open() || !modkit::begin(f)) return;
+    if (g_open) ui();
+    items_ui();
     modkit::end(f);
 }
 
@@ -630,6 +664,7 @@ extern "C" __declspec(dllexport) const NxMod *nx_mod_init(const NxModHost *host)
     g_rom = strcmp(host->title_id, "0100A3D008C5C000") ? 2 : 1;
     modkit::init(host, "raids");
     load_data(host->cache_dir);
+    items_init(host->cache_dir);
     if (!D.loaded) host->log(0, "raids: %s", D.error.c_str());
     else host->log(1, "raids: %zu raid table entries, %s", D.raids.size(), g_rom == 2 ? "Violet" : "Scarlet");
     return &mod;
