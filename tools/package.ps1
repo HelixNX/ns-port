@@ -1,15 +1,17 @@
 # A folder for players (run inside a game's repo): the packaged executable (NX_PACKAGE: the game read from the
 # player's own NSPs and keys in game\, data under %LOCALAPPDATA%\<title>\), its DLLs, the shaders (translated
 # beforehand in shaders.pak, or the translator: an embeddable Python, translate.py, glslang) and the room server.
-# Usage: package.ps1 -Out <dir> (-ShaderPack <shaders.pak> | -PythonZip <python-3.x-embed-amd64.zip>) [-NoBuild]
-#   -ShaderPack  every shader translated beforehand (translate.py --spv, then nxshpack: tools/shader/pack.c), next to
-#                the exe; no translator in the package. Built from the game's files, as the exe's lifted code is
+# Usage: package.ps1 -Out <dir> [-ShaderPack <shaders.pak> | -PythonZip <python-3.x-embed-amd64.zip>] [-NoBuild]
+#   (neither)    the default: every shader in the game's shader folder (<build>\shaders) translated now
+#                (translate.py --spv) and packed (nxshpack: tools/shader/pack.c) into <build>\shaders.pak, which goes
+#                next to the exe; no translator in the package. Built from the game's files, as the exe's lifted code is
+#   -ShaderPack  a pack made before (the same, without translating again)
 #   -PythonZip   Python's official "Windows embeddable package (64-bit)" (python.org), unpacked into translator\python:
 #                shaders translated on the player's PC as the game first uses them; glslang comes from
 #                %VULKAN_SDK%\Bin\glslangValidator.exe
 param([Parameter(Mandatory)] [string]$Out, [string]$ShaderPack, [string]$PythonZip, [switch]$NoBuild)
 $ErrorActionPreference = 'Stop'
-if (-not $ShaderPack -and -not $PythonZip) { throw 'give -ShaderPack (shaders translated beforehand) or -PythonZip (the translator)' }
+if ($ShaderPack -and $PythonZip) { throw 'give -ShaderPack or -PythonZip, not both' }
 if ($ShaderPack -and -not (Test-Path $ShaderPack)) { throw "no $ShaderPack" }
 $tools = $PSScriptRoot
 $d = (Get-Location).Path
@@ -24,6 +26,26 @@ if (-not $NoBuild) {
 }
 $exe = Get-ChildItem $pkg -Filter *.exe | Select-Object -First 1
 if (-not $exe) { throw "no packaged executable in $pkg" }
+if (-not $ShaderPack -and -not $PythonZip) {
+    # every shader for the translator version in this tree, then the pack (the runtime uses a pack only when its
+    # translator version matches, gpu.c pak_open)
+    Push-Location $d
+    try {
+        python "$tools\shader\translate.py" --spv
+        if ($LASTEXITCODE) { throw 'translate.py --spv failed' }
+        $ver = python -c "import sys; sys.path.insert(0, r'$tools\shader'); import translate; print(translate.translator_version())"
+        if ($LASTEXITCODE -or -not $ver) { throw 'no translator version' }
+    } finally { Pop-Location }
+    $spv = "$build\shaders\spv\$($ver.Trim())"
+    if (-not (Test-Path $spv)) { throw "no $spv" }
+    if (-not $NoBuild -or -not (Test-Path "$build\cmake\nxshpack.exe")) {
+        cmd /c "`"$d\build.bat`" --target nxshpack"
+        if ($LASTEXITCODE) { throw 'the nxshpack build failed' }
+    }
+    $ShaderPack = "$build\shaders.pak"
+    & "$build\cmake\nxshpack.exe" $spv $ShaderPack
+    if ($LASTEXITCODE) { throw 'nxshpack failed' }
+}
 if (-not $ShaderPack -and (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN_SDK\Bin\glslangValidator.exe"))) {
     throw 'no %VULKAN_SDK%\Bin\glslangValidator.exe'
 }
@@ -89,7 +111,8 @@ first minutes of play stutter again).
 
 Controls: WASD moves, the mouse looks (click in the window to capture it), Z = A, X = B, C = X, V = Y, Q = L,
 R = R, 1 = ZL, 3 = ZR, Enter = +, Backspace = -, arrow keys = D-pad. A gamepad works too.
-Esc opens the options (mouse sensitivity, 30 or 60 fps, FPS counter); Esc again closes them.
+Esc opens the options (mouse sensitivity, 30 or 60 fps, FPS counter, render scale 1-4x: 2x draws at 4K and is much
+smoother on a 1440p or 4K screen if your graphics card keeps up); Esc again closes them.
 F3 shows the frame rate. F12 captures the next frame into %LOCALAPPDATA%\$title\dumps: if something looks wrong,
 press it and send that folder's newest files with log.txt.
 
