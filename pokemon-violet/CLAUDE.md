@@ -355,6 +355,16 @@ a second backend next to the room. Not started: needs the adapter.
     the browser's game filter hides it), playit tunnels UDP 24872, the host joins 127.0.0.1:24872 directly.
     Then the raid mod's first real use (F6; dens appear only once the story unlocks raids): does the scan find the
     blocks (log `raids: Found ...`, `raids: run at ...` at log level 1), do written seeds show in the world.
+  - **Later the same evening (nxrecomp `ab7f7c5`; render scale and music user-checked, scale cycled 1-4x live):**
+    - Quiet music: hwopus was a silent stub (549 decoders opened in one session). Now libopus (vcpkg `opus`, found
+      by `nx_opus_lib` in nxrecomp.cmake, opus.dll next to the exe); multistream parameter layout unverified.
+    - The game stopped after hours of play with Lua's "longjmp to a jmp_buf no lifted setjmp call set" again:
+      dispatch.c's host jump buffer table is now 256 per thread and evicts non-stack entries first.
+    - Render scale 1-4x (Esc panel "RENDER SCALE", settings.ini `render_scale`, NX_RES_SCALE), switchable while
+      playing (gpu.c `rescale_all` at a present waits for the GPU and remakes targets in place). 16:9 targets
+      from 120x68 up are made N times larger when first drawn into; translate.py takes bit 18 of a handle and
+      pc.scale (FragCoord, texelFetch, TXQ, image coordinates). Smoke test at 2x: title-to-overworld frames match
+      1x, sharper, 60 fps. Known: Violet draws 360x360 targets with the 1080p depth bound (that pass runs at 1x).
   - Asked by the user, not started: setting save flags for the raid star unlocks and every fly point (one tool for
     save flags: in memory, or the save file with the game closed, which needs the save's encryption from the game's
     code); "story completed" as such is not feasible. The mon generator is for later (user's call).
