@@ -340,6 +340,24 @@ a second backend next to the room. Not started: needs the adapter.
     (`FSYS_RAID_DIFFICTLTY3..6_RELEASE`) and fly points live in save flag blocks: the user asked about setting them
     (and "story completed": not feasible as such).
   - The user's old save is in `build/save-backup-2026-11-05/` (a new save started 2026-11-05).
+  - Fixed the same day from the user's new-save run (nxrecomp, compiled, **not yet linked: the game was running**):
+    - Opening movie sound broken (user-reported): audren REV7+ (Violet's Bink renderer is REV10, "REV:" in the log)
+      starts the mix section with a 0x20-byte header {magic 0xCAFEBABE, count}, each mix with its id at +0x10; we
+      read the header as the final mix, so its volume was the magic (-8346975) and every sample was scaled by it.
+      Check: the log's `audren: frame ... final mix volume` should read ~1.00 and the movie sound right.
+    - Name entry showed "ur name?" with "up to 0 characters": the keyboard config's texts and length limit are 4
+      bytes earlier (header 0x34, sub 0xb6, guide 0x1b8, limit 0x3bc). Inferred from that one prompt; check the
+      log's `am: keyboard (... up to N characters): "..."` line on the next prompt (link code entry too).
+    - Direct Connect never sent a password: it now asks when the room turns the join down for one (untested).
+  - **Next when the user is back:** they close the game -> `build.bat` -> relaunch (multiplayer on: no NX_NETPLAY=0;
+    the room browser shows; no scripted input). Hosting: `build/room/room_server.exe --port 24872 --name ...
+    --game-id 01008F6008C5E000 --game "Pokemon Violet" [--password pw]` (without the game id the server says MK8 and
+    the browser's game filter hides it), playit tunnels UDP 24872, the host joins 127.0.0.1:24872 directly.
+    Then the raid mod's first real use (F6; dens appear only once the story unlocks raids): does the scan find the
+    blocks (log `raids: Found ...`, `raids: run at ...` at log level 1), do written seeds show in the world.
+  - Asked by the user, not started: setting save flags for the raid star unlocks and every fly point (one tool for
+    save flags: in memory, or the save file with the game closed, which needs the save's encryption from the game's
+    code); "story completed" as such is not feasible. The mon generator is for later (user's call).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
@@ -688,7 +706,8 @@ In order:
     `NX_WATCH_DEPTH` frames; pages read-only from when they are mapped, single-stepping writes; GPU writes are not
     seen), `NX_ONE_CORE` (all threads on core 0: tells races from logic bugs), `NX_DUMP_MEM` also on a crash,
     MapPhysicalMemory callers at log level 2, audren logs its work buffer size and renderer stop/close.
-  - Also open: hwopus decoding (V5), the audren log's final-mix volume reads garbage.
+  - Also open: hwopus decoding (V5). (The audren log's garbage final-mix volume: solved 2026-11-05, see "Mods and
+    the Tera raid editor" below: the movie's sound was clipped noise because of it.)
   - Black screen from ~frame 4,600: solved 2026-10-18. Not the movie (Bink's audio voice plays and is consumed in
     real time). The scene rendered, but the final tonemap samples a 32x32x32 color-grading LUT (3D texture, f61)
     that the game draws one slice per instance (gl_Layer); we rendered with layerCount 1, so 31 slices stayed
