@@ -719,6 +719,26 @@ void host_stack(void *thread) {
     ResumeThread(h);
 }
 
+/* NX_WATCH_MEM armed while running (mods: host->watch_mem). A range already watched is let go first */
+void diag_watch(u64 a, u64 n) {
+    DWORD old;
+    if (watch_lo) VirtualProtect((void *)(uintptr_t)watch_lo, watch_hi - watch_lo, PAGE_READWRITE, &old);
+    watch_lo = 0;
+    if (!n) return;
+    watch_a = a;
+    watch_n = n;
+    watch_hits = 0;
+    u64 lo = a & ~0xfffull, hi = (a + n + 0xfff) & ~0xfffull;
+    watch_hi = hi;
+    watch_lo = lo;
+    if (!VirtualProtect((void *)(uintptr_t)lo, hi - lo, PAGE_READONLY, &old)) {
+        hlog(0, "watch: %llx+%llx could not be armed (%lu)", a, n, GetLastError());
+        watch_lo = 0;
+        return;
+    }
+    hlog(0, "watch: %llx+%llx armed", a, n);
+}
+
 void diag_init(void) {
     QueryPerformanceFrequency(&qpc_freq);
     QueryPerformanceCounter(&qpc_start);

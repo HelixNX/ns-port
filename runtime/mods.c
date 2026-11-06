@@ -38,7 +38,7 @@ void mods_load(SDL_Window *window) {
     const char *e = getenv("NX_MODS");
     if (e && *e == '0') return;
     snprintf(title_id, sizeof title_id, "%016llX", (unsigned long long)NX_TITLE_ID);
-    host = (NxModHost){NXMOD_VERSION, title_id, NX_TITLE, nx_cache_dir(), window, mod_log, release_mouse};
+    host = (NxModHost){NXMOD_VERSION, title_id, NX_TITLE, nx_cache_dir(), window, mod_log, release_mouse, diag_watch};
     char dir[MAX_PATH], pat[MAX_PATH + 16];
     GetModuleFileNameA(NULL, dir, MAX_PATH);
     char *s = strrchr(dir, '\\');

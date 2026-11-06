@@ -19,9 +19,11 @@
 extern "C" {
 #endif
 
-#define NXMOD_VERSION 1
+#define NXMOD_VERSION 2
 #define NXMOD_HEAP_BASE 0x2000000000ull     /* hos.h HEAP_BASE: svcSetHeapSize's heap */
 #define NXMOD_HEAP_MAX  0x0180000000ull     /* the most it can span (hos.h HEAP_MAX) */
+#define NXMOD_ALIAS_BASE 0x1000000000ull    /* hos.h ALIAS_BASE: svcMapPhysicalMemory's region, where games with */
+#define NXMOD_ALIAS_SIZE 0x1000000000ull    /* their own allocator (Violet's 12 GB one) keep most of their data */
 
 typedef struct NxModHost {
     uint32_t version;                       /* NXMOD_VERSION */
@@ -31,6 +33,9 @@ typedef struct NxModHost {
     SDL_Window *window;
     void (*log)(int level, const char *fmt, ...);   /* log.txt (level 0 always, 1 with --log 1) */
     void (*release_mouse)(void);            /* give the mouse back from the game's camera (window thread) */
+    /* debugging (version 2): log every write to [addr, addr + len) from now on (NX_WATCH_MEM's report: the writer's
+     * guest instruction and host stack, i.e. the lifted f_<addr> chain; the first 200 writes). One range at a time */
+    void (*watch_mem)(uint64_t addr, uint64_t len);
 } NxModHost;
 
 /* draw()'s frame: the swapchain image in COLOR_ATTACHMENT_OPTIMAL (left so), `cmd` recording. Submissions of the

@@ -217,6 +217,7 @@ const char *sym_name(u64 addr, u64 *offset);        /* nearest symbol at or belo
 /* ---------------------------------------------------------------------------------------------- dispatch */
 void dispatch_init(void);
 void diag_init(void);
+void diag_watch(u64 addr, u64 len);     /* NX_WATCH_MEM from now on (mods' host->watch_mem) */
 void host_stack(void *thread);                          /* log a host thread's native stack */
 u64 hostcall_register(const char *name, GuestFn fn);  /* returns the guest address that calls fn */
 GuestFn guest_fn(u64 addr);                            /* lifted function or host call at addr, or NULL */
