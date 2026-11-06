@@ -1,7 +1,8 @@
 # nxrecomp: the shared part of a game's build. A game's CMakeLists.txt includes this file and calls
 #   nx_game(GAME_JSON <path to game.json> [SOURCES <game-specific .c files>])
 # which builds <name>.exe (game.json "name") from the shared runtime, the game's sources and the lifted code in
-# LIFTED_DIR (written by tools/lifter/a64lift.py). Configure from a vcvars64 shell with clang-cl and Ninja.
+# LIFTED_DIR (written by tools/lifter/a64lift.py), and nx_mod(<name> SOURCES ...) for mods (DLLs, runtime/nxmod.h).
+# Configure from a vcvars64 shell with clang-cl and Ninja.
 set(NX_ROOT "${CMAKE_CURRENT_LIST_DIR}")
 set(NX_DEPS "${NX_ROOT}/../deps")
 # third-party locations, found in this order (each can be set on the cmake command line instead):
@@ -69,7 +70,7 @@ set(NX_RUNTIME_SOURCES
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
-    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c movie.c swkbd.c)
+    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c mods.c movie.c swkbd.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
@@ -275,4 +276,43 @@ function(nx_game_exe target package)
         target_compile_definitions(${target} PRIVATE NX_NETPLAY)
         target_link_libraries(${target} PRIVATE nx_enet winhttp comctl32)
     endif()
+endfunction()
+
+# A mod (runtime/nxmod.h): a DLL built into <build>/mods, which the runtime loads from mods\ next to the exe, with
+# Dear ImGui through modkit/. ImGui comes from vcpkg (x64-windows: `vcpkg install imgui[vulkan-binding]`), in the
+# vcpkg tree SDL3 came from, then $VCPKG_ROOT and $VCPKG_INSTALLATION_ROOT. Needs the CXX language in project().
+#   nx_mod(<name> SOURCES <files>)
+function(nx_mod name)
+    cmake_parse_arguments(M "" "" "SOURCES" ${ARGN})
+    if(NOT NX_IMGUI_BASE)
+        get_filename_component(_sdl_base "${NX_SDL3_INCLUDE}" DIRECTORY)
+        set(_bases "${_sdl_base}")
+        foreach(_v "$ENV{VCPKG_ROOT}" "$ENV{VCPKG_INSTALLATION_ROOT}")
+            if(_v)
+                file(TO_CMAKE_PATH "${_v}/installed/x64-windows" _b)
+                list(APPEND _bases "${_b}")
+            endif()
+        endforeach()
+        foreach(_b ${_bases})
+            if(EXISTS "${_b}/include/imgui_impl_vulkan.h" AND EXISTS "${_b}/lib/imgui.lib")
+                set(NX_IMGUI_BASE "${_b}" CACHE PATH "vcpkg tree with Dear ImGui (imgui[vulkan-binding])")
+                break()
+            endif()
+        endforeach()
+        if(NOT NX_IMGUI_BASE)
+            message(FATAL_ERROR "mods need Dear ImGui: `vcpkg install imgui[vulkan-binding]` (x64-windows)")
+        endif()
+        message(STATUS "nxrecomp: Dear ImGui from ${NX_IMGUI_BASE}")
+    endif()
+    add_library(${name} SHARED ${M_SOURCES} "${NX_ROOT}/modkit/modkit.cpp")
+    # the Vulkan headers ahead of vcpkg's include folder, as the runtime has them
+    target_include_directories(${name} PRIVATE "${NX_VULKAN_INCLUDE}" "${NX_ROOT}/runtime" "${NX_ROOT}/modkit"
+                               "${NX_SDL3_INCLUDE}" "${NX_IMGUI_BASE}/include")
+    target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${name} PRIVATE /clang:-O2 /W3)
+    # ImGui's Vulkan backend was built with prototypes: vulkan-1.lib (the loader the runtime uses too)
+    target_link_libraries(${name} PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_IMGUI_BASE}/lib/vulkan-1.lib"
+                          "${NX_SDL3_LIB}")
+    set_target_properties(${name} PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mods"
+                          LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mods")
 endfunction()

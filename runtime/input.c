@@ -15,6 +15,7 @@
 #include <math.h>
 #include "hos.h"
 #include "options.h"
+#include "mods.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,7 +140,7 @@ static bool replayed(u64 frame, u64 *b, s32 *lx, s32 *ly, s32 *rx, s32 *ry) {
 }
 
 void input_poll(void) {
-    if (options_is_open()) {                            /* the panel has the keyboard and the mouse */
+    if (options_is_open() || mods_want_input()) {       /* the panel (or a mod's window) has the keyboard and mouse */
         mouse_dx = mouse_dy = 0;
         hid_set_input(0, 0, 0, 0, 0, 0);
         return;

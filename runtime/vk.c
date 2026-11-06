@@ -33,6 +33,7 @@ static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
 #include "options.h"
+#include "mods.h"
 void gpu_capture_next(void);
 void gpu_reload_textures(void);
 void gpu_save_pipelines(void);
@@ -86,11 +87,13 @@ void window_init(void) {
 /* the host's main thread: window events until the guest's main thread ends or the window is closed */
 void window_loop(void *guest_main_thread) {
     options_init();
+    mods_load(window);
     for (;;) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 8)) {
             do {
                 bool used = options_event(&e);          /* Esc and the options panel's keys and clicks */
+                if (!used && e.type != SDL_EVENT_QUIT) used = mods_event(&e);   /* then the mods' (mods.c) */
 #ifdef NX_PACKAGE                                       /* no input while the start-up's shaders are translated */
                 if (!gpu_shaders_starting())
 #endif
@@ -658,6 +661,7 @@ static struct {
     VkExtent2D extent;
     u32 count;
     VkImage images[MAX_IMAGES];
+    VkImageView views[MAX_IMAGES];          /* for mods that draw (mods.c), made with the swapchain */
     VkSemaphore done[MAX_IMAGES];           /* rendering into image i finished (waited on by the present) */
     VkSemaphore acquired[PRESENT_FRAMES];
     VkFence fence[PRESENT_FRAMES];
@@ -719,6 +723,8 @@ static void swapchain_create(void) {
         .presentMode = mode, .clipped = 1, .oldSwapchain = old};
     VKCHECK(vkCreateSwapchainKHR(vk.dev, &ci, NULL, &sw.sc));
     if (old) vkDestroySwapchainKHR(vk.dev, old, NULL);
+    for (u32 i = 0; i < MAX_IMAGES; i++)                /* the device is idle here (present_locked) */
+        if (sw.views[i]) { vkDestroyImageView(vk.dev, sw.views[i], NULL); sw.views[i] = NULL; }
     sw.count = MAX_IMAGES;
     VKCHECK(vkGetSwapchainImagesKHR(vk.dev, sw.sc, &sw.count, sw.images));
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -734,6 +740,10 @@ static void swapchain_create(void) {
  * then queue_lock */
 static SRWLOCK sw_lock = SRWLOCK_INIT;
 static SRWLOCK queue_lock = SRWLOCK_INIT;
+
+/* mods' own submissions to vk.queue (nxmod.h NxModFrame) */
+void vk_queue_lock(void) { AcquireSRWLockExclusive(&queue_lock); }
+void vk_queue_unlock(void) { ReleaseSRWLockExclusive(&queue_lock); }
 
 VkResult vk_submit(const VkSubmitInfo2 *si, VkFence fence) {
     AcquireSRWLockExclusive(&queue_lock);
@@ -1090,7 +1100,18 @@ static void present_locked(VkImage src, s32 x, s32 y, s32 w, s32 h, bool flip_y,
                                 .imageOffset = {8, (s32)sw.extent.height - MSG_H - 8, 0}, .imageExtent = {MSG_W, MSG_H, 1}};
         vkCmdCopyBufferToImage(cmd, msg_buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     }
-    image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (!sw.views[idx] && mods_draw_any()) {           /* made on first use: mods load on the window thread */
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = dst,
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sw.format,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VKCHECK(vkCreateImageView(vk.dev, &vi, NULL, &sw.views[idx]));
+    }
+    if (sw.views[idx]) {                                /* mods draw last, over everything (mods.c) */
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        mods_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    } else
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     VKCHECK(vkEndCommandBuffer(cmd));
     VkSemaphoreSubmitInfo waits[2] = {
         {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = sw.acquired[f],

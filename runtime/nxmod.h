@@ -1,0 +1,67 @@
+/* nxmod.h: what the runtime gives mods, and what a mod gives back.
+ *
+ * A mod is a DLL in the mods\ folder next to the executable (NX_MODS=0: none loaded). The runtime loads each at
+ * start-up and calls its export
+ *     const NxMod *nx_mod_init(const NxModHost *host);
+ * (NULL: the mod declines, e.g. another game). Mods see the guest's memory directly at its own addresses (the
+ * modules at game.json's bases, the heap at NXMOD_HEAP_BASE), as the lifted code does.
+ *
+ * Threads: event() runs on the window thread (SDL's main thread), draw() on the render thread inside the present;
+ * a mod synchronises its own state between them. nxrecomp/modkit has the Dear ImGui glue for both. */
+#ifndef NXMOD_H
+#define NXMOD_H
+#include <stdbool.h>
+#include <stdint.h>
+#include <vulkan/vulkan.h>                  /* with or without VK_NO_PROTOTYPES (the runtime's vk.h has it) */
+#include <SDL3/SDL.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NXMOD_VERSION 1
+#define NXMOD_HEAP_BASE 0x2000000000ull     /* hos.h HEAP_BASE: svcSetHeapSize's heap */
+#define NXMOD_HEAP_MAX  0x0180000000ull     /* the most it can span (hos.h HEAP_MAX) */
+
+typedef struct NxModHost {
+    uint32_t version;                       /* NXMOD_VERSION */
+    const char *title_id;                   /* "01008F6008C5E000" */
+    const char *title;                      /* game.json's title */
+    const char *cache_dir;                  /* the build folder, or %LOCALAPPDATA%\<title> in a package */
+    SDL_Window *window;
+    void (*log)(int level, const char *fmt, ...);   /* log.txt (level 0 always, 1 with --log 1) */
+    void (*release_mouse)(void);            /* give the mouse back from the game's camera (window thread) */
+} NxModHost;
+
+/* draw()'s frame: the swapchain image in COLOR_ATTACHMENT_OPTIMAL (left so), `cmd` recording. Submissions of the
+ * mod's own (uploads) go to `queue` between queue_lock() and queue_unlock(): the runtime's threads share it. */
+typedef struct NxModFrame {
+    VkCommandBuffer cmd;
+    VkImage image;
+    VkImageView view;
+    VkFormat format;
+    uint32_t width, height;
+    uint32_t image_count;                   /* swapchain images */
+    PFN_vkGetInstanceProcAddr gipa;
+    VkInstance instance;
+    VkPhysicalDevice phys;
+    VkDevice dev;
+    uint32_t family;
+    VkQueue queue;
+    void (*queue_lock)(void);
+    void (*queue_unlock)(void);
+} NxModFrame;
+
+typedef struct NxMod {
+    const char *name;
+    bool (*event)(const SDL_Event *e);      /* window thread; true: used (the game does not see it) */
+    bool (*wants_input)(void);              /* while true the game gets no keyboard, mouse or pad input */
+    void (*draw)(const NxModFrame *f);      /* render thread, once a presented frame */
+} NxMod;
+
+typedef const NxMod *(*NxModInit)(const NxModHost *host);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
