@@ -637,8 +637,10 @@ static bool any_open() { return g_open || items_open(); }
 static bool mod_event(const SDL_Event *e) {
     if (e->type == SDL_EVENT_KEY_DOWN && (e->key.scancode == SDL_SCANCODE_F6 || e->key.scancode == SDL_SCANCODE_F7)) {
         if (!e->key.repeat) {
-            if (e->key.scancode == SDL_SCANCODE_F6) g_open = !g_open;
-            else items_toggle();
+            if (e->key.scancode == SDL_SCANCODE_F6) {
+                g_open = !g_open;
+                if (g_open && D.loaded) scan_start();   /* every time it opens: the dens move between loads */
+            } else items_toggle();
         }
         modkit::set_open(any_open());
         return true;

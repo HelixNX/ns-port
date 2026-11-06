@@ -3,8 +3,14 @@
  * The bag lives in the save's item block (PKHeX: KItem 0x21C9BD44), which the game keeps current in memory:
  * 3,000 entries of 0x10 bytes indexed by item id, each {u32 pocket, u32 count, u32 flags, u32 0}; flags bit 0 new,
  * bit 1 favourite, bit 2 obtained. The game writes it when items come and go and saves it as it is, but the bag
- * screen works from lists built when the save loads: an item written here shows after saving and restarting. Instant
- * giving needs the game's own add-item path, which is Lua (Haxe) script code (pokemon-violet/CLAUDE.md, "Item giver").
+ * screen works from the script side's pocket lists, built when the save loads.
+ *
+ * Giving goes through the game's own bag code instead (host->run_script, the runner in violetrecomp/lua.c): the bag
+ * singleton C14A8D35D72F56FE9.S90D73F1D715BCBF4() (main.blua, Haxe -> Lua 5.4, obfuscated names), whose
+ * FB01A9B29CD4CC6CB(id, n) adds to the pocket list and the save entry (clamped to the item's maximum, new items
+ * appended and flagged), FE027A297CCA14276(id, n) takes n away, F13D72EF77582090D(id) is the item's index in the
+ * list (-1: not in it) and self[6][index].num its count. Shows at once. The direct write stays as the fallback (no
+ * runner): that shows after saving and restarting.
  *
  * The block is found by scanning guest memory for an array of that shape that holds the Rotom Phone (every save has
  * it from the start) with every held item in its own pocket, as the raid blocks are. Item names and pockets:
@@ -45,7 +51,14 @@ std::mutex g_lock;
 std::vector<u64> g_bags;                    /* where each copy of the item array starts */
 std::atomic<bool> g_scanning;
 std::atomic<u64> g_done, g_total;
-std::string g_scan_msg, g_status;
+std::string g_scan_msg;
+std::mutex g_status_lock;                   /* g_status: also set from the game's thread (script results) */
+std::string g_status;
+
+void set_status(const std::string &s) {
+    std::lock_guard<std::mutex> l(g_status_lock);
+    g_status = s;
+}
 
 bool mem_read(u64 a, void *out, size_t n) {
     SIZE_T got = 0;
@@ -150,18 +163,9 @@ void scan_thread() {
     g_scanning = false;
 }
 
+/* always a whole scan (the window starts one each time it opens): a copy found earlier can be stale */
 void scan_start() {
     if (g_scanning.exchange(true)) return;
-    {   /* where it was last time (this session): no scan while it stays put */
-        std::lock_guard<std::mutex> l(g_lock);
-        std::vector<Entry> tmp;
-        if (!g_bags.empty() && bag_at(g_bags[0], tmp)) {
-            g_bags.resize(1);
-            g_scan_msg = "Bag still in place";
-            g_scanning = false;
-            return;
-        }
-    }
     std::thread(scan_thread).detach();
 }
 
@@ -191,6 +195,44 @@ int set_count(const Item &it, u32 count) {
     return n;
 }
 
+/* Give (add) / Set through the game's bag code: false when there is no script runner */
+struct GiveJob { std::string name; };
+
+void give_done(void *ud, bool ok, const char *result) {
+    GiveJob *j = (GiveJob *)ud;
+    set_status(ok ? j->name + ": " + result + " in the bag." : j->name + ": the game's bag code failed: " + result);
+    delete j;
+}
+
+bool give_script(const Item &it, u32 amount, bool set) {
+    if (modkit::host()->version < 3 || !modkit::host()->run_script) return false;
+    char text[1024];
+    snprintf(text, sizeof text,
+             "local id, n, set = %u, %u, %s\n"
+             "local cls = C14A8D35D72F56FE9\n"
+             "if cls == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+             "local b = cls.S90D73F1D715BCBF4()\n"
+             "if b == nil or b[6] == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+             "local function held() local i = b:F13D72EF77582090D(id) if i >= 0 then return b[6][i].num end return 0 end\n"
+             "local h = held()\n"
+             "local want = set and n or h + n\n"
+             "if want > %d then want = %d end\n"
+             "if want > h then b:FB01A9B29CD4CC6CB(id, want - h) elseif want < h then b:FE027A297CCA14276(id, h - want) end\n"
+             "return tostring(held())\n",
+             it.id, amount, set ? "true" : "false", (int)MAX_COUNT, (int)MAX_COUNT);
+    GiveJob *j = new GiveJob{it.name};
+    if (!modkit::host()->run_script(text, give_done, j)) { delete j; return false; }
+    set_status(it.name + ": sent to the game...");
+    return true;
+}
+
+/* the fallback: the save entry only */
+void give_direct(const Item &it, u32 count) {
+    int w = set_count(it, count);
+    set_status(it.name + ": " + std::to_string(count) + " (" + std::to_string(w) + " cop" + (w == 1 ? "y" : "ies") +
+               " written). Save, then restart to see it.");
+}
+
 bool contains_nocase(const char *s, const char *sub) {
     for (; *s; s++) {
         size_t k = 0;
@@ -205,6 +247,9 @@ char g_filter[64];
 int g_pocket = -1, g_sel = -1, g_amount = 1;
 bool g_owned_only;
 std::vector<Entry> g_bag;
+char g_lua[2048] = "return tostring(C14A8D35D72F56FE9 ~= nil)";
+
+void lua_done(void *, bool ok, const char *result) { set_status(std::string(ok ? "Lua: " : "Lua error: ") + result); }
 
 } // namespace
 
@@ -215,7 +260,10 @@ void items_init(const char *cache_dir) {
 }
 
 bool items_open() { return g_open; }
-void items_toggle() { g_open = !g_open; }
+void items_toggle() {
+    g_open = !g_open;
+    if (g_open && g_error.empty()) scan_start();    /* every time it opens: the bag moves between loads */
+}
 
 void items_ui() {
     if (!g_open) return;
@@ -238,9 +286,10 @@ void items_ui() {
         std::lock_guard<std::mutex> l(g_lock);
         u64 a = g_bags[0] + 4 * sizeof(Entry) + 4;
         modkit::host()->watch_mem(a, 4);
-        g_status = "Watching the Poke Ball count: pick up or use a Poke Ball (the log lists the code that writes it).";
+        set_status("Watching the Poke Ball count: pick up or use a Poke Ball (the log lists the code that writes it).");
     }
-    ImGui::TextWrapped("Given items are written into the save's bag: save, then restart the game to see them.");
+    bool script = modkit::host()->version >= 3 && modkit::host()->run_script;
+    if (!script) ImGui::TextWrapped("Given items are written into the save's bag: save, then restart the game to see them.");
 
     ImGui::SetNextItemWidth(200);
     ImGui::InputTextWithHint("##filter", "search items", g_filter, sizeof g_filter);
@@ -291,28 +340,31 @@ void items_ui() {
         ImGui::InputInt("Amount", &g_amount);
         if (g_amount < 0) g_amount = 0;
         if (g_amount > MAX_COUNT) g_amount = MAX_COUNT;
-        if (have) {
+        if (have || script) {
             ImGui::SameLine();
             if (ImGui::Button("Give")) {
                 u32 n = held + (u32)g_amount;
-                int w = set_count(it, n > MAX_COUNT ? MAX_COUNT : n);
-                g_status = it.name + ": " + std::to_string(n > MAX_COUNT ? MAX_COUNT : n) + " (" + std::to_string(w) + " cop" +
-                           (w == 1 ? "y" : "ies") + " written). Save, then restart to see it.";
+                if (!give_script(it, (u32)g_amount, false) && have) give_direct(it, n > MAX_COUNT ? MAX_COUNT : n);
             }
             ImGui::SameLine();
             if (ImGui::Button("Set to amount")) {
-                int w = set_count(it, (u32)g_amount);
-                g_status = it.name + " set to " + std::to_string(g_amount) + " (" + std::to_string(w) + " cop" +
-                           (w == 1 ? "y" : "ies") + " written). Save, then restart to see it.";
+                if (!give_script(it, (u32)g_amount, true) && have) give_direct(it, (u32)g_amount);
             }
             ImGui::SameLine();
             if (ImGui::Button("Give 999")) {
-                int w = set_count(it, MAX_COUNT);
-                g_status = it.name + " set to 999 (" + std::to_string(w) + " cop" + (w == 1 ? "y" : "ies") +
-                           " written). Save, then restart to see it.";
+                if (!give_script(it, MAX_COUNT, true) && have) give_direct(it, MAX_COUNT);
             }
         }
     }
-    if (!g_status.empty()) ImGui::TextWrapped("%s", g_status.c_str());
+    if (script && ImGui::CollapsingHeader("Lua (the game's VM)")) {
+        ImGui::InputTextMultiline("##lua", g_lua, sizeof g_lua, ImVec2(-1, 90));
+        if (ImGui::Button("Run")) modkit::host()->run_script(g_lua, lua_done, nullptr);
+        ImGui::SameLine();
+        ImGui::TextDisabled("its first result, as text, shows below (and in the log)");
+    }
+    {
+        std::lock_guard<std::mutex> l(g_status_lock);
+        if (!g_status.empty()) ImGui::TextWrapped("%s", g_status.c_str());
+    }
     ImGui::End();
 }

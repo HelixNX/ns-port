@@ -18,3 +18,6 @@ main+c07dc4  was bd401e60  if gfx 1e3e1000               # ldr s0, [x19, #0x1c] 
 main+7f1a6c  was bd401280  if gfx 1e3e1000               # ldr s0, [x20, #0x10] -> fmov s0, #-1.0 (quality value)
 main+c4d864  was f9001be9  if nodof f9001bff              # str x9, [sp, #0x30] -> str xzr: no depth-of-field blur
 main+146e80c was 52808008  if shadow 52810008              # mov w8, #0x400 -> #0x800: 2048x2048 shadow maps
+#
+# Mods' host->run_script (lua.c): chunks run at lua_pcallk's entry, where x0 is the caller's lua_State.
+main+b5ddd0 was d10103ff after lua_pcall_entry      # sub sp, sp, #0x40: lua_pcallk's first instruction
