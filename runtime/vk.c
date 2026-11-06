@@ -770,6 +770,16 @@ static void present_pending(void) {
     for (; pq.tail != pq.head; pq.tail++) present_now(pq.idx[pq.tail % MAX_IMAGES]);
 }
 
+/* every queue idle, the queued presents done (gpu.c: before images still in flight are remade) */
+void vk_wait_idle(void) {
+    AcquireSRWLockExclusive(&sw_lock);
+    present_pending();
+    AcquireSRWLockExclusive(&queue_lock);
+    vkDeviceWaitIdle(vk.dev);
+    ReleaseSRWLockExclusive(&queue_lock);
+    ReleaseSRWLockExclusive(&sw_lock);
+}
+
 static unsigned __stdcall present_thread(void *arg) {
     (void)arg;
     for (;;) {

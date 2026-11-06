@@ -4,7 +4,7 @@
 #include <SDL3/SDL.h>
 
 #define OPT_W 440                   /* the panel's size in pixels (vk.c draws it centred) */
-#define OPT_H 200
+#define OPT_H 244
 
 void options_init(void);            /* settings.ini: before the first frame */
 bool options_event(const SDL_Event *e);     /* true: the panel used the event (the game does not see it) */

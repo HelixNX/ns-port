@@ -3,12 +3,12 @@
  * Esc opens it (releasing the mouse) and closes it; up / down choose a line, left / right (or Enter) change it; the
  * mouse drags the sensitivity slider and clicks lines; a click outside the panel closes it and captures the mouse
  * again. The game gets no input while it is open. Lines: mouse sensitivity (0.25-4x of input.c's scale), the frame
- * rate (30, the game's own pace, or 60; F5 in a development build also has 120 and uncapped) and the FPS counter
- * (F3).
+ * rate (30, the game's own pace, or 60; F5 in a development build also has 120 and uncapped), the FPS counter
+ * (F3) and the render scale (1-4x the game's 1080p, gpu.c; applied at the next frame).
  *
  * The values are kept in settings.ini in the cache folder (nx_cache_dir: build\ in a development build,
- * %LOCALAPPDATA%\<title>\ in a package), written on every change. NX_MOUSE_SENS, NX_FRAMERATE / NX_NOPACE and
- * NX_FPS still decide at start when set; a change in the panel then wins and is saved. */
+ * %LOCALAPPDATA%\<title>\ in a package), written on every change. NX_MOUSE_SENS, NX_FRAMERATE / NX_NOPACE,
+ * NX_FPS and NX_RES_SCALE still decide at start when set; a change in the panel then wins and is saved. */
 #include "options.h"
 #include "framerate.h"
 #include "hos.h"
@@ -23,8 +23,11 @@ void overlay_set(bool on);
 bool overlay_shown(void);
 void vk_swap_extent(u32 *w, u32 *h);
 void input_release_mouse(SDL_WindowID id);
+void gpu_render_scale_set(u32 s);
+u32 gpu_render_scale(void);
 
-enum { L_SENS, L_RATE, L_FPS, N_LINES };
+enum { L_SENS, L_RATE, L_FPS, L_SCALE, N_LINES };
+#define SCALE_MAX 4
 #define SENS_MIN 0.25f
 #define SENS_MAX 4.0f
 /* layout (panel pixels) */
@@ -46,7 +49,8 @@ static void save(void) {
     settings_path(path, sizeof path);
     FILE *f = fopen(path, "w");
     if (!f) { hlog(0, "options: cannot write %s", path); return; }
-    fprintf(f, "mouse_sensitivity=%.2f\nframerate=%d\nfps_counter=%d\n", sens, nx_framerate(), overlay_shown());
+    fprintf(f, "mouse_sensitivity=%.2f\nframerate=%d\nfps_counter=%d\nrender_scale=%u\n", sens, nx_framerate(),
+            overlay_shown(), gpu_render_scale());
     fclose(f);
 }
 
@@ -62,7 +66,11 @@ void options_init(void) {
         if (!strcmp(line, "mouse_sensitivity") && !getenv("NX_MOUSE_SENS")) sens = (float)atof(v);
         else if (!strcmp(line, "framerate") && !getenv("NX_FRAMERATE") && !getenv("NX_NOPACE")) nx_framerate_set(atoi(v));
         else if (!strcmp(line, "fps_counter") && !getenv("NX_FPS")) overlay_set(atoi(v) != 0);
+        else if (!strcmp(line, "render_scale")) gpu_render_scale_set((u32)atoi(v));
     }
+    const char *rs = getenv("NX_RES_SCALE");
+    if (rs) gpu_render_scale_set((u32)atoi(rs));
+    if (gpu_render_scale() > 1) hlog(0, "options: render scale %ux", gpu_render_scale());
     if (f) { fclose(f); hlog(1, "options: %s", path); }
     if (getenv("NX_MOUSE_SENS")) sens = (float)atof(getenv("NX_MOUSE_SENS"));
     if (!(sens >= SENS_MIN)) sens = sens > 0 ? SENS_MIN : 1.0f;
@@ -90,6 +98,7 @@ static void change(int line, int d) {
         int n = (int)(sizeof rates / sizeof *rates), i = (rate_index() + d + n) % n;
         nx_framerate_set(rates[i]);
     } else if (line == L_FPS) overlay_set(!overlay_shown());
+    else if (line == L_SCALE) gpu_render_scale_set((gpu_render_scale() - 1 + SCALE_MAX + d) % SCALE_MAX + 1);
     save();
 }
 
@@ -176,14 +185,16 @@ void options_draw(u32 *px) {
     char v[32];
     for (int i = 0; i < N_LINES; i++) {
         u32 c = i == sel ? green : white;
-        const char *label = i == L_SENS ? "MOUSE SENSITIVITY" : i == L_RATE ? "FRAME RATE" : "FPS COUNTER";
+        const char *label = i == L_SENS ? "MOUSE SENSITIVITY" : i == L_RATE ? "FRAME RATE" :
+                            i == L_FPS ? "FPS COUNTER" : "RENDER SCALE";
         if (i == L_SENS) snprintf(v, sizeof v, "%.2fX", sens);
         else if (i == L_RATE) {
             s32 r = nx_framerate();
             if (r == FRAMERATE_GAME) snprintf(v, sizeof v, "30");
             else if (r == FRAMERATE_UNCAPPED) snprintf(v, sizeof v, "UNCAPPED");
             else snprintf(v, sizeof v, "%d", r);
-        } else snprintf(v, sizeof v, "%s", overlay_shown() ? "ON" : "OFF");
+        } else if (i == L_FPS) snprintf(v, sizeof v, "%s", overlay_shown() ? "ON" : "OFF");
+        else snprintf(v, sizeof v, "%uX  %uP", gpu_render_scale(), 1080 * gpu_render_scale());
         ov_text(px, OPT_W, OPT_H, 16, ROW_Y(i), label, c, 2);
         ov_text(px, OPT_W, OPT_H, OPT_W - 16 - 12 * (int)strlen(v), ROW_Y(i), v, c, 2);
     }

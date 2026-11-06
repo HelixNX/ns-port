@@ -42,6 +42,12 @@ TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5,
 # (UINT/SINT, stencil) and puts its integer view in ut2d / ut2da at the same index; fetches and gathers of 2D and 2D
 # array textures read through it when the bit is set (a float read of an integer view is undefined)
 INT_FLAG = '((%s >> 19) & 1u) != 0u'
+# Render scale (runtime/gpu.c HANDLE_SCALED, rs_scale): bit 18 of a handle marks a texture or image made N times the
+# game's size, N in pc.scale bits 0-7; the pass's targets' scale is in bits 8-15. gl_FragCoord is divided by the
+# targets' scale, integer coordinates of scaled textures and images are multiplied by N (plus the pixel's place in
+# its N x N block in fragment shaders), sizes divided by it; stores into scaled images outside fragment shaders
+# fill the whole block. Sampling with normalized coordinates needs nothing.
+PC_DECL = 'layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; uint scale; } pc;'
 
 
 class Unsupported(Exception):
@@ -238,7 +244,9 @@ class Translator:
             self.in_attrs.setdefault(k, self.interp_of(k, c))
             return 'U(in_a%d[%d])' % (k, c), True
         if self.stage == 'fragment':
-            m = {0x70: 'U(gl_FragCoord.x)', 0x74: 'U(gl_FragCoord.y)', 0x78: 'U(gl_FragCoord.z)',
+            if off in (0x70, 0x74):
+                self.uses.add('rscale')
+            m = {0x70: 'U(gl_FragCoord.x / rs_rt())', 0x74: 'U(gl_FragCoord.y / rs_rt())', 0x78: 'U(gl_FragCoord.z)',
                  0x7c: 'U(gl_FragCoord.w)', 0x3fc: '(gl_FrontFacing ? 0xffffffffu : 0u)',
                  0x2e0: 'U(gl_PointCoord.x)', 0x2e4: 'U(gl_PointCoord.y)', 0x64: 'uint(gl_Layer)'}
             if off in m:
@@ -315,10 +323,13 @@ class Translator:
         if offset and gather is None:
             # GLSL wants constant offsets outside gathers: shift the coordinates by whole texels instead
             lv = 'int(%s)' % lod if lod is not None else '0'
+            if kind in ('2D', '2DARRAY'):
+                self.uses.add('rscale')
+                offset = '(vec2(%s) * float(tsc(%s)))' % (offset, handle)
             if kind == '2D':
-                coords = '(%s + vec2(%s) / vec2(textureSize(%s, %s)))' % (coords, offset, s, lv)
+                coords = '(%s + %s / vec2(textureSize(%s, %s)))' % (coords, offset, s, lv)
             elif kind == '2DARRAY':
-                coords = 'vec3(%s.xy + vec2(%s) / vec2(textureSize(%s, %s).xy), %s.z)' % (coords, offset, s, lv, coords)
+                coords = 'vec3(%s.xy + %s / vec2(textureSize(%s, %s).xy), %s.z)' % (coords, offset, s, lv, coords)
             elif kind == '3D':
                 coords = '(%s + vec3(%s) / vec3(textureSize(%s, %s)))' % (coords, offset, s, lv)
             else:
@@ -1445,6 +1456,9 @@ class Translator:
         self.uses.add('tex_' + arr)
         if offset:
             coords = '(%s + %s)' % (coords, offset)
+        if kind in ('2D', '2DARRAY'):
+            self.uses.add('rscale')
+            coords = '%s(%s, %s)' % ('rs_c2' if kind == '2D' else 'rs_c3', handle, coords)
         e = 'texelFetch(%s[%s], %s, %s)' % (arr, self.ix('%s & 0xffffu' % handle), coords, lod)
         if kind in ('2D', '2DARRAY'):           # integer textures: the raw bits through the integer view
             self.uses.add('tex_u' + arr)
@@ -1610,7 +1624,7 @@ class Translator:
             h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
         # each view type has its own array (runtime/gpu.c TB_*): every 2D image has a 2D array view, a 3D image only
         # a 3D one; the 1x1 black texture where the entry has no view of that type
-        self.uses.update(('tex_t2da', 'tex_t3d', 'tex_ut2da', 'txq'))
+        self.uses.update(('tex_t2da', 'tex_t3d', 'tex_ut2da', 'txq', 'rscale'))
         self.emit('{ uint h_ = %s; uvec4 v_ = txq(h_, int(%s));' % (h, lod))
         self.indent += 1
         r = d
@@ -1624,7 +1638,7 @@ class Translator:
     # --- storage images (NVN images: the handle, an image id in the texture pool, is read from c[2] at 0x120 + 8k)
     SURF = {0: ('1D', 1), 2: ('1DARRAY', 1), 3: ('2D', 2), 4: ('2DARRAY', 2), 5: ('3D', 3)}
 
-    def surface(self, w, kind):
+    def surface(self, w, kind, store=False):
         """image array element and integer coordinates; kind: 'f' formatted float, 'a' r32ui (atomics), 'ai' r32i"""
         st = bits(w, 33, 3)
         if st not in self.SURF:
@@ -1642,23 +1656,40 @@ class Translator:
         h = self.cbuf(2, bits(w, 36, 13) * 4) if bound else self.R(bits(w, 39, 8))
         name = {'f': 'i', 'a': 'ua', 'ai': 'ia'}[kind] + dim.lower()
         self.uses.add('img_' + name)
-        return '%s[%s(%s & 0xffffu)]' % (name, '' if bound else 'nonuniformEXT', h), coords
+        img = '%s[%s(%s & 0xffffu)]' % (name, '' if bound else 'nonuniformEXT', h)
+        if dim in ('2D', '2DARRAY'):
+            self.uses.add('rscale')
+            if store and self.stage != 'fragment':
+                return img, coords, (h, dim)    # surface_store fills the block
+            coords = '%s(%s, %s)' % ('rs_c2' if dim == '2D' else 'rs_c3', h, coords)
+        return img, coords, None
+
+    def surface_store(self, img, coords, block, fmt):
+        """a store or atomic (fmt: GLSL with {img} and {c}); into a scaled image outside fragment shaders, at every
+        texel of the coordinates' N x N block"""
+        if block is None:
+            self.emit(fmt.format(img=img, c=coords))
+            return
+        h, dim = block
+        c = 'ivec2(c_.xy * s_ + ivec2(x_, y_))' if dim == '2D' else 'ivec3(c_.xy * s_ + ivec2(x_, y_), c_.z)'
+        self.emit('{ int s_ = tsc(%s); %s c_ = %s;' % (h, 'ivec2' if dim == '2D' else 'ivec3', coords))
+        self.emit('  for (int y_ = 0; y_ < s_; y_++) for (int x_ = 0; x_ < s_; x_++) ' + fmt.format(img=img, c=c) + ' }')
 
     def op_SUST(self, w, form, pc):
         if bits(w, 52, 1):
             raise Unsupported('SUST.D')
         if bits(w, 20, 4) != 15:
             raise Unsupported('SUST.P partial mask')
-        img, coords = self.surface(w, 'f')
+        img, coords, block = self.surface(w, 'f', store=True)
         d = bits(w, 0, 8)
         v = ', '.join(self.Rf(d + i if d != RZ else RZ) for i in range(4))
-        self.emit('imageStore(%s, %s, vec4(%s));' % (img, coords, v))
+        self.surface_store(img, coords, block, 'imageStore({img}, {c}, vec4(%s));' % v)
 
     def op_SULD(self, w, form, pc):
         if bits(w, 52, 1):
             raise Unsupported('SULD.D')
         mask = bits(w, 20, 4)
-        img, coords = self.surface(w, 'f')
+        img, coords, _ = self.surface(w, 'f')
         self.emit('{ vec4 v_ = imageLoad(%s, %s);' % (img, coords))
         self.indent += 1
         self.store_mask(bits(w, 0, 8), mask, 'v_')
@@ -1673,9 +1704,9 @@ class Translator:
         op, size = bits(w, 24, 3), bits(w, 20, 3)
         if op not in self.ATOM or size > 1:
             raise Unsupported('SURED op %d size %d' % (op, size))
-        img, coords = self.surface(w, 'ai' if size else 'a')
+        img, coords, block = self.surface(w, 'ai' if size else 'a', store=True)
         v = self.R(bits(w, 0, 8))
-        self.emit('%s(%s, %s, %s);' % (self.ATOM[op], img, coords, 'int(%s)' % v if size else v))
+        self.surface_store(img, coords, block, '%s({img}, {c}, %s);' % (self.ATOM[op], 'int(%s)' % v if size else v))
 
     def op_VMNMX(self, w, form, pc):
         """video min/max: the min or max of byte/half/word lanes of A and B, then MIN or MAX with C"""
@@ -2045,6 +2076,17 @@ class Translator:
         if 'fmz' in self.uses:
             out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                     'float ffmz(float a, float b, float c) { return (a == 0.0 || b == 0.0) ? c : fma(a, b, c); }']
+        if self.stage in ('vertex', 'fragment', 'compute') or 'rscale' in self.uses:
+            out.append(PC_DECL)
+        if 'rscale' in self.uses:
+            frag = self.stage == 'fragment'
+            out += ['int tsc(uint h) { return ((h >> 18) & 1u) != 0u ? max(int(pc.scale & 0xffu), 1) : 1; }',
+                    'float rs_rt() { return float(max((pc.scale >> 8) & 0xffu, 1u)); }',
+                    ('ivec2 rs_sub() { int r = int((pc.scale >> 8) & 0xffu); '
+                     'return r > 1 ? ivec2(gl_FragCoord.xy) % r : ivec2(0); }') if frag else
+                    'ivec2 rs_sub() { return ivec2(0); }',
+                    'ivec2 rs_c2(uint h, ivec2 c) { int s = tsc(h); return s == 1 ? c : c * s + rs_sub(); }',
+                    'ivec3 rs_c3(uint h, ivec3 c) { int s = tsc(h); return s == 1 ? c : ivec3(c.xy * s + rs_sub(), c.z); }']
         base = STAGE_BASE[self.stage]
         # 16 push descriptor slots per stage (32 in all, the usual maxPushDescriptors) for c[0..16]: c[i] in slot i,
         # and c[16] in a slot this shader leaves free; the runtime reads the slots back from the cbN bindings
@@ -2074,6 +2116,7 @@ class Translator:
                         '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
                         '    if (%s) {' % (INT_FLAG % 'h'),
                         '        ivec3 u = textureSize(ut2da[nonuniformEXT(t)], lod);',
+                        '        u.xy /= tsc(h);',
                         '        return uvec4(uvec3(u), uint(textureQueryLevels(usampler2DArray(ut2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]))));',
                         '    }',
                         '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
@@ -2082,6 +2125,7 @@ class Translator:
                         '        ivec3 d = textureSize(t3d[nonuniformEXT(t)], lod);',
                         '        if (d != ivec3(1)) { z = d; l = textureQueryLevels(sampler3D(t3d[nonuniformEXT(t)], smp[nonuniformEXT(s)])); }',
                         '    }',
+                        '    z.xy /= tsc(h);',
                         '    return uvec4(uvec3(z), uint(l));',
                         '}']]
         # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)
@@ -2109,7 +2153,6 @@ class Translator:
                     loc -= 1
             if 'clip' in self.uses:
                 out.append('out float gl_ClipDistance[8];')
-            out.append('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; } pc;')
         if self.stage == 'fragment':
             for k in sorted(self.in_attrs):
                 q = self.in_attrs[k]
@@ -2120,8 +2163,7 @@ class Translator:
         if self.stage == 'fragment':
             # debug: bit 0 of pc.debug (NX_NO_DISCARD) turns every discard off. The alpha test's function is a
             # specialization constant (the pipeline's), so without one the driver drops its discard: early depth
-            out += ['layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; } pc;',
-                    'layout(constant_id = 0) const uint ALPHA_FUNC = 0u;',
+            out += ['layout(constant_id = 0) const uint ALPHA_FUNC = 0u;',
                     'bool kill_ok() { return (pc.debug & 1u) == 0u; }',
                     'bool alpha_ok(float a) {',
                     '    switch (ALPHA_FUNC) {',
