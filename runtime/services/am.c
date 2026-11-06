@@ -274,14 +274,16 @@ static void la_push_in(SvcObj *o, IpcReq *r) {
     SvcObj *so = in_object(r, 0);
     if (!so) { hlog(1, "am: keyboard config: no storage object"); return; }
     Storage *s = so->iface == &iface_storage ? so->data : NULL;
-    if (!s || s->size < 0x3c4) { svcobj_unref(so); return; }
+    if (!s || s->size < 0x3c0) { svcobj_unref(so); return; }
+    /* header / sub / guide texts at 0x34 / 0xb6 / 0x1b8 and the length limit at 0x3bc: 4 bytes earlier than read
+     * before (Violet's name entry showed "ur name?" for "Your name?" and a limit of 0) */
     memcpy(&a->kbd_type, s->data, 4);
-    memcpy(&a->kbd_max, s->data + 0x3c0, 4);
+    memcpy(&a->kbd_max, s->data + 0x3bc, 4);
     if (a->kbd_max > 500) a->kbd_max = 500;
     wchar_t header[66] = {0}, sub[130] = {0}, guide[258] = {0};
-    kbd_string(header, 66, s->data, s->size, 0x38, 65);
-    kbd_string(sub, 130, s->data, s->size, 0xba, 129);
-    kbd_string(guide, 258, s->data, s->size, 0x1bc, 257);
+    kbd_string(header, 66, s->data, s->size, 0x34, 65);
+    kbd_string(sub, 130, s->data, s->size, 0xb6, 129);
+    kbd_string(guide, 258, s->data, s->size, 0x1b8, 257);
     memcpy(a->kbd_title, header, sizeof header);
     _snwprintf(a->kbd_prompt, 399, L"%ls%ls%ls%ls%ls", header, header[0] && (sub[0] || guide[0]) ? L"\r\n" : L"", sub,
                sub[0] && guide[0] ? L"\r\n" : L"", guide);
