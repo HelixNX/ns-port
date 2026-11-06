@@ -19,11 +19,15 @@
 extern "C" {
 #endif
 
-#define NXMOD_VERSION 2
+#define NXMOD_VERSION 3
 #define NXMOD_HEAP_BASE 0x2000000000ull     /* hos.h HEAP_BASE: svcSetHeapSize's heap */
 #define NXMOD_HEAP_MAX  0x0180000000ull     /* the most it can span (hos.h HEAP_MAX) */
 #define NXMOD_ALIAS_BASE 0x1000000000ull    /* hos.h ALIAS_BASE: svcMapPhysicalMemory's region, where games with */
 #define NXMOD_ALIAS_SIZE 0x1000000000ull    /* their own allocator (Violet's 12 GB one) keep most of their data */
+
+/* run_script's result: the chunk's first result as text (ok), or the error message; on the game's thread */
+#define NXMOD_SCRIPT_AGAIN "again"           /* a chunk returning this is run again at a later safe point */
+typedef void (*NxScriptDone)(void *ud, bool ok, const char *result);
 
 typedef struct NxModHost {
     uint32_t version;                       /* NXMOD_VERSION */
@@ -36,6 +40,10 @@ typedef struct NxModHost {
     /* debugging (version 2): log every write to [addr, addr + len) from now on (NX_WATCH_MEM's report: the writer's
      * guest instruction and host stack, i.e. the lifted f_<addr> chain; the first 200 writes). One range at a time */
     void (*watch_mem)(uint64_t addr, uint64_t len);
+    /* version 3: run a chunk of source in the game's own script VM (Violet: Lua 5.4), at the next safe point on a
+     * thread that runs scripts; `done` (may be NULL) gets what it returned. The text is copied. false: the game's
+     * host code has no script runner. Results and errors also go to the log (level 1 / 0) */
+    bool (*run_script)(const char *text, NxScriptDone done, void *ud);
 } NxModHost;
 
 /* draw()'s frame: the swapchain image in COLOR_ATTACHMENT_OPTIMAL (left so), `cmd` recording. Submissions of the
