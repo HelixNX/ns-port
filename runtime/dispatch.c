@@ -138,8 +138,12 @@ void jump_ind(Ctx *c) {
 /* setjmp/longjmp (a64rt.h): the host jump buffers of each thread's setjmp calls, by guest jmp_buf. A buffer on the
  * guest stack below the stack pointer belongs to a frame that has returned, so its slot is free again: Lua runs
  * many short protected calls at varying depths, and evicting the oldest slot lost the outer pcall's buffer that a
- * later error unwound to */
-#define HOST_JMPS 64
+ * later error unwound to. A jmp_buf elsewhere (in a decoder's heap state: each new one has a new address) is never
+ * known to be dead: those went round-robin with the rest, and once 64 had piled up over a long session a live Lua
+ * buffer could be the one evicted (2026-11-05, Violet: the same trap after hours of play). So the table is bigger,
+ * and when it is full an entry that is not a live frame on this thread's stack goes first. */
+#define HOST_JMPS 256
+#define STACK_SPAN 0x1000000ull         /* how far from SP a jmp_buf counts as on the stack */
 typedef struct { u64 guest; jmp_buf buf; } HostJmp;
 static __declspec(thread) HostJmp host_jmps[HOST_JMPS];
 static __declspec(thread) unsigned host_jmp_next;
@@ -154,11 +158,20 @@ jmp_buf *guest_jmp_slot(u64 guest_buf) {
     HostJmp *j = host_jmp_find(guest_buf);
     if (!j) {
         u64 sp = cur_thread ? cur_thread->ctx->x[31] : 0;     /* (saved before the call into setjmp) */
-        for (int i = 0; i < HOST_JMPS && !j; i++) {
+        for (int i = 0; i < HOST_JMPS && !j; i++) {             /* free, or in a frame that has returned */
             u64 g = host_jmps[i].guest;
-            if (!g || (g < sp && sp - g < 0x1000000)) j = &host_jmps[i];
+            if (!g || (g < sp && sp - g < STACK_SPAN)) j = &host_jmps[i];
         }
-        if (!j) j = &host_jmps[host_jmp_next++ % HOST_JMPS];
+        for (int n = 0; n < HOST_JMPS && !j; n++) {             /* full: one that is not a live stack frame */
+            HostJmp *k = &host_jmps[host_jmp_next++ % HOST_JMPS];
+            if (!(k->guest >= sp && k->guest - sp < STACK_SPAN)) j = k;
+        }
+        if (!j) {
+            static volatile LONG warned;
+            if (!InterlockedExchange(&warned, 1))
+                hlog(0, "setjmp: %d live jmp_bufs on one thread's stack: evicting one", HOST_JMPS);
+            j = &host_jmps[host_jmp_next++ % HOST_JMPS];
+        }
         j->guest = guest_buf;
     }
     return &j->buf;
