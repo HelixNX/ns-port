@@ -143,6 +143,10 @@ action frames with OUI 00:22:AA); the .pcap is the reference for the daemon. The
   - Raid lag: the room client sent each packet at its next ENet tick (up to 15.6 ms a hop): now at once, and the
     traffic line gives the round trip to the server. Not yet measured with two clients.
   - Open: ConnectPrivate unverified; the Pi bridge; the room latency check.
+  - Local communication id (2026-11-06): ldn:u's "own" id (-1) is the NACP's first LocalCommunicationId, for Violet
+    Scarlet's 0100A3D008C5C000 (both games meet on it; a real Switch and Eden filter on it), not the title id as
+    before (nxrecomp `ldn_net.c`, read at boot; log line `ldn: local communication id`). Development builds read it
+    from `dump/control/control.nacp`: extracted 2026-11-06 from the update NSP's Control NCA (`nstool -x /0`).
 - **Frame stalls** (nxrecomp `3e6100f`). Overworld at 60 fps had 1% lows of 20-47 ms (12 fps at 30). Found with
   NX_HITCH_MS=20 plus the new per-frame thread lines and NX_PROFILE's slow-frame tables:
   1. New pipelines compiled in the draw, ~100 ms each on amdvlk (0.1-1 s hitches): now built by 2 workers, the
