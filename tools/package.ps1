@@ -53,7 +53,8 @@ if (-not $ShaderPack -and (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN
     throw 'no %VULKAN_SDK%\Bin\glslangValidator.exe'
 }
 
-New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware", "$Out\room" | Out-Null
+$netplay = (Get-Content "$d\CMakeLists.txt" -Raw) -match 'nx_game\([^)]*\bNETPLAY\b'      # local play: the room server too
+New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware" | Out-Null
 Copy-Item $exe.FullName, "$pkg\*.dll" $Out -Force
 # the Visual C++ runtime next to the exe (app-local, as Microsoft allows), so players need no redistributable;
 # the UCRT (api-ms-win-crt-*) is part of Windows 10 and 11
@@ -79,13 +80,15 @@ if ($ShaderPack) {
     $pth = Get-ChildItem "$Out\translator\python" -Filter 'python*._pth' | Select-Object -First 1
     Add-Content $pth.FullName '..'
 }
-$room = [IO.Path]::GetFullPath("$tools\..\..\room\build.bat")      # the room server: its own folder next to nxrecomp
-if (-not (Test-Path $room)) { throw "no room server at $room (the room/ folder next to nxrecomp)" }
-cmd /c "`"$room`" `"$Out\room`""
-if ($LASTEXITCODE) { throw 'the room server build failed' }
-Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
+if ($netplay) {
+    $room = [IO.Path]::GetFullPath("$tools\..\..\room\build.bat")  # the room server: its own folder next to nxrecomp
+    if (-not (Test-Path $room)) { throw "no room server at $room (the room/ folder next to nxrecomp)" }
+    cmd /c "`"$room`" `"$Out\room`""
+    if ($LASTEXITCODE) { throw 'the room server build failed' }
+    Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
+}
 Copy-Item $vcrt $Out -Force
-Copy-Item $vcrt "$Out\room" -Force
+if ($netplay) { Copy-Item $vcrt "$Out\room" -Force }
 # mods: optional DLLs, only the ones asked for (each is built here; a stale folder from an earlier package is cleared)
 if (Test-Path "$Out\mods") { Remove-Item -Recurse -Force -Confirm:$false "$Out\mods" }
 if ($Mods.Count) {
@@ -104,6 +107,21 @@ if ($Mods.Count) {
 }
 
 $title = $cfg.title
+# game.json's own words for the README: "version" (the update the build is for), "dlc" (it has some),
+# "multiplayer" (what local play covers); a game built without NETPLAY gets no room server text
+$update = if ($cfg.version) { "the $($cfg.version) update NSP" } else { 'its update NSP' }
+$dlc = if ($cfg.dlc) { ' (the DLC NSP too, if you own it)' } else { '' }
+
+$mp = if ($cfg.multiplayer) { "local play: $($cfg.multiplayer)" } else { 'local play' }
+$mptext = if (-not $netplay) { '' } else { @"
+Multiplayer ($mp) goes through a room server that relays the game's traffic: one
+player runs room\room_server.exe (UDP port 24872), everyone else joins it from the game's menu
+(Esc, then Multiplayer > Rooms: the public list, or Direct connect). On one network nothing needs setting up.
+Over the internet only the server's machine must be reachable: forward UDP 24872, use a UDP tunnel (e.g.
+playit.gg) or a VPN such as Tailscale. Players need no forwarding.
+
+
+"@ }
 $shaders = if ($ShaderPack) { @"
 The game's shaders come translated for PC already (shaders.pak, next to the exe). The first time an area is
 shown it can stutter briefly while your graphics driver compiles what it needs; later starts reuse that work.
@@ -116,7 +134,7 @@ The translator folder is needed while playing: new shaders are translated as the
 $title (Windows)
 
 What you need (your own, from your own Switch and game cartridge or eShop copy):
-  - the base game NSP and the 4.0.0 update NSP (the DLC NSP too, if you own it)
+  - the base game NSP and $update$dlc
   - prod.keys (and title.keys if you have one)
   - firmware: the NCA files of a firmware dump (local multiplayer needs one of them)
 
@@ -140,13 +158,7 @@ Alt+Enter switches fullscreen. F3 shows the frame rate. F12 captures the next fr
 Mods (if this folder has a mods folder) are listed under the menu's Mods; each is a DLL in mods\: delete one to
 remove it.
 
-Multiplayer (local play, Union Circle, Tera raids) goes through a room server that relays the game's traffic: one
-player runs room\room_server.exe (UDP port 24872), everyone else joins it from the game's menu
-(Esc, then Multiplayer > Rooms: the public list, or Direct connect). On one network nothing needs setting up. Over the internet only the server's machine must be
-reachable: forward UDP 24872, use a UDP tunnel (e.g. playit.gg) or a VPN such as Tailscale. Players need no
-forwarding.
-
-Needs: Windows 10 or 11 (64-bit) and a graphics driver with Vulkan 1.3 (any recent NVIDIA, AMD or Intel driver).
+${mptext}Needs: Windows 10 or 11 (64-bit) and a graphics driver with Vulkan 1.3 (any recent NVIDIA, AMD or Intel driver).
 Nothing else needs installing.
 "@ | Set-Content "$Out\README.txt"
 "Put your NSPs, prod.keys and title.keys here. Firmware .nca files go in the firmware folder." | Set-Content "$Out\game\PUT YOUR FILES HERE.txt"
