@@ -16,8 +16,8 @@ From the workspace root (`..\start.ps1` wraps the scripts in `violetrecomp\`, wh
 |---|---|
 | Play (builds first; runs until the game is closed; log `build\run.log`) | `.\start.ps1 violet` (`-NoBuild` to skip the build, `-Log 2`, `-Timeout <s>` for unattended runs) |
 | Build only (first time configures `build\cmake`, ~25 min from scratch; keep it Release) | `.\start.ps1 build violet` = `violetrecomp\build.bat` |
-| Host a room for local play (UDP 24872) | `.\start.ps1 room` (`-Name`, `-Password`); the game's room browser lists it |
-| Join a room directly | `.\start.ps1 violet -Room 127.0.0.1:24872 -Nick Host`; test runs without the browser: `NX_NETPLAY=0` |
+| Host a room for local play (UDP 24872) | `.\start.ps1 room` (`-Name`, `-Password`); join it in the game's menu, Multiplayer > Rooms |
+| Join a room directly | `.\start.ps1 violet -Room 127.0.0.1:24872 -Nick Host` (the game starts offline otherwise; the old start-up browser: `NX_ROOM_BROWSER=1`) |
 | A real Switch in the room | `.\start.ps1 beacon` (ESP32-S3 on USB; see `../ldn-beacon/CLAUDE.md`) |
 | A folder for players | `.\start.ps1 package violet <dir>` (nxrecomp `tools\package.ps1`; `-PythonZip` / `-ShaderPack`) |
 | Stand-still benchmark | `violetrecomp\bench.ps1 <name> [NAME=value ...]` (~140 s, hands off; `-Summary`) |
@@ -45,7 +45,7 @@ and weights; held items). Sources `mods\<name>\`, shared `mods\common\`. Their d
 edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` first): ride upgrades, raid levels,
 `addmon`, `dump`, ...
 
-**Switches** (read once at boot): `NX_ROOM`, `NX_NICK`, `NX_NETPLAY=0`, `NX_MODS=0`, `NX_RES_SCALE`, `NX_FPS=0`,
+**Switches** (read once at boot): `NX_ROOM`, `NX_NICK`, `NX_ROOM_BROWSER=1`, `NX_MODS=0`, `NX_RES_SCALE`, `NX_FPS=0`,
 `NX_VK_VALIDATION`, `NX_PROFILE`, `NX_GPU_PROF`, `NX_GPU_TIMELINE`, `NX_HITCH_MS`, `NX_WILD_LOG=1`, `NX_WATCH_MEM`,
 `NX_IPC_TRACE=<interfaces>`; the rest and what they print: grep `NOTES.md`.
 

@@ -14,8 +14,8 @@ Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
 From the workspace root (`..\start.ps1` wraps `mk8recomp\build.bat` and `run.ps1`, which also work on their own):
 `.\start.ps1 mk8` plays (builds first; runs until the game is closed since 2026-11-07, `-Timeout <s>` for unattended
 runs; `-NoBuild`; log `build\run.log`), `.\start.ps1 build mk8` builds, `.\start.ps1 room mk8` hosts a room with
-MK8's game id, `.\start.ps1 mk8 -Room host:port -Nick name` joins one directly (no `-Room`: the room browser;
-`NX_NETPLAY=0` skips it), `.\start.ps1 package mk8 <dir>` makes a folder for players. The room server is `../room`.
+MK8's game id, `.\start.ps1 mk8 -Room host:port -Nick name` joins one directly (no `-Room`: offline, rooms in the menu's
+Multiplayer; the old browser: `NX_ROOM_BROWSER=1`), `.\start.ps1 package mk8 <dir>` makes a folder for players. The room server is `../room`.
 MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 
 ## Design decisions (2026-10-15)
@@ -125,7 +125,7 @@ MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 - Libraries (the user approved both downloads): `../deps/enet` (lsalzman/enet v1.3.18, the rooms' transport) and
   `../deps/zstd` (v1.5.6, `lib/` only: Eden zstd-compresses every proxy payload), built from source by
   `nxrecomp.cmake` (`nx_netplay_libs`).
-- Start-up (`runtime/net/browser.c`): a Win32 "Public Room Browser" (nickname, search, "<game> only" by title id:
+- Start-up (`runtime/net/browser.c`; since 2026-11-07 only with `NX_ROOM_BROWSER=1`, rooms are joined in the menu): a Win32 "Public Room Browser" (nickname, search, "<game> only" by title id:
   the room's preferredGameId or a member's gameId, hide empty/full, refresh, member list, description, password
   prompt, direct connect host[:port], Play Offline; closing quits). Settings in `build/save/netplay.ini`. Lobby:
   `GET https://api.ynet-fun.xyz/lobby` (`net/lobby.c`; ids above 2^53, parsed as integers). `NX_NETPLAY=0` skips

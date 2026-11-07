@@ -18,7 +18,7 @@ Everything starts from `start.ps1` at the root (PowerShell); `.\start.ps1` alone
 ```powershell
 .\start.ps1 violet                 # build and play Pokemon Violet (-NoBuild to skip the build)
 .\start.ps1 mk8                    # the same for Mario Kart 8 Deluxe
-.\start.ps1 room                   # host a room for local play (UDP 24872); the games' room browser lists it
+.\start.ps1 room                   # host a room for local play (UDP 24872); join it in the game's menu (Multiplayer)
 .\start.ps1 violet -Room 127.0.0.1:24872 -Nick Host   # join a room directly
 .\start.ps1 beacon                 # bring a real Switch into the room (ESP32-S3 on USB)
 .\start.ps1 build violet|mk8|room|beacon

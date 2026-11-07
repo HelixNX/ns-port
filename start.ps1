@@ -19,7 +19,7 @@ function Show-Help {
   Play
     violet [-NoBuild] [-Room host[:port[:pw]]] [-Nick name]   Pokemon Violet (builds first unless -NoBuild)
     mk8    [-NoBuild] [-Room host[:port[:pw]]] [-Nick name]   Mario Kart 8 Deluxe
-           (no -Room: the game's room browser; other run.ps1 options pass through: -Log 2, -Timeout 300, ...)
+           (no -Room: starts offline, rooms are in the game's menu; other options pass through: -Log 2, ...)
 
   Local play
     room   [violet|mk8] [-Name "..."] [-Password pw] [-Port 24872]   host a room (builds it the first time)
