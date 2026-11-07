@@ -141,8 +141,8 @@ Mods (if this folder has a mods folder) are listed under the menu's Mods; each i
 remove it.
 
 Multiplayer (local play, Union Circle, Tera raids) goes through a room server that relays the game's traffic: one
-player runs room\room_server.exe (UDP port 24872), everyone else picks that address in the room browser when the
-game starts. On one network nothing needs setting up. Over the internet only the server's machine must be
+player runs room\room_server.exe (UDP port 24872), everyone else joins it from the game's menu
+(Esc, then Multiplayer > Rooms: the public list, or Direct connect). On one network nothing needs setting up. Over the internet only the server's machine must be
 reachable: forward UDP 24872, use a UDP tunnel (e.g. playit.gg) or a VPN such as Tailscale. Players need no
 forwarding.
 

@@ -3,7 +3,8 @@
  * our players and theirs meet in the same rooms.
  *   room.c     the room client: ENet to the room server, its packets (join, LDN, proxy), zstd for proxy payloads
  *   lobby.c    the public room list (HTTPS GET <lobby>/lobby, JSON)
- *   browser.c  the room browser shown at start-up (Win32), or NX_ROOM to join without it
+ *   browser.c  NX_ROOM at start-up (else offline), the nickname; the old Win32 browser with NX_ROOM_BROWSER=1
+ *   netmenu.c  rooms during play: the menu's Multiplayer (join, switch, leave, the public list)
  * Room protocol facts (network_version 1): every message is an ENet reliable packet on channel 0 whose first byte is
  * its type; integers are big-endian, strings and vectors have a u32 length in front, IPv4 addresses are 4 raw bytes.
  * The room gives each member a fake address 192.168.x.y; LDN and proxy packets name members by it. */
@@ -72,8 +73,8 @@ int lobby_fetch(LobbyRoom **out, char *err, size_t errn);      /* the number of 
 void lobby_free(LobbyRoom *rooms, int n);
 
 /* ---------------------------------------------------------------------------------------------- browser.c */
-/* before the game starts: NX_ROOM=host[:port[:password]] (with NX_NICK) joins directly, NX_NETPLAY=0 skips;
- * otherwise the room browser. Exits the process if the browser is closed */
+/* before the game starts: NX_ROOM=host[:port[:password]] (with NX_NICK) joins directly; otherwise offline (the menu's
+ * Multiplayer joins later). NX_ROOM_BROWSER=1: the old browser window (closing it exits) */
 void netplay_startup(const char *save_dir, const char *game_dir);
 
 /* ---------------------------------------------------------------------------------------------- services */

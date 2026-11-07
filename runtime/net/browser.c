@@ -1,4 +1,5 @@
-/* The room browser, shown before the game starts (Win32, like Eden's "Public Room Browser"): the public rooms with
+/* The room browser before the game (Win32, like Eden's "Public Room Browser"), now only with NX_ROOM_BROWSER=1: the
+ * game starts offline and the menu's Multiplayer (netmenu.c) joins rooms during play. The browser lists the public rooms with
  * their preferred game, name, players and host, filtered by default to rooms for this game by title id (the room's
  * preferred game, or a member playing it; never by name), plus hide-empty / hide-full and a text search. Join (or a
  * double click) asks for the password if the room has one and joins it; Direct Connect joins host[:port] (and asks
@@ -591,12 +592,18 @@ void netplay_startup(const char *save_dir, const char *game_dir) {
         if (n && *n) snprintf(nick, sizeof nick, "%s", n);
         else { ini_get("nickname", nick, sizeof nick, ""); if (!*nick) default_nick(nick, sizeof nick); }
         if (!room_join(spec, port ? (u16)atoi(port) : NET_DEFAULT_PORT, nick, pw ? pw : "", err, sizeof err))
-            fatal("NX_ROOM: %s", err);
+            hlog(0, "netplay: NX_ROOM: %s (offline; the menu's Multiplayer joins rooms)", err);
         return;
     }
-    run_browser();
-    if (result == R_NONE) exit(0);
-    if (result == R_OFFLINE) hlog(1, "netplay: playing offline");
+    /* the game starts offline: rooms are joined, switched and left in the menu's Multiplayer (netmenu.c). The
+     * browser window before the game stays for NX_ROOM_BROWSER=1 */
+    if ((e = getenv("NX_ROOM_BROWSER")) && *e == '1') {
+        run_browser();
+        if (result == R_NONE) exit(0);
+        if (result == R_OFFLINE) hlog(1, "netplay: playing offline");
+        return;
+    }
+    hlog(1, "netplay: offline at start; rooms are in the menu (Multiplayer)");
 }
 
 /* the in-game menu (netmenu.c) shares the nickname with the browser: netplay.ini's nickname= line */
