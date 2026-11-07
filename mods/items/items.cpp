@@ -278,18 +278,18 @@ void items_ui() {
     ImGui::SameLine();
     {
         std::lock_guard<std::mutex> l(g_lock);
-        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load into the overworld, then scan." : g_scan_msg.c_str());
+        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load a save, then scan." : g_scan_msg.c_str());
     }
     bool have = read_bag(g_bag);
-    if (!have) ImGui::TextDisabled("No bag in memory: scan (again after loading a save).");
-    else if (modkit::host()->version >= 2 && ImGui::SmallButton("Debug: log writes to the Poke Ball count")) {
+    if (!have) ImGui::TextDisabled("No bag found: scan again after loading.");
+    else if (modkit::host()->version >= 2 && ImGui::SmallButton("Debug: watch Poke Ball count")) {
         std::lock_guard<std::mutex> l(g_lock);
         u64 a = g_bags[0] + 4 * sizeof(Entry) + 4;
         modkit::host()->watch_mem(a, 4);
-        set_status("Watching the Poke Ball count: pick up or use a Poke Ball (the log lists the code that writes it).");
+        set_status("Watching the Poke Ball count (see the log).");
     }
     bool script = modkit::host()->version >= 3 && modkit::host()->run_script;
-    if (!script) ImGui::TextWrapped("Given items are written into the save's bag: save, then restart the game to see them.");
+    if (!script) ImGui::TextWrapped("Items show after saving and restarting.");
 
     ImGui::SetNextItemWidth(200);
     ImGui::InputTextWithHint("##filter", "search items", g_filter, sizeof g_filter);
@@ -336,7 +336,7 @@ void items_ui() {
         ImGui::SeparatorText(it.name.c_str());
         ImGui::Text("Held: %u   (item %u, %s)", held, it.id, pocket_names[it.pocket]);
         if (it.pocket == POCKET_KEY)
-            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "A key item: giving one early can skip or confuse story events.");
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "Key item: may break story events.");
         ImGui::SetNextItemWidth(120);
         ImGui::InputInt("Amount", &g_amount);
         if (g_amount < 0) g_amount = 0;
@@ -361,7 +361,7 @@ void items_ui() {
         ImGui::InputTextMultiline("##lua", g_lua, sizeof g_lua, ImVec2(-1, 90));
         if (ImGui::Button("Run")) modkit::host()->run_script(g_lua, lua_done, nullptr);
         ImGui::SameLine();
-        ImGui::TextDisabled("its first result, as text, shows below (and in the log)");
+        ImGui::TextDisabled("(result below)");
     }
     {
         std::lock_guard<std::mutex> l(g_status_lock);

@@ -1010,7 +1010,7 @@ void mons_ui() {
     ImGui::SameLine();
     {
         std::lock_guard<std::mutex> l(g_lock);
-        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load into the overworld, then scan." : g_scan_msg.c_str());
+        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load a save, then scan." : g_scan_msg.c_str());
     }
 
     Spec &p = g_spec;
@@ -1106,7 +1106,7 @@ void mons_ui() {
         }
         ImGui::EndTable();
     }
-    if (ev_total > 510) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "EV total %d (the game's limit is 510)", ev_total);
+    if (ev_total > 510) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "EV total %d (max 510)", ev_total);
     else ImGui::TextDisabled("EV total %d / 510", ev_total);
 
     ImGui::SeparatorText("Moves");
@@ -1126,7 +1126,7 @@ void mons_ui() {
 
     static int lv_mode = 0, shiny_mode = 2;   /* shared by the wild spawns and "Spawn <species> on me" */
     static bool all = true;
-    ImGui::SeparatorText("Wild spawns (the game's own spawner)");
+    ImGui::SeparatorText("Wild spawns");
     {
         static int pct = 100;
         ImGui::RadioButton("Level: the area's", &lv_mode, 0);
@@ -1135,10 +1135,10 @@ void mons_ui() {
         ImGui::SetNextItemWidth(140);
         ImGui::Combo("Shiny##wild", &shiny_mode, "As rolled\0Never\0Always\0");
         ImGui::SameLine();
-        ImGui::Checkbox("IVs, EVs, nature, ability, gender, moves, Tera as above", &all);
+        ImGui::Checkbox("Use the stats above", &all);
         ImGui::SetNextItemWidth(200);
         ImGui::SliderInt("of wild spawns", &pct, 0, 100, "%d%%");
-        if (ImGui::Button("Make wild spawns this species")) {
+        if (ImGui::Button("Apply to wild spawns")) {
             bool spec = wild_spec_apply(p, lv_mode ? p.level : 0, shiny_mode, all, pct);
             bool lua = wild_lua(s->internal, s->form, lv_mode ? p.level : 0, pct);
             std::string msg = !spec ? "No wild spawn hook in this build (violet_wild_set missing from the exe)."
@@ -1148,7 +1148,7 @@ void mons_ui() {
             g_wild_status = msg;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Restore wild spawns")) {
+        if (ImGui::Button("Restore")) {
             std::string msg;
             if (WildSet f = wild_set_fn()) f(nullptr);
             wild_lua(-1, 0, 0, 0);
@@ -1163,46 +1163,45 @@ void mons_ui() {
                      "return 'swapped ' .. tostring(C.__nx_count) .. ', last was ' .. tostring(C.__nx_last)\n", WILD_CLASS);
             if (modkit::host()->run_script) modkit::host()->run_script(lua, wild_lua_done, nullptr);
         }
-        ImGui::TextDisabled("Every area, until restored or the game restarts. Moves all (none): the species' own. "
-                            "Also applies to any other %s the game makes meanwhile (raids, trades, eggs).", s->name.c_str());
+        ImGui::TextDisabled("Until restored. Also affects other %s (raids, trades, eggs).", s->name.c_str());
         std::lock_guard<std::mutex> l(g_status_lock);
         if (!g_wild_status.empty()) ImGui::TextWrapped("%s", g_wild_status.c_str());
     }
 
-    ImGui::SeparatorText("Around you (the spawn point nearest you)");
+    ImGui::SeparatorText("Around you");
     {
         static float dist = 3.0f;
-        if (ImGui::Button("List what spawns here")) {
-            if (!area_list()) field_status("No script runner (the Lua bridge) in this build.");
+        if (ImGui::Button("List spawns")) {
+            if (!area_list()) field_status("No Lua bridge in this build.");
             else field_status("Listing...");
         }
         ImGui::SameLine();
-        if (ImGui::Button("Spawn on me (the game's pick)")) {
-            if (!spawn_on_me(dist)) field_status("No script runner (the Lua bridge) in this build.");
+        if (ImGui::Button("Spawn here")) {
+            if (!spawn_on_me(dist)) field_status("No Lua bridge in this build.");
         }
         ImGui::SameLine();
-        if (ImGui::Button(("Spawn " + s->label + " on me").c_str())) {
+        if (ImGui::Button(("Spawn " + s->name).c_str())) {
             /* the spec (shiny, IVs, ... as in Wild spawns above) stays on for this species until Restore wild spawns */
             wild_spec_apply(p, lv_mode ? p.level : 0, shiny_mode, all, 0);
             if (!spawn_on_me(dist, -1, 0, s->internal, s->form, lv_mode ? p.level : 0))
-                field_status("No script runner (the Lua bridge) in this build.");
+                field_status("No Lua bridge in this build.");
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
-        ImGui::SliderFloat("from me", &dist, 0.0f, 15.0f, "%.1f m");
+        ImGui::SliderFloat("Distance", &dist, 0.0f, 15.0f, "%.1f m");
         static bool no_battles = false;
-        if (ImGui::Checkbox("Dev: wild Pokemon don't start battles", &no_battles)) {
+        if (ImGui::Checkbox("No contact battles (dev)", &no_battles)) {
             if (NoBattles f = no_battles_fn()) f(no_battles ? 1 : 0);
-            else field_status("No battle hook in this build (violet_no_battles missing from the exe).");
+            else field_status("No battle hook in this build.");
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(new and re-acting mons; walk away for fresh ones)");
+        ImGui::TextDisabled("(new spawns)");
         if (dist < 2.0f && !no_battles)
-            ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Under 2 m it may touch you and start a battle.");
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Under 2 m may start a battle.");
 
         std::lock_guard<std::mutex> l(g_area_lock);
         if (g_area.ok) {
-            ImGui::Text("Area %s, biome %s, levels %d-%d, %zu entries (total weight %d)", g_area.area.c_str(),
+            ImGui::Text("%s, %s, Lv. %d-%d, %zu entries (weight %d)", g_area.area.c_str(),
                         g_area.biome.c_str(), g_area.minl, g_area.maxl, g_area.rows.size(), g_area.total);
             if (ImGui::BeginTable("##area", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                                                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
@@ -1210,7 +1209,7 @@ void mons_ui() {
                 ImGui::TableSetupColumn("Species", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Levels");
                 ImGui::TableSetupColumn("Chance");
-                ImGui::TableSetupColumn("Weight (-1 as is)");
+                ImGui::TableSetupColumn("Weight");
                 ImGui::TableSetupColumn("");
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
@@ -1232,17 +1231,17 @@ void mons_ui() {
                     ImGui::InputInt("##w", &r.set, 1, 10);
                     if (r.set < -1) r.set = -1;
                     ImGui::TableNextColumn();
-                    if (ImGui::SmallButton("Spawn on me")) spawn_on_me(dist, r.dev, r.form);
+                    if (ImGui::SmallButton("Spawn")) spawn_on_me(dist, r.dev, r.form);
                     ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
             ImGui::SetNextItemWidth(90);
-            ImGui::InputInt("Weight of everything else (-1 as is, 0 never)", &g_weight_others, 1, 10);
+            ImGui::InputInt("Others' weight", &g_weight_others, 1, 10);
             if (g_weight_others < -1) g_weight_others = -1;
             if (ImGui::Button("Apply weights")) {
                 g_area_lock.unlock();
-                if (!weights_apply(false)) field_status("Nothing to apply: set a weight (0 = never) on a row first.");
+                if (!weights_apply(false)) field_status("Set a weight on a row first (0 = never).");
                 g_area_lock.lock();
             }
             ImGui::SameLine();
@@ -1254,7 +1253,7 @@ void mons_ui() {
                 g_area_lock.lock();
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("Chance is the game's own; weights apply to new spawns everywhere.");
+            ImGui::TextDisabled("-1 = unchanged, 0 = never");
         }
         if (!g_field_status.empty()) ImGui::TextWrapped("%s", g_field_status.c_str());
     }
@@ -1266,7 +1265,7 @@ void mons_ui() {
         set_status(msg);
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("first free slot; the trainer is copied from your own mons");
+    ImGui::TextDisabled("(first free box slot)");
     {
         std::lock_guard<std::mutex> l(g_status_lock);
         if (!g_status.empty()) ImGui::TextWrapped("%s", g_status.c_str());

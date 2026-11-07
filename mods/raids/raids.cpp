@@ -450,7 +450,7 @@ static void ui() {
     ImGui::SameLine();
     {
         std::lock_guard<std::mutex> l(g_blocks_lock);
-        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load into the overworld, then scan." : g_scan_msg.c_str());
+        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load a save, then scan." : g_scan_msg.c_str());
     }
     ImGui::SetNextItemWidth(280);
     ImGui::Combo("Story progress", &g_progress, progress_names, 5);
@@ -461,7 +461,7 @@ static void ui() {
 
     g_have_dens = read_dens(g_region, g_dens);
     u32 nd = region_dens[g_region];
-    if (!g_have_dens) ImGui::TextDisabled("No %s dens in memory: scan (again after loading a save).", region_names[g_region]);
+    if (!g_have_dens) ImGui::TextDisabled("No %s dens found: scan again after loading.", region_names[g_region]);
 
     if (g_have_dens && ImGui::BeginTable("dens", 8, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
                                                    ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
@@ -563,7 +563,7 @@ static void ui() {
         if (e.stars < 6) {
             reachable = false;
             for (u32 roll = 0; roll < 100 && !reachable; roll++) reachable = stars_of_roll(roll, g_progress) == e.stars;
-            if (!reachable) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%d-star raids do not appear at this story progress.", e.stars);
+            if (!reachable) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%d-star raids aren't unlocked yet.", e.stars);
         }
     }
     if (g_finding) {
@@ -576,7 +576,7 @@ static void ui() {
         w.progress = g_progress;
         bool one = ImGui::Button("Find for the selected den");
         ImGui::SameLine();
-        bool all = g_have_dens && ImGui::Button("Find for every den in this region");
+        bool all = g_have_dens && ImGui::Button("Find for all dens here");
         if (one || all) {
             g_find_stop = false;
             g_finding = true;
