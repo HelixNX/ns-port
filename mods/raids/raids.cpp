@@ -17,8 +17,11 @@
  * types). The tables come from the game's files (raiddata.py -> <build>\mods\raids.dat).
  *
  * The finder searches seeds for a species (and shiny / Tera type) and writes them into dens. The world's crystals
- * show a den's new raid once the area reloads. F7 opens the item giver (items.cpp) in the same DLL. */
+ * show a den's new raid once the area reloads. F7 opens the item giver (items.cpp) and F8 the mon spawner (mons.cpp) in
+ * the same DLL. */
 #include "items.h"
+#include "mons.h"
+#include "filtercombo.h"
 #include "modkit.h"
 #include <algorithm>
 #include <atomic>
@@ -539,7 +542,8 @@ static void ui() {
                  e.form ? " (form)" : "");
     }
     ImGui::SetNextItemWidth(320);
-    if (ImGui::BeginCombo("Raid", preview, ImGuiComboFlags_HeightLarge)) {
+    static FilterCombo fc_raid, fc_tera;
+    if (fc_raid.begin("Raid", preview)) {
         for (int s = 1; s <= 6; s++)
             for (u32 i : D.table[g_region][s]) {
                 const Raid &e = D.raids[i];
@@ -549,20 +553,20 @@ static void ui() {
                 char lbl[128];
                 snprintf(lbl, sizeof lbl, "%s  %d stars%s  Lv.%u  (%u%%)##%u", nm, e.stars, e.form ? " (form)" : "",
                          e.level, e.rate / 100, i);
-                if (ImGui::Selectable(lbl, g_want.raid == (int)i)) g_want.raid = (int)i;
+                if (fc_raid.item(nm, g_want.raid == (int)i, lbl)) g_want.raid = (int)i;
             }
-        ImGui::EndCombo();
+        fc_raid.end();
     }
     ImGui::Checkbox("Shiny", &g_want.shiny);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140);
     {
         const char *tp = g_want.tera < 0 ? "any" : name_of(D.types, (u32)g_want.tera);
-        if (ImGui::BeginCombo("Tera type", tp)) {
-            if (ImGui::Selectable("any", g_want.tera < 0)) g_want.tera = -1;
+        if (fc_tera.begin("Tera type", tp)) {
+            if (fc_tera.item("any", g_want.tera < 0)) g_want.tera = -1;
             for (int t = 0; t < 18; t++)
-                if (ImGui::Selectable(name_of(D.types, (u32)t), g_want.tera == t)) g_want.tera = t;
-            ImGui::EndCombo();
+                if (fc_tera.item(name_of(D.types, (u32)t), g_want.tera == t)) g_want.tera = t;
+            fc_tera.end();
         }
     }
     ImGui::SameLine();
@@ -632,15 +636,17 @@ static void ui() {
 }
 
 /* ---------------------------------------------------------------------------------------------- the mod */
-static bool any_open() { return g_open || items_open(); }
+static bool any_open() { return g_open || items_open() || mons_open(); }
 
 static bool mod_event(const SDL_Event *e) {
-    if (e->type == SDL_EVENT_KEY_DOWN && (e->key.scancode == SDL_SCANCODE_F6 || e->key.scancode == SDL_SCANCODE_F7)) {
+    if (e->type == SDL_EVENT_KEY_DOWN && (e->key.scancode == SDL_SCANCODE_F6 || e->key.scancode == SDL_SCANCODE_F7 ||
+                                          e->key.scancode == SDL_SCANCODE_F8)) {
         if (!e->key.repeat) {
             if (e->key.scancode == SDL_SCANCODE_F6) {
                 g_open = !g_open;
                 if (g_open && D.loaded) scan_start();   /* every time it opens: the dens move between loads */
-            } else items_toggle();
+            } else if (e->key.scancode == SDL_SCANCODE_F7) items_toggle();
+            else mons_toggle();
         }
         modkit::set_open(any_open());
         return true;
@@ -655,6 +661,7 @@ static void mod_draw(const NxModFrame *f) {
     if (!any_open() || !modkit::begin(f)) return;
     if (g_open) ui();
     items_ui();
+    mons_ui();
     modkit::end(f);
 }
 
@@ -667,6 +674,7 @@ extern "C" __declspec(dllexport) const NxMod *nx_mod_init(const NxModHost *host)
     modkit::init(host, "raids");
     load_data(host->cache_dir);
     items_init(host->cache_dir);
+    mons_init(host->cache_dir);
     if (!D.loaded) host->log(0, "raids: %s", D.error.c_str());
     else host->log(1, "raids: %zu raid table entries, %s", D.raids.size(), g_rom == 2 ? "Violet" : "Scarlet");
     return &mod;

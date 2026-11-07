@@ -4,6 +4,8 @@ Read through nxrecomp/tools/trinity.py (data.trpfd / data.trpfs, Oodle via oozba
   world/data/raid/{,su1_,su2_}raid_enemy_0N/..._array.bin   the raid tables: Paldea, Kitakami, Blueberry; N = stars
   avalon/data/personal_array.bin                            types, abilities, gender ratio, DevID -> national dex
   message/dat/English/common/{monsname,wazaname,tokusei,seikaku,typename}.dat    names
+  world/data/encount/pokedata/pokedata{,_su1,_su2}/..._array.bin   wild encounters, copied as they are to
+                                                            <build>/mods/encount_pokedata{,_su1,_su2}.bin
 Schemas (FlatBuffers; field = vtable slot, a missing field is its default 0):
   raid table {entries [{info}]}, info: 0 rom (0 both, 1 Scarlet, 2 Violet), 3 difficulty, 4 rate (u8),
     9 boss: 0 DevID u16, 1 form i16, 2 sex, 4 level i32, 7-10 moves {0 move u16, 1 PP ups}, 11 gem (0 the
@@ -148,6 +150,13 @@ def main():
         f.write(struct.pack('<I', len(rows)))
         f.write(b''.join(rows))
     print('%s: %d raids, %d species names' % (path, len(rows), len(names[0])))
+    # the wild encounter tables as the game has them, for F8's wild spawns (mons.cpp finds them in memory)
+    for sub in ('', '_su1', '_su2'):
+        src = 'world/data/encount/pokedata/pokedata%s/pokedata%s_array.bin' % (sub, sub)
+        d = t.read(src)
+        dst = os.path.join(out, 'encount_pokedata%s.bin' % sub)
+        open(dst, 'wb').write(d)
+        print('%s: %d bytes' % (dst, len(d)))
 
 
 if __name__ == '__main__':

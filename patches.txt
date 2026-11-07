@@ -21,3 +21,7 @@ main+146e80c was 52808008  if shadow 52810008              # mov w8, #0x400 -> #
 #
 # Mods' host->run_script (lua.c): chunks run at lua_pcallk's entry, where x0 is the caller's lua_State.
 main+b5ddd0 was d10103ff after lua_pcall_entry      # sub sp, sp, #0x40: lua_pcallk's first instruction
+#
+# Wild spawns made to order (wild.c, the raids mod's F8): the param constructor's entry (spec in x1) and end (x19).
+main+debf88  was aa0003f3 after wild_create          # mov x19, x0
+main+debff8  was aa1303e0 after wild_created         # mov x0, x19

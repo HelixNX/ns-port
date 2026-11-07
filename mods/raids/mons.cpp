@@ -1,0 +1,977 @@
+/* Mon spawner (F8), part of the raids mod's DLL: a Pokemon made to order, written into the first free box slot.
+ *
+ * The boxes are the save's box block (PKHeX: KBox 0x0D66012C), which the game keeps in memory and reads when the box
+ * screen opens: 990 slots of 0x158 bytes, each an encrypted PK9 (empty slots too: an encrypted blank). We write our
+ * own PK9 into a slot there, as live box editors and trade bots do on a console. The format, as PKHeX reads it
+ * (offsets checked with violetrecomp\tools\svedit `layout`, our writer's output with `check`), decrypted:
+ *   0 EC, 6 checksum (u16 sum of 0x08..0x148), 8 species (the game's internal index), 0xA item, 0xC TID16, 0xE SID16,
+ *   0x10 EXP, 0x14 ability, 0x16 ability number (1, 2, 4), 0x1C PID, 0x20 nature, 0x21 stat nature, 0x22 fateful |
+ *   gender << 1, 0x24 form, 0x26 EVs (hp atk def spe spa spd), 0x48 height, 0x49 weight, 0x4A scale, 0x58 nickname
+ *   (13 UTF-16), 0x72 moves, 0x7A PP, 0x7E PP ups, 0x82 relearn moves, 0x8A current HP, 0x8C IVs (5 bits each, hp atk
+ *   def spe spa spd; bit 30 egg, 31 nicknamed), 0x94 Tera type, 0x95 Tera override (0x13 none), 0xCE version, 0xD4
+ *   affixed ribbon (0xFF none), 0xD5 language, 0xF8 OT name, 0x112 OT friendship, 0x11C met date (y-2000, m, d), 0x11F
+ *   obedience level, 0x122 met location, 0x124 ball, 0x125 met level | OT gender << 7; party: 0x148 level, 0x14A max
+ *   HP, then atk def spe spa spd.
+ * Encrypted: the four 0x50 blocks from 0x08 shuffled by (EC >> 13) & 31, then 0x08..0x148 and 0x148..0x158 each XORed
+ * with an LCRNG (x * 0x41C64E6D + 0x6073, high 16 bits) seeded with the EC.
+ *
+ * The block is found by scanning guest memory for 960+ consecutive slots whose checksums hold (the window scans each
+ * time it opens). The trainer (OT name, ids, language) is copied from the most common one in the boxes.
+ * Tables: <build>\mods\mons_*.txt (svedit `monsdata`, PKHeX.Core's personal / move / experience data). */
+#include "mons.h"
+#include "filtercombo.h"
+#include "modkit.h"
+#include <algorithm>
+#include <atomic>
+#include <ctype.h>
+#include <map>
+#include <mutex>
+#include <random>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <thread>
+#include <time.h>
+#include <vector>
+#include <windows.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+namespace {
+
+enum { SLOT = 0x158, STORED = 0x148, MIN_RUN = 960, BOX_SLOTS = 30 };
+
+/* ---------------------------------------------------------------------------------------------- PK9 */
+const char *const shuffle[32] = {"ABCD", "ABDC", "ACBD", "ACDB", "ADBC", "ADCB", "BACD", "BADC", "BCAD", "BCDA", "BDAC",
+                                 "BDCA", "CABD", "CADB", "CBAD", "CBDA", "CDAB", "CDBA", "DABC", "DACB", "DBAC", "DBCA",
+                                 "DCAB", "DCBA", "ABCD", "ABDC", "ACBD", "ACDB", "ADBC", "ADCB", "BACD", "BADC"};
+
+u16 rd16(const u8 *p) { return (u16)(p[0] | p[1] << 8); }
+u32 rd32(const u8 *p) { return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24; }
+void wr16(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
+void wr32(u8 *p, u32 v) { wr16(p, v); wr16(p + 2, v >> 16); }
+
+void xor_stream(u8 *d, u32 seed, int from, int to) {
+    for (int i = from; i < to; i += 2) {
+        seed = seed * 0x41C64E6Du + 0x6073u;
+        wr16(d + i, rd16(d + i) ^ (seed >> 16));
+    }
+}
+
+u16 checksum(const u8 *dec) {
+    u32 s = 0;
+    for (int i = 8; i < STORED; i += 2) s += rd16(dec + i);
+    return (u16)s;
+}
+
+void encrypt(const u8 *dec, u8 *enc) {
+    u32 ec = rd32(dec);
+    const char *order = shuffle[(ec >> 13) & 31];
+    memcpy(enc, dec, SLOT);
+    for (int pos = 0; pos < 4; pos++) memcpy(enc + 8 + 0x50 * pos, dec + 8 + 0x50 * (order[pos] - 'A'), 0x50);
+    xor_stream(enc, ec, 8, STORED);
+    xor_stream(enc, ec, STORED, SLOT);
+}
+
+void decrypt(const u8 *enc, u8 *dec) {
+    u32 ec = rd32(enc);
+    u8 t[SLOT];
+    memcpy(t, enc, SLOT);
+    xor_stream(t, ec, 8, STORED);
+    xor_stream(t, ec, STORED, SLOT);
+    const char *order = shuffle[(ec >> 13) & 31];
+    memcpy(dec, t, SLOT);
+    for (int pos = 0; pos < 4; pos++) memcpy(dec + 8 + 0x50 * (order[pos] - 'A'), t + 8 + 0x50 * pos, 0x50);
+}
+
+/* an encrypted slot's checksum holds (the block shuffle does not change the sum) */
+bool slot_valid(const u8 *enc) {
+    if (rd16(enc + 4)) return false;
+    u32 seed = rd32(enc), s = 0;
+    for (int i = 8; i < STORED; i += 2) {
+        seed = seed * 0x41C64E6Du + 0x6073u;
+        s += rd16(enc + i) ^ (seed >> 16);
+    }
+    return (u16)s == rd16(enc + 6);
+}
+
+/* ---------------------------------------------------------------------------------------------- tables */
+struct Species {
+    u16 national, form, internal;
+    std::string name, form_name;
+    u8 growth, gender;              /* gender: 0 male only, 254 female only, 255 genderless, else the female ratio */
+    u16 ability[3];
+    u8 type1, type2, friendship;
+    u8 base[6];                     /* hp atk def spa spd spe */
+    std::string label;
+};
+struct Move { u16 id; u8 pp; std::string name; };
+
+std::vector<Species> g_species;
+std::vector<Move> g_moves;
+std::map<u16, std::string> g_ability_names;
+std::vector<std::pair<u8, std::string>> g_balls;
+std::vector<u32> g_exp[6];
+struct Trainer { u16 tid = 0, sid = 0; u8 name[26] = {}; u8 gender = 0, language = 2, version = 51; u16 location = 6; bool ok = false; };
+Trainer g_save_trainer;                     /* mons_trainer.txt (svedit monsdata, from the save); else the boxes' */
+void put_name(u8 *dst, const char *s);
+std::string g_error;
+
+std::vector<std::vector<std::string>> read_tsv(const std::string &path) {
+    std::vector<std::vector<std::string>> rows;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) { if (g_error.empty()) g_error = "no " + path + " (svedit monsdata)"; return rows; }
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        std::vector<std::string> r;
+        std::string cur;
+        for (char *p = line; *p && *p != '\n' && *p != '\r'; p++) {
+            if (*p == '\t') { r.push_back(cur); cur.clear(); }
+            else cur += *p;
+        }
+        r.push_back(cur);
+        rows.push_back(r);
+    }
+    fclose(f);
+    return rows;
+}
+
+void load_tables(const char *cache_dir) {
+    std::string d = std::string(cache_dir) + "\\mods\\";
+    for (auto &r : read_tsv(d + "mons_species.txt")) {
+        if (r.size() < 19) continue;
+        Species s;
+        s.national = (u16)atoi(r[0].c_str()); s.form = (u16)atoi(r[1].c_str()); s.internal = (u16)atoi(r[2].c_str());
+        s.name = r[3]; s.form_name = r[4];
+        s.growth = (u8)atoi(r[5].c_str()); s.gender = (u8)atoi(r[6].c_str());
+        for (int i = 0; i < 3; i++) s.ability[i] = (u16)atoi(r[7 + i].c_str());
+        s.type1 = (u8)atoi(r[10].c_str()); s.type2 = (u8)atoi(r[11].c_str()); s.friendship = (u8)atoi(r[12].c_str());
+        for (int i = 0; i < 6; i++) s.base[i] = (u8)atoi(r[13 + i].c_str());   /* file: hp atk def spa spd spe */
+        char lbl[128];
+        snprintf(lbl, sizeof lbl, "%s%s%s%s (#%u)", s.name.c_str(), s.form_name.empty() || !s.form ? "" : " (",
+                 s.form && !s.form_name.empty() ? s.form_name.c_str() : "", s.form && !s.form_name.empty() ? ")" : "", s.national);
+        s.label = lbl;
+        g_species.push_back(s);
+    }
+    for (auto &r : read_tsv(d + "mons_moves.txt"))
+        if (r.size() >= 3) g_moves.push_back({(u16)atoi(r[0].c_str()), (u8)atoi(r[1].c_str()), r[2]});
+    std::sort(g_moves.begin(), g_moves.end(), [](const Move &a, const Move &b) { return a.name < b.name; });
+    for (auto &r : read_tsv(d + "mons_abilities.txt")) if (r.size() >= 2) g_ability_names[(u16)atoi(r[0].c_str())] = r[1];
+    for (auto &r : read_tsv(d + "mons_balls.txt")) if (r.size() >= 2) g_balls.push_back({(u8)atoi(r[0].c_str()), r[1]});
+    int g = 0;
+    for (auto &r : read_tsv(d + "mons_exp.txt")) {
+        if (g >= 6) break;
+        for (auto &v : r) g_exp[g].push_back((u32)strtoul(v.c_str(), nullptr, 10));
+        g++;
+    }
+    for (auto &r : read_tsv(d + "mons_trainer.txt"))
+        if (r.size() >= 6) {
+            Trainer &t = g_save_trainer;
+            t.tid = (u16)atoi(r[0].c_str()); t.sid = (u16)atoi(r[1].c_str()); t.gender = (u8)atoi(r[2].c_str());
+            t.language = (u8)atoi(r[3].c_str()); t.version = (u8)atoi(r[4].c_str());
+            put_name(t.name, r[5].c_str());
+            t.ok = true;
+        }
+    if (g_error.find("mons_trainer") != std::string::npos) g_error.clear();     /* optional */
+    if (g_error.empty() && (g_species.empty() || g_moves.empty() || g < 6)) g_error = "the mons_*.txt tables are incomplete";
+}
+
+const char *const natures[25] = {"Hardy", "Lonely", "Brave", "Adamant", "Naughty", "Bold", "Docile", "Relaxed", "Impish",
+                                 "Lax", "Timid", "Hasty", "Serious", "Jolly", "Naive", "Modest", "Mild", "Quiet",
+                                 "Bashful", "Rash", "Calm", "Gentle", "Sassy", "Careful", "Quirky"};
+const char *const types[18] = {"Normal", "Fighting", "Flying", "Poison", "Ground", "Rock", "Bug", "Ghost", "Steel",
+                               "Fire", "Water", "Grass", "Electric", "Psychic", "Ice", "Dragon", "Dark", "Fairy"};
+const char *const stat_names[6] = {"HP", "Atk", "Def", "SpA", "SpD", "Spe"};   /* the UI's order */
+
+/* ---------------------------------------------------------------------------------------------- what to make */
+struct Spec {
+    int species = -1;               /* index into g_species */
+    int level = 50;
+    bool shiny = false;
+    int gender = 0;                 /* 0 male, 1 female (when the species has both) */
+    int nature = 15;
+    int ability_slot = 0;           /* 0, 1, 2 hidden */
+    int iv[6] = {31, 31, 31, 31, 31, 31};       /* UI order hp atk def spa spd spe */
+    int ev[6] = {};
+    u16 moves[4] = {};
+    int tera = -1;                  /* -1: the species' first type; 18: Stellar */
+    u8 ball = 4;                    /* Poke Ball */
+    char nickname[13] = "";
+};
+
+u32 stat(const Species &s, const Spec &p, int i) {    /* i: UI order */
+    int b = s.base[i], iv = p.iv[i], ev = p.ev[i], l = p.level;
+    if (i == 0) return s.national == 292 ? 1 : (u32)((2 * b + iv + ev / 4) * l / 100 + l + 10);
+    u32 v = (u32)((2 * b + iv + ev / 4) * l / 100 + 5);
+    int up = p.nature / 5, down = p.nature % 5;           /* the nature's stats: 0 atk 1 def 2 spe 3 spa 4 spd */
+    int me = i == 1 ? 0 : i == 2 ? 1 : i == 3 ? 3 : i == 4 ? 4 : 2;
+    if (up != down) { if (me == up) v = v * 110 / 100; else if (me == down) v = v * 90 / 100; }
+    return v;
+}
+
+void put_name(u8 *dst, const char *s) {     /* 12 characters + terminator, UTF-16 (ASCII input) */
+    memset(dst, 0, 26);
+    for (int i = 0; i < 12 && s[i]; i++) wr16(dst + 2 * i, (u8)s[i]);
+}
+
+/* the decrypted PK9 */
+void build(const Spec &p, const Trainer &t, u8 *d) {
+    const Species &s = g_species[p.species];
+    static std::mt19937 rng((u32)GetTickCount64() ^ (u32)time(nullptr));
+    memset(d, 0, SLOT);
+    u32 ec = rng(), pid = rng();
+    u16 lo = (u16)pid;
+    if (p.shiny) pid = (u32)lo | (u32)(u16)(lo ^ t.tid ^ t.sid) << 16;       /* square: the xor is 0 */
+    else if (((pid >> 16) ^ lo ^ t.tid ^ t.sid) < 16) pid ^= 0x10000000;      /* not shiny by chance */
+    wr32(d + 0x00, ec);
+    wr16(d + 0x08, s.internal);
+    wr16(d + 0x0C, t.tid);
+    wr16(d + 0x0E, t.sid);
+    int lv = p.level < 1 ? 1 : p.level > 100 ? 100 : p.level;
+    wr32(d + 0x10, g_exp[s.growth < 6 ? s.growth : 0][lv - 1]);
+    wr16(d + 0x14, s.ability[p.ability_slot]);
+    d[0x16] = (u8)(1 << p.ability_slot);
+    wr32(d + 0x1C, pid);
+    d[0x20] = d[0x21] = (u8)p.nature;
+    int gender = s.gender == 255 ? 2 : s.gender == 254 ? 1 : s.gender == 0 ? 0 : p.gender;
+    d[0x22] = (u8)(gender << 1);
+    wr16(d + 0x24, s.form);
+    static const int ev_slot[6] = {0, 1, 2, 4, 5, 3};     /* UI hp atk def spa spd spe -> hp atk def spe spa spd */
+    for (int i = 0; i < 6; i++) d[0x26 + ev_slot[i]] = (u8)p.ev[i];
+    d[0x48] = (u8)rng(); d[0x49] = (u8)rng(); d[0x4A] = (u8)rng();
+    put_name(d + 0x58, p.nickname[0] ? p.nickname : s.name.c_str());
+    for (int i = 0; i < 4; i++) {
+        wr16(d + 0x72 + 2 * i, p.moves[i]);
+        u8 pp = 0;
+        for (auto &m : g_moves) if (m.id == p.moves[i]) pp = m.pp;
+        d[0x7A + i] = pp;
+    }
+    u32 iv32 = 0;
+    for (int i = 0; i < 6; i++) iv32 |= (u32)(p.iv[i] & 31) << (5 * ev_slot[i]);
+    if (p.nickname[0]) iv32 |= 1u << 31;
+    wr32(d + 0x8C, iv32);
+    d[0x94] = p.tera < 0 ? s.type1 : p.tera == 18 ? 99 : (u8)p.tera;
+    d[0x95] = 0x13;
+    d[0xCE] = t.version;
+    d[0xD4] = 0xFF;
+    d[0xD5] = t.language;
+    memcpy(d + 0xF8, t.name, 26);
+    d[0x112] = s.friendship;
+    time_t now = time(nullptr);
+    struct tm tm;
+    localtime_s(&tm, &now);
+    d[0x11C] = (u8)(tm.tm_year - 100); d[0x11D] = (u8)(tm.tm_mon + 1); d[0x11E] = (u8)tm.tm_mday;
+    d[0x11F] = (u8)lv;
+    wr16(d + 0x122, t.location);
+    d[0x124] = p.ball;
+    d[0x125] = (u8)(lv | t.gender << 7);
+    /* party part: level and stats */
+    Spec q = p;
+    q.level = lv;
+    u32 hp = stat(s, q, 0);
+    wr16(d + 0x8A, hp);
+    d[0x148] = (u8)lv;
+    wr16(d + 0x14A, hp);
+    wr16(d + 0x14C, stat(s, q, 1)); wr16(d + 0x14E, stat(s, q, 2)); wr16(d + 0x150, stat(s, q, 5));
+    wr16(d + 0x152, stat(s, q, 3)); wr16(d + 0x154, stat(s, q, 4));
+    wr16(d + 0x06, checksum(d));
+}
+
+/* ---------------------------------------------------------------------------------------------- the box block */
+std::mutex g_lock;
+std::vector<u64> g_blocks;                  /* where each copy of the box block starts (all written) */
+std::atomic<bool> g_scanning;
+std::atomic<u64> g_done, g_total;
+std::string g_scan_msg, g_status;
+std::mutex g_status_lock;
+
+void set_status(const std::string &s) { std::lock_guard<std::mutex> l(g_status_lock); g_status = s; }
+
+bool mem_read(u64 a, void *out, size_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)a, out, n, &got) && got == n;
+}
+bool mem_write(u64 a, const void *in, size_t n) {
+    SIZE_T put = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)(uintptr_t)a, in, n, &put) && put == n;
+}
+
+/* ---------------------------------------------------------------------------------------------- wild spawns
+ * The overworld spawner draws from the wild encounter tables, world/data/encount/pokedata/pokedata{,_su1,_su2}
+ * (Paldea, Kitakami, Blueberry), FlatBuffers the game keeps in memory as loaded: {entries [entry]}, an entry's
+ * fields (vtable slots): 0 DevID u16, 1 sex, 2 form u8, 3 min level u16, 4 max level u16, 5 weight, 6-13 biome /
+ * weight pairs, 14 area, 15 location, 18-20 time / flags, 21-25 a companion (23 its DevID u16, 25 its form u8),
+ * 26-29 the rest. Copies from the game's files: <build>\mods\encount_pokedata*.bin (raiddata.py).
+ *
+ * "Wild spawns" rewrites every entry in place: species, form, level range (and companions' species), so the game's
+ * own spawner places that mon wherever it would place any (model, behaviour, battle, catching all the game's). Form
+ * is absent in most entries (default 0): where the entry's vtable has no slot for it, slot 2 is pointed at a padding
+ * byte of the table (bytes 4.. before its first field; entries sharing a vtable share the layout); an entry with
+ * neither gets weights (5, 7, 9, 11, 13) 0 for a form other than 0, so it is never picked. A level range of
+ * 1-100 leaves the level to the spawn point's own range (an entry outside a point's range does not spawn there).
+ * Restore writes the original bytes back. Found by its first 28 bytes (root, entry count, first offset), then
+ * checked byte for byte except where the patch writes. */
+/* the log, or nothing offline (mons_wild_selftest) */
+template <class... A> void enc_log(int level, const char *fmt, A... a) { if (modkit::host()) modkit::host()->log(level, fmt, a...); }
+struct EncEntry { u32 dev, form, minl, maxl, band_dev, band_form, vt_slot2, weight[5]; };
+struct EncTable {
+    const char *file, *label;
+    std::vector<u8> orig, touch;            /* touch: bytes a patch may change */
+    std::vector<EncEntry> entries;          /* buffer offsets (0: none); form / vt_slot2: the padding byte route */
+    std::vector<u64> found;                 /* copies in guest memory */
+};
+EncTable g_enc[3] = {{"encount_pokedata.bin", "Paldea"}, {"encount_pokedata_su1.bin", "Kitakami"},
+                     {"encount_pokedata_su2.bin", "Blueberry"}};
+enum { ENC_SIG = 28 };
+std::string g_wild_status;
+u32 g_enc_first;                            /* the tables' first word (their root offset), 0: none loaded */
+
+bool enc_parse(EncTable &t) {
+    const std::vector<u8> &b = t.orig;
+    size_t n = b.size();
+    auto u32at = [&](size_t o) { return o + 4 <= n ? rd32(&b[o]) : 0u; };
+    auto u16at = [&](size_t o) { return o + 2 <= n ? rd16(&b[o]) : 0u; };
+    auto field = [&](u32 tab, int k, u32 &vt, u32 &vtsize) -> u32 {
+        vt = tab - (u32)(int32_t)u32at(tab);
+        vtsize = u16at(vt);
+        return (u32)(4 + 2 * k) < vtsize ? u16at(vt + 4 + 2 * k) : 0;
+    };
+    if (n < 64) return false;
+    u32 root = u32at(0), vt, vs;
+    u32 f0 = field(root, 0, vt, vs);
+    if (!f0) return false;
+    u32 vec = root + f0 + u32at(root + f0), cnt = u32at(vec);
+    if (vec + 4 + 4ull * cnt > n) return false;
+    t.touch.assign(n, 0);
+    auto mark = [&](u32 o, int len) { for (int i = 0; o && i < len && o + i < n; i++) t.touch[o + i] = 1; };
+    for (u32 k = 0; k < cnt; k++) {
+        u32 e = vec + 4 + 4 * k;
+        e += u32at(e);
+        EncEntry x = {};
+        u32 off;
+        if ((off = field(e, 0, vt, vs))) x.dev = e + off;
+        if ((off = field(e, 3, vt, vs))) x.minl = e + off;
+        if ((off = field(e, 4, vt, vs))) x.maxl = e + off;
+        if ((off = field(e, 23, vt, vs))) x.band_dev = e + off;
+        if ((off = field(e, 25, vt, vs))) x.band_form = e + off;
+        for (int w = 0; w < 5; w++) if ((off = field(e, 5 + 2 * w, vt, vs))) x.weight[w] = e + off;
+        if ((off = field(e, 2, vt, vs))) x.form = e + off;
+        else if (vs >= 4 + 2 * 3) {
+            u32 tsize = u16at(vt + 2), lo = tsize;
+            for (int f = 0; 4 + 2 * f < (int)vs; f++) { u32 o = u16at(vt + 4 + 2 * f); if (o && o < lo) lo = o; }
+            if (lo > 4) { x.form = e + 4; x.vt_slot2 = vt + 4 + 2 * 2; }
+        }
+        if (!x.dev) continue;
+        mark(x.dev, 2); mark(x.minl, 2); mark(x.maxl, 2); mark(x.band_dev, 2); mark(x.form, 1); mark(x.band_form, 1);
+        if (x.vt_slot2) mark(x.vt_slot2, 2);
+        if (!x.form) for (u32 w : x.weight) mark(w, 2);
+        t.entries.push_back(x);
+    }
+    for (int i = 0; i < ENC_SIG; i++) if (t.touch[i]) return false;
+    return !t.entries.empty();
+}
+
+void enc_load(const char *cache_dir) {
+    for (auto &t : g_enc) {
+        std::string p = std::string(cache_dir) + "\\mods\\" + t.file;
+        FILE *f = fopen(p.c_str(), "rb");
+        if (!f) { enc_log(0, "mons: no %s (run mods\\raids\\raiddata.py): no wild spawns", p.c_str()); continue; }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        t.orig.resize(sz > 0 ? (size_t)sz : 0);
+        if (fread(t.orig.data(), 1, t.orig.size(), f) != t.orig.size()) t.orig.clear();
+        fclose(f);
+        if (!enc_parse(t)) { enc_log(0, "mons: %s: not an encounter table", t.file); t.orig.clear(); t.entries.clear(); continue; }
+        g_enc_first = rd32(t.orig.data());
+        enc_log(1, "mons: %s: %zu entries", t.label, t.entries.size());
+    }
+}
+
+/* whether a copy of t starts at a: every byte the patch does not write as in the file */
+bool enc_at(const EncTable &t, u64 a, std::vector<u8> &buf) {
+    buf.resize(t.orig.size());
+    if (!mem_read(a, buf.data(), buf.size())) return false;
+    for (size_t i = 0; i < buf.size(); i++) if (!t.touch[i] && buf[i] != t.orig[i]) return false;
+    return true;
+}
+
+/* species index sp (-1: restore), level 0: 1-100 (the spawn point decides) */
+void enc_apply(int sp, int level, std::string &msg) {
+    std::lock_guard<std::mutex> l(g_lock);
+    int tables = 0, copies = 0, entries = 0, no_form = 0;
+    std::vector<u8> cur;
+    for (auto &t : g_enc) {
+        if (t.orig.empty()) continue;
+        std::vector<u8> img = t.orig;
+        if (sp >= 0) {
+            const Species &s = g_species[sp];
+            int lo = level ? level : 1, hi = level ? level : 100;
+            for (auto &e : t.entries) {
+                wr16(&img[e.dev], s.internal);
+                if (e.minl) wr16(&img[e.minl], lo);
+                if (e.maxl) wr16(&img[e.maxl], hi);
+                if (e.band_dev) wr16(&img[e.band_dev], s.internal);
+                if (e.band_form) img[e.band_form] = (u8)s.form;
+                if (e.form) {
+                    img[e.form] = (u8)s.form;
+                    if (e.vt_slot2 && s.form) wr16(&img[e.vt_slot2], 4);
+                } else if (s.form) {        /* no way to give it the form: never picked (weights 0) */
+                    for (u32 w : e.weight) if (w) wr16(&img[w], 0);
+                    no_form++;
+                }
+                entries++;
+            }
+        }
+        int w = 0;
+        for (u64 a : t.found)
+            if (enc_at(t, a, cur) && mem_write(a, img.data(), img.size())) w++;
+        if (w) tables++;
+        copies += w;
+    }
+    char m[256];
+    if (sp < 0) snprintf(m, sizeof m, "Wild spawns restored (%d table cop%s).", copies, copies == 1 ? "y" : "ies");
+    else if (!copies) snprintf(m, sizeof m, "No encounter table in memory: scan (load into the overworld first).");
+    else snprintf(m, sizeof m, "Wild spawns: %s, level %s, in %d table%s (%d cop%s, %d entries%s). New spawns only: "
+                  "walk away from the ones already out.", g_species[sp].label.c_str(),
+                  level ? std::to_string(level).c_str() : "as the area's", tables, tables == 1 ? "" : "s", copies,
+                  copies == 1 ? "y" : "ies", entries, no_form ? ", some left out: no form slot" : "");
+    msg = m;
+    enc_log(0, "mons: %s", m);
+}
+
+/* whether a block still starts at `a` (its first MIN_RUN slots hold) */
+bool block_at(u64 a, std::vector<u8> &buf) {
+    buf.resize((size_t)MIN_RUN * SLOT);
+    if (!mem_read(a, buf.data(), buf.size())) return false;
+    for (int i = 0; i < MIN_RUN; i++) if (!slot_valid(&buf[(size_t)i * SLOT])) return false;
+    return true;
+}
+
+void scan_thread() {
+    const u64 lo = NXMOD_ALIAS_BASE, hi = NXMOD_HEAP_BASE + NXMOD_HEAP_MAX;
+    u64 total = 0;
+    for (u64 a = lo; a < hi;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)a, &mi, sizeof mi)) break;
+        u64 end = (u64)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (mi.State == MEM_COMMIT) total += (end < hi ? end : hi) - a;
+        a = end;
+    }
+    g_total = total ? total : 1;
+    g_done = 0;
+    std::vector<u64> found, enc_cand[3];
+    const size_t CH = 16 << 20;
+    std::vector<u8> buf(CH + SLOT), tmp;
+    u64 run_start = 0, run_next = 0;
+    int run_len = 0;
+    for (u64 a = lo; a < hi;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)a, &mi, sizeof mi)) break;
+        u64 rend = (u64)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (rend > hi) rend = hi;
+        bool rw = mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                  (mi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE));
+        if (rw)
+            for (u64 c = a; c < rend; c += CH) {
+                size_t n = (size_t)(rend - c < CH ? rend - c : CH);
+                size_t rn = (size_t)(rend - c < CH + SLOT ? rend - c : CH + SLOT);   /* a slot across the chunk's end */
+                g_done += n;
+                if (!mem_read(c, buf.data(), rn)) continue;
+                for (size_t i = 0; i < n && i + SLOT <= rn; i += 8) {
+                    const u8 *e = &buf[i];
+                    if (g_enc_first && rd32(e) == g_enc_first)
+                        for (int k = 0; k < 3; k++)
+                            if (g_enc[k].orig.size() && !memcmp(e, g_enc[k].orig.data(), ENC_SIG)) enc_cand[k].push_back(c + i);
+                    if (rd16(e + 4) || (!rd32(e + 8) && !rd32(e + 12) && !rd32(e + 16))) continue;
+                    if (!slot_valid(e)) continue;
+                    u64 at = c + i;
+                    if (run_len && at == run_next) { run_len++; run_next += SLOT; }
+                    else if (!run_len || at > run_next) { run_start = at; run_next = at + SLOT; run_len = 1; }
+                    else continue;                                  /* inside the current run, off its stride */
+                    if (run_len == MIN_RUN) found.push_back(run_start);
+                    i = (size_t)(run_next - c) - 8;                 /* to the next slot of this run */
+                }
+            }
+        a = rend;
+    }
+    /* a run longer than one block (990 slots) starts where it starts; drop copies that do not hold any more */
+    std::vector<u64> ok;
+    for (u64 b : found) if (block_at(b, tmp)) ok.push_back(b);
+    std::vector<u64> enc_ok[3];
+    int enc_n = 0;
+    for (int k = 0; k < 3; k++)
+        for (u64 a : enc_cand[k]) if (enc_at(g_enc[k], a, tmp)) { enc_ok[k].push_back(a); enc_n++; }
+    char msg[192];
+    snprintf(msg, sizeof msg, "Found %zu box block%s, %d wild table cop%s (%.1f GB scanned)", ok.size(),
+             ok.size() == 1 ? "" : "s", enc_n, enc_n == 1 ? "y" : "ies", (double)g_done / (1 << 30));
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_blocks = ok;
+        for (int k = 0; k < 3; k++) g_enc[k].found = enc_ok[k];
+        g_scan_msg = msg;
+    }
+    modkit::host()->log(0, "mons: %s", msg);
+    for (int k = 0; k < 3; k++)
+        for (u64 a : enc_ok[k]) modkit::host()->log(0, "mons: %s wild table at %llx", g_enc[k].label, (unsigned long long)a);
+    for (u64 b : ok) modkit::host()->log(1, "mons: box block at %llx", (unsigned long long)b);
+    g_scanning = false;
+}
+
+void scan_start() {
+    if (g_scanning.exchange(true)) return;
+    std::thread(scan_thread).detach();
+}
+
+/* the trainer most of the box's mons have (from this game: version 50 / 51) */
+bool find_trainer(const std::vector<u8> &blk, Trainer &out) {
+    std::map<std::string, int> count;
+    std::map<std::string, Trainer> seen;
+    u8 dec[SLOT];
+    for (size_t i = 0; i + SLOT <= blk.size(); i += SLOT) {
+        decrypt(&blk[i], dec);
+        if (!rd16(dec + 8) || (dec[0xCE] != 50 && dec[0xCE] != 51)) continue;
+        Trainer t;
+        t.tid = rd16(dec + 0xC); t.sid = rd16(dec + 0xE);
+        memcpy(t.name, dec + 0xF8, 26);
+        t.gender = dec[0x125] >> 7; t.language = dec[0xD5]; t.version = dec[0xCE]; t.location = rd16(dec + 0x122);
+        t.ok = true;
+        std::string key((const char *)dec + 0xC, 4);
+        key.append((const char *)dec + 0xF8, 26);
+        if (!count[key]++) seen[key] = t;
+    }
+    int best = 0;
+    for (auto &kv : count) if (kv.second > best) { best = kv.second; out = seen[kv.first]; }
+    return best > 0;
+}
+
+/* the spec into the first empty slot of every copy; returns the slot (-1: none) and fills msg */
+int spawn(const Spec &p, std::string &msg) {
+    std::lock_guard<std::mutex> l(g_lock);
+    std::vector<u8> blk;
+    std::vector<u64> live;
+    for (u64 b : g_blocks) if (block_at(b, blk)) live.push_back(b);
+    if (live.empty()) { msg = "No box block in memory: scan (load into the overworld first)."; return -1; }
+    if (!block_at(live[0], blk)) { msg = "The box block moved: scan again."; return -1; }
+    Trainer t = g_save_trainer;
+    if (!t.ok && !find_trainer(blk, t)) {
+        msg = "No trainer: run svedit monsdata (writes mods/mons_trainer.txt), or keep one of your own mons in the boxes.";
+        return -1;
+    }
+    int slot = -1;
+    u8 dec[SLOT];
+    for (int i = 0; i < MIN_RUN && slot < 0; i++) {
+        decrypt(&blk[(size_t)i * SLOT], dec);
+        if (!rd16(dec + 8)) slot = i;
+    }
+    if (slot < 0) { msg = "The boxes are full."; return -1; }
+    u8 enc[SLOT];
+    build(p, t, dec);
+    encrypt(dec, enc);
+    int w = 0;
+    for (u64 b : live) if (mem_write(b + (u64)slot * SLOT, enc, SLOT)) w++;
+    char m[256];
+    snprintf(m, sizeof m, "%s: box %d, slot %d (%d cop%s written). Open the boxes to see it.",
+             g_species[p.species].label.c_str(), slot / BOX_SLOTS + 1, slot % BOX_SLOTS + 1, w, w == 1 ? "y" : "ies");
+    msg = m;
+    modkit::host()->log(0, "mons: %s", m);
+    return slot;
+}
+
+/* the rest of the spec for wild spawns: the game's hook on PokemonParam::Create (violetrecomp\wild.c, same layout),
+ * reached through the exe's export violet_wild_set */
+#pragma pack(push, 1)
+struct VioletWild {
+    u32 size;
+    u16 dev, form, level;
+    u8 shiny, sex;
+    u16 nature;
+    u8 ability;
+    int8_t tera;
+    u8 iv[6], ev[6];
+    u16 moves[4];
+    u32 swap_pct;
+};
+#pragma pack(pop)
+static_assert(sizeof(VioletWild) == 40, "wild.c's VioletWild");
+typedef void (*WildSet)(const VioletWild *);
+
+WildSet wild_set_fn() {
+    static WildSet f = (WildSet)(void *)GetProcAddress(GetModuleHandleW(nullptr), "violet_wild_set");
+    return f;
+}
+
+/* shiny: 0 as rolled, 1 never, 2 always; all: the IVs / EVs / nature / ability / gender / moves / Tera too */
+bool wild_spec_apply(const Spec &p, int level, int shiny, bool all, int pct) {
+    WildSet f = wild_set_fn();
+    if (!f) return false;
+    const Species &s = g_species[p.species];
+    VioletWild w = {};
+    w.size = sizeof w;
+    w.dev = s.internal;
+    w.form = s.form;
+    w.level = (u16)level;
+    w.shiny = (u8)shiny;
+    w.swap_pct = (u32)pct;
+    w.sex = 0xff; w.nature = 0xffff; w.ability = 0xff; w.tera = -1;
+    memset(w.iv, 0xff, 6);
+    if (all) {
+        if (s.gender != 0 && s.gender != 254 && s.gender != 255) w.sex = (u8)p.gender;
+        w.nature = (u16)p.nature;
+        w.ability = (u8)p.ability_slot;
+        if (p.tera >= 0 && p.tera < 18) w.tera = (int8_t)p.tera;
+        for (int i = 0; i < 6; i++) { w.iv[i] = (u8)p.iv[i]; w.ev[i] = (u8)p.ev[i]; }
+        for (int i = 0; i < 4; i++) w.moves[i] = p.moves[i];
+    }
+    f(&w);
+    return true;
+}
+
+/* The species swap itself, in the game's scripts: the wild manager (class C4EE52E49562F8277, three call sites) makes
+ * every overworld wild mon through C2B428A63695FD2C7.S988D7D0A4EEF693D(?, DevID, form, sex, level, ...), which fills a
+ * spec (cC99399C3.f101D811F) and calls c113335A8.f7AC1FE6B. Wrapped through the Lua bridge (host->run_script): a
+ * share of calls get our DevID / form (and level), then the original runs. Restore puts the original back. */
+const char *const WILD_CLASS = "C2B428A63695FD2C7", *const WILD_FN = "S988D7D0A4EEF693D";
+
+void wild_lua_done(void *, bool ok, const char *r) {
+    std::lock_guard<std::mutex> l(g_status_lock);
+    g_wild_status += ok ? std::string(" Script: ") + r : std::string(" Script error: ") + r;
+}
+
+bool wild_lua(int dev, int form, int level, int pct) {
+    const NxModHost *h = modkit::host();
+    if (h->version < 3 || !h->run_script) return false;
+    char lua[1024];
+    if (dev < 0)
+        snprintf(lua, sizeof lua,
+                 "local C = %s\n"
+                 "if C == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+                 "if C.__nx_orig then C.%s = C.__nx_orig; C.__nx_orig = nil; return 'wild maker restored' end\n"
+                 "return 'wild maker was not wrapped'\n", WILD_CLASS, WILD_FN);
+    else
+        snprintf(lua, sizeof lua,
+                 "local C = %s\n"
+                 "if C == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+                 "if not C.__nx_orig then C.__nx_orig = C.%s end\n"
+                 "local orig = C.__nx_orig\n"
+                 "C.__nx_count = 0\n"
+                 "C.%s = function(a, dev, form, sex, lv, ...)\n"
+                 "  if math.random(100) <= %d then\n"
+                 "    C.__nx_count = C.__nx_count + 1\n"
+                 "    C.__nx_last = tostring(dev) .. '/' .. tostring(form) .. ' lv ' .. tostring(lv)\n"
+                 "    dev = %d; form = %d\n"
+                 "    if %d > 0 then lv = %d end\n"
+                 "  end\n"
+                 "  return orig(a, dev, form, sex, lv, ...)\n"
+                 "end\n"
+                 "return 'wild maker wrapped'\n",
+                 WILD_CLASS, WILD_FN, WILD_FN, pct, dev, form, level, level);
+    return h->run_script(lua, wild_lua_done, nullptr);
+}
+
+/* ---------------------------------------------------------------------------------------------- UI */
+std::atomic<bool> g_open;
+Spec g_spec;
+FilterCombo fc_species, fc_nature, fc_ability, fc_tera, fc_ball, fc_moves[4];
+
+const char *move_name(u16 id) {
+    for (auto &m : g_moves) if (m.id == id) return m.name.c_str();
+    return id ? "?" : "(none)";
+}
+
+/* NX_MONS_TEST="<national>[,<form>[,<level>]]": spawn one with default settings as soon as a box block is found
+ * (scans every 20 s from 60 s after start), for an unattended check */
+void test_thread(std::string arg) {
+    int nat = 0, form = 0, level = 50;
+    sscanf(arg.c_str(), "%d,%d,%d", &nat, &form, &level);
+    Spec p;
+    for (size_t i = 0; i < g_species.size(); i++)
+        if (g_species[i].national == nat && g_species[i].form == form) p.species = (int)i;
+    if (p.species < 0) { modkit::host()->log(0, "mons test: no species %d form %d", nat, form); return; }
+    p.level = level;
+    p.shiny = true;
+    strcpy(p.nickname, "SpawnTest");
+    Sleep(60000);
+    for (int tries = 0; tries < 60; tries++) {
+        scan_start();
+        while (g_scanning) Sleep(500);
+        std::string msg;
+        bool have;
+        { std::lock_guard<std::mutex> l(g_lock); have = !g_blocks.empty(); }
+        int slot = have ? spawn(p, msg) : -1;
+        if (slot >= 0) {
+            modkit::host()->log(0, "mons test: %s", msg.c_str());
+            /* read it back through the game's own box code: the mon's dev id (the internal index) and form */
+            char lua[512];
+            snprintf(lua, sizeof lua,
+                     "if c1A1CBE3B == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+                     "local m = c1A1CBE3B.f6AA17B5F(%d, %d)\n"
+                     "if m == nil then return 'slot read: nil' end\n"
+                     "return 'slot read: dev id ' .. tostring(m:f0BD5134F()) .. ' form ' .. tostring(m:f5D94E897()) .. ' (expected %u %u)'\n",
+                     slot / BOX_SLOTS, slot % BOX_SLOTS, g_species[p.species].internal, g_species[p.species].form);
+            if (modkit::host()->version >= 3 && modkit::host()->run_script)
+                modkit::host()->run_script(lua, [](void *, bool ok, const char *r) {
+                    modkit::host()->log(0, "mons test: %s %s", ok ? "game says" : "game error", r);
+                }, nullptr);
+            return;
+        }
+        modkit::host()->log(0, "mons test: not yet (%s)", have ? msg.c_str() : "no box block");
+        Sleep(20000);
+    }
+}
+
+} // namespace
+
+void mons_init(const char *cache_dir) {
+    load_tables(cache_dir);
+    enc_load(cache_dir);
+    if (!g_error.empty()) { modkit::host()->log(0, "mons: %s", g_error.c_str()); return; }
+    modkit::host()->log(1, "mons: %zu species / forms, %zu moves", g_species.size(), g_moves.size());
+    for (size_t i = 0; i < g_species.size(); i++) if (g_species[i].national == 25 && !g_species[i].form) g_spec.species = (int)i;
+    const char *t = getenv("NX_MONS_TEST");
+    if (t && *t) std::thread(test_thread, std::string(t)).detach();
+}
+
+bool mons_open() { return g_open; }
+void mons_toggle() {
+    g_open = !g_open;
+    if (g_open && g_error.empty()) scan_start();    /* every time it opens: the boxes move between loads */
+}
+
+void mons_ui() {
+    if (!g_open) return;
+    ImGui::SetNextWindowSize(ImVec2(640, 700), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (!ImGui::Begin("Spawn a Pokemon (F8)", &open)) { ImGui::End(); if (!open) g_open = false; return; }
+    if (!open) g_open = false;
+    if (!g_error.empty()) { ImGui::TextWrapped("%s", g_error.c_str()); ImGui::End(); return; }
+
+    if (g_scanning) ImGui::ProgressBar((float)((double)g_done / (double)g_total), ImVec2(240, 0), "scanning memory");
+    else if (ImGui::Button("Scan memory for the boxes")) scan_start();
+    ImGui::SameLine();
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        ImGui::TextUnformatted(g_scan_msg.empty() ? "Load into the overworld, then scan." : g_scan_msg.c_str());
+    }
+
+    Spec &p = g_spec;
+    const Species *s = p.species >= 0 ? &g_species[p.species] : nullptr;
+    ImGui::SetNextItemWidth(320);
+    if (fc_species.begin("Species", s ? s->label.c_str() : "(pick one)")) {
+        for (int i = 0; i < (int)g_species.size(); i++)
+            if (fc_species.item(g_species[i].label.c_str(), i == p.species)) {
+                p.species = i;
+                p.ability_slot = 0;
+                p.tera = -1;
+            }
+        fc_species.end();
+    }
+    if (!s) { ImGui::End(); return; }
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("Level", &p.level);
+    p.level = p.level < 1 ? 1 : p.level > 100 ? 100 : p.level;
+    ImGui::SameLine();
+    ImGui::Checkbox("Shiny", &p.shiny);
+    if (s->gender != 0 && s->gender != 254 && s->gender != 255) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100);
+        ImGui::Combo("Gender", &p.gender, "Male\0Female\0");
+    }
+    ImGui::SetNextItemWidth(160);
+    if (fc_nature.begin("Nature", natures[p.nature])) {
+        for (int k = 0; k < 25; k++) if (fc_nature.item(natures[k], p.nature == k)) p.nature = k;
+        fc_nature.end();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200);
+    {
+        auto an = [&](int k) { auto it = g_ability_names.find(s->ability[k]); return it != g_ability_names.end() ? it->second : std::string("?"); };
+        std::string cur = an(p.ability_slot) + (p.ability_slot == 2 ? " (H)" : "");
+        if (fc_ability.begin("Ability", cur.c_str(), 0)) {
+            for (int k = 0; k < 3; k++) {
+                std::string t = an(k) + (k == 2 ? " (H)" : ""), l = t + "##" + std::to_string(k);
+                if (fc_ability.item(t.c_str(), p.ability_slot == k, l.c_str())) p.ability_slot = k;
+            }
+            fc_ability.end();
+        }
+    }
+    ImGui::SetNextItemWidth(160);
+    {
+        const char *tp = p.tera < 0 ? types[s->type1 < 18 ? s->type1 : 0] : p.tera == 18 ? "Stellar" : types[p.tera];
+        if (fc_tera.begin("Tera type", tp)) {
+            for (int k = 0; k < 19; k++)
+                if (fc_tera.item(k == 18 ? "Stellar" : types[k], (p.tera < 0 ? s->type1 : p.tera) == k)) p.tera = k;
+            fc_tera.end();
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160);
+    {
+        const char *bn = "?";
+        for (auto &b : g_balls) if (b.first == p.ball) bn = b.second.c_str();
+        if (fc_ball.begin("Ball", bn)) {
+            for (auto &b : g_balls) if (fc_ball.item(b.second.c_str(), b.first == p.ball)) p.ball = b.first;
+            fc_ball.end();
+        }
+    }
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputTextWithHint("Nickname", s->name.c_str(), p.nickname, sizeof p.nickname);
+
+    ImGui::SeparatorText("IVs / EVs");
+    int ev_total = 0;
+    for (int i = 0; i < 6; i++) ev_total += p.ev[i];
+    if (ImGui::BeginTable("stats", 4, ImGuiTableFlags_SizingFixedFit)) {
+        Spec q = p;
+        for (int i = 0; i < 6; i++) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(stat_names[i]);
+            /* typed boxes (no +/- buttons), clamped to the game's ranges */
+            ImGui::TableNextColumn(); ImGui::TextDisabled("IV"); ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            ImGui::InputInt((std::string("##iv") + stat_names[i]).c_str(), &p.iv[i], 0, 0);
+            p.iv[i] = p.iv[i] < 0 ? 0 : p.iv[i] > 31 ? 31 : p.iv[i];
+            ImGui::TableNextColumn(); ImGui::TextDisabled("EV"); ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            ImGui::InputInt((std::string("##ev") + stat_names[i]).c_str(), &p.ev[i], 0, 0);
+            p.ev[i] = p.ev[i] < 0 ? 0 : p.ev[i] > 252 ? 252 : p.ev[i];
+            ImGui::TableNextColumn(); ImGui::Text("%u", stat(*s, q, i));
+        }
+        ImGui::EndTable();
+    }
+    if (ev_total > 510) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "EV total %d (the game's limit is 510)", ev_total);
+    else ImGui::TextDisabled("EV total %d / 510", ev_total);
+
+    ImGui::SeparatorText("Moves");
+    for (int k = 0; k < 4; k++) {
+        ImGui::PushID(k);
+        ImGui::SetNextItemWidth(260);
+        FilterCombo &fm = fc_moves[k];
+        if (fm.begin("##move", move_name(p.moves[k]))) {
+            if (fm.item("(none)", !p.moves[k])) p.moves[k] = 0;
+            for (auto &m : g_moves)
+                if (fm.item(m.name.c_str(), m.id == p.moves[k])) p.moves[k] = m.id;
+            fm.end();
+        }
+        ImGui::PopID();
+        if (k % 2 == 0) ImGui::SameLine();
+    }
+
+    ImGui::SeparatorText("Wild spawns (the game's own spawner)");
+    {
+        static int lv_mode = 0, shiny_mode = 2;
+        static bool all = true;
+        static int pct = 100;
+        ImGui::RadioButton("Level: the area's", &lv_mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("the level above", &lv_mode, 1);
+        ImGui::SetNextItemWidth(140);
+        ImGui::Combo("Shiny##wild", &shiny_mode, "As rolled\0Never\0Always\0");
+        ImGui::SameLine();
+        ImGui::Checkbox("IVs, EVs, nature, ability, gender, moves, Tera as above", &all);
+        ImGui::SetNextItemWidth(200);
+        ImGui::SliderInt("of wild spawns", &pct, 0, 100, "%d%%");
+        if (ImGui::Button("Make wild spawns this species")) {
+            bool spec = wild_spec_apply(p, lv_mode ? p.level : 0, shiny_mode, all, pct);
+            bool lua = wild_lua(s->internal, s->form, lv_mode ? p.level : 0, pct);
+            std::string msg = !spec ? "No wild spawn hook in this build (violet_wild_set missing from the exe)."
+                              : !lua ? "No script runner (the Lua bridge): only the spec, no species swap."
+                              : "Wild spawns: " + s->label + ", " + std::to_string(pct) + "% of new spawns. Walk to fresh ground.";
+            std::lock_guard<std::mutex> l(g_status_lock);
+            g_wild_status = msg;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Restore wild spawns")) {
+            std::string msg;
+            if (WildSet f = wild_set_fn()) f(nullptr);
+            wild_lua(-1, 0, 0, 0);
+            msg = "Wild spawns back to normal (new spawns).";
+            std::lock_guard<std::mutex> l(g_status_lock);
+            g_wild_status = msg;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Count")) {
+            char lua[256];
+            snprintf(lua, sizeof lua, "local C = %s\nif C == nil then return 'no class' end\n"
+                     "return 'swapped ' .. tostring(C.__nx_count) .. ', last was ' .. tostring(C.__nx_last)\n", WILD_CLASS);
+            if (modkit::host()->run_script) modkit::host()->run_script(lua, wild_lua_done, nullptr);
+        }
+        ImGui::TextDisabled("Every area, until restored or the game restarts. Moves all (none): the species' own. "
+                            "Also applies to any other %s the game makes meanwhile (raids, trades, eggs).", s->name.c_str());
+        std::lock_guard<std::mutex> l(g_status_lock);
+        if (!g_wild_status.empty()) ImGui::TextWrapped("%s", g_wild_status.c_str());
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Spawn into the boxes")) {
+        std::string msg;
+        spawn(p, msg);
+        set_status(msg);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("first free slot; the trainer is copied from your own mons");
+    {
+        std::lock_guard<std::mutex> l(g_status_lock);
+        if (!g_status.empty()) ImGui::TextWrapped("%s", g_status.c_str());
+    }
+    ImGui::End();
+}
+
+/* for svedit `check`: the PK9 these settings make, encrypted, to a file (no game needed) */
+extern "C" __declspec(dllexport) int mons_selftest(const char *cache_dir, const char *out, int national, int form, int level) {
+    if (g_species.empty()) load_tables(cache_dir);
+    Spec p;
+    for (size_t i = 0; i < g_species.size(); i++)
+        if (g_species[i].national == national && g_species[i].form == form) p.species = (int)i;
+    if (p.species < 0) return 1;
+    p.level = level; p.nature = 15; p.ability_slot = 2; p.shiny = true;
+    p.ev[0] = 252; p.ev[3] = 252;
+    for (auto &m : g_moves) {
+        if (m.name == "Lumina Crash") p.moves[0] = m.id;
+        if (m.name == "Calm Mind") p.moves[1] = m.id;
+        if (m.name == "Feather Dance") p.moves[2] = m.id;
+        if (m.name == "Roost") p.moves[3] = m.id;
+    }
+    strcpy(p.nickname, "SelfTest");
+    Trainer t;
+    put_name(t.name, "Tester");
+    t.tid = 12345; t.sid = 54321;
+    t.ok = true;
+    u8 dec[SLOT], enc[SLOT], back[SLOT];
+    build(p, t, dec);
+    encrypt(dec, enc);
+    decrypt(enc, back);
+    if (memcmp(dec, back, SLOT) || !slot_valid(enc)) return 2;
+    FILE *f = fopen(out, "wb");
+    if (!f) return 3;
+    fwrite(enc, 1, SLOT, f);
+    fclose(f);
+    return 0;
+}
+
+/* the Paldea wild table as "Wild spawns" would patch it, to a file (no game needed; read it back with a FlatBuffers
+ * reader: every entry the species / form / level asked for) */
+extern "C" __declspec(dllexport) int mons_wild_selftest(const char *cache_dir, const char *out, int national, int form, int level) {
+    if (g_species.empty()) load_tables(cache_dir);
+    if (g_enc[0].orig.empty()) enc_load(cache_dir);
+    EncTable &t = g_enc[0];
+    if (t.orig.empty()) return 1;
+    int sp = -1;
+    for (size_t i = 0; i < g_species.size(); i++)
+        if (g_species[i].national == national && g_species[i].form == form) sp = (int)i;
+    if (sp < 0) return 2;
+    std::vector<u8> mem = t.orig;           /* a "guest" copy in our own memory */
+    t.found = {(u64)(uintptr_t)mem.data()};
+    std::string msg;
+    enc_apply(sp, level, msg);
+    std::vector<u8> chk;
+    if (!enc_at(t, t.found[0], chk)) return 3;
+    t.found.clear();
+    FILE *f = fopen(out, "wb");
+    if (!f) return 4;
+    fwrite(mem.data(), 1, mem.size(), f);
+    fclose(f);
+    return 0;
+}

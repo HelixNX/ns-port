@@ -17,6 +17,7 @@
  * <build>\mods\items.txt, lines of "id \t pocket \t name" (violetrecomp\tools\svedit `items`, PKHeX.Core, for now;
  * to come from the game's own item data). */
 #include "items.h"
+#include "filtercombo.h"
 #include "modkit.h"
 #include <atomic>
 #include <ctype.h>
@@ -295,11 +296,12 @@ void items_ui() {
     ImGui::InputTextWithHint("##filter", "search items", g_filter, sizeof g_filter);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
-    if (ImGui::BeginCombo("##pocket", g_pocket < 0 ? "every pocket" : pocket_names[g_pocket])) {
-        if (ImGui::Selectable("every pocket", g_pocket < 0)) g_pocket = -1;
+    static FilterCombo fc_pocket;
+    if (fc_pocket.begin("##pocket", g_pocket < 0 ? "every pocket" : pocket_names[g_pocket], 0)) {
+        if (fc_pocket.item("every pocket", g_pocket < 0)) g_pocket = -1;
         for (int p = 0; p < N_POCKETS; p++)
-            if (ImGui::Selectable(pocket_names[p], g_pocket == p)) g_pocket = p;
-        ImGui::EndCombo();
+            if (fc_pocket.item(pocket_names[p], g_pocket == p)) g_pocket = p;
+        fc_pocket.end();
     }
     ImGui::SameLine();
     ImGui::Checkbox("Held only", &g_owned_only);
