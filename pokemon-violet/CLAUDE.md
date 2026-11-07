@@ -68,6 +68,11 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 0. Try the new menu: Esc / F1, Options (Video, Controls: rebind a key and a pad button), Mods (the three windows,
    Manage), Interface (themes), Multiplayer (Rooms: join, switch between two rooms, leave, rejoin; a switch between
    Union Circle sessions). Built 2026-11-07; only start-up checked unattended.
+   Later (asked 2026-11-07, not started): host a room from the menu (Multiplayer > Host: name, password, slots,
+   port; the game starts room_server.exe from room\ next to the exe in a package or ../room/build in development as
+   a child in a job object so it stops with the game, joins 127.0.0.1 and shows the LAN address; friends outside the
+   network still need the port forwarded or a tunnel). Also later: the whole room server on the ESP32 with the beacon
+   (../ldn-beacon/CLAUDE.md, Open).
 1. Try the F8 changes above; confirm the wild spec on a caught mon (overworld shiny vs battle shiny).
 2. Spawn-pool rules: wrap the encounter table's filter / per-entry rules (version, time, flags, weights; F8 weights
    are the first step), spawn density parameters. NOTES.md, "Planned next" item 3.
