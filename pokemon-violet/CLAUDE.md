@@ -472,7 +472,86 @@ a second backend next to the room. Not started: needs the adapter.
   - F6 and F7 now start a full rescan every time their window opens (no "still in place" shortcut).
 - **Mons from the closed game: `svedit addmon`** (PKHeX.Core; full IVs, the save's OT, party or first free box slot).
   Used for "FakeEspathra" (user's request; backup `build/save-backup-2026-11-06-1151-premon`).
-- **Mon spawner while playing (asked, not started).** Lead: the in-game NPC trade. `P2882` (trade class method
+- **Mon spawner into the boxes (F8, `mods/raids/mons.cpp`; built, NOT yet seen working in game).** Our own PK9
+  writer (layout and crypto in the file's header; offsets learnt with svedit `layout`, output checked with svedit
+  `check` = PKHeX read-back + legality: Espathra / Paldean Tauros / Pikachu / Ogerpon all decode exactly, stats
+  match PKHeX's), written into the first empty slot of the live box block (KBox: 990 slots x 0x158, encrypted PK9,
+  empty = an encrypted blank), found by scanning for 960+ consecutive slots whose checksums hold (rescans on open).
+  Species are stored as the internal index (Espathra 956 -> 927). Tables + the save's trainer: svedit `monsdata
+  <main> <build>\mods` -> `mons_species / moves / abilities / exp / balls / trainer.txt` (rerun after changing saves:
+  the trainer comes from it; fallback is the most common OT in the boxes, which failed for the user: all their
+  own mons were in the party). `mons_selftest` (DLL export) writes a test PK9 offline.
+  - The user's first try said "no mon in the boxes" (the trainer fallback): fixed with mons_trainer.txt, then the
+    user had to close the game to relink the DLL. Next: the user spawns one and opens the boxes.
+  - Game-side read-back for tests: box get `c1A1CBE3B.f6AA17B5F(box, slot)` (0-based; nil = empty?), set
+    `CEC4BF82A35D1E447.S0B3F69C4549A0284():F518978B87DAB37D6(box, slot, mon)` (party when box == -1:
+    `c1A1CBE3B.fFCE06E04():f36E12C71(pos, mon)`), mon `:f0BD5134F()` dev id, `:f5D94E897()` form.
+  - NX_MONS_TEST="<national>,<form>,<level>" spawns one unattended (scans from 60 s) and reads it back through
+    the game's box code. Its only run (5 min, a copy of the save, bench inputs NX_INPUT='300-900/60:A' NX_NOPACE=1)
+    wrote nothing at all to stderr: not looked into (dev builds log to stderr; was the redirect wrong?).
+- **Dropdowns filter as you type** (`mods/raids/filtercombo.h`: search box focused on open, Enter = first match) in
+  F6 / F7 / F8; F8's IV / EV boxes are typed fields.
+- **Mons spawning in the world (option A; done 2026-11-06, see "Wild spawns" below).** Plan as it was: take over the regular wild spawner: hook where the
+  overworld spawner picks what to place near the player and substitute the F8 window's species / form / level /
+  shiny; the game then does the model, behaviour, battle and catching. Apply the rest of the spec (IVs, nature,
+  ability, moves, EVs, ball?) where the wild mon's param is made when the battle starts (the native makers
+  `cA20E9FCA.*` all take FlatBuffer PokeData records read by field name through reflection; `pokeDataSymbol` /
+  `adjustEncLv` in `P14484` is the fixed-symbol path, `cA20E9FCA.f92C18AA6` its maker). Unknowns: the spawn
+  decision is probably native C++ with the encount tables (romfs `world/data/encount/...`), and where the battle's
+  mon is made. Needs the game running (the user, or the unattended test once it logs). UI: "Spawn nearby" in F8.
+  (Option B, a fixed spawn at the player like story events, needs PokeData FlatBuffers the reflection reader accepts
+  plus field-object setup: more unknowns.)
+- **Wild spawns (2026-11-06, F8 "Make wild spawns this species").** First attempt (no effect, see below): the
+  wild encounter tables `world/data/encount/pokedata/pokedata{,_su1,_su2}/..._array.bin` (Paldea 449 entries,
+  Kitakami 252, Blueberry 254; FlatBuffers, schema in mons.cpp) are found in guest memory by the same scan as the
+  boxes (first 28 bytes, then every untouched byte) and rewritten in place: DevID, form, level range (1-100 = the
+  spawn point decides, or a fixed level), companions' DevID / form. Form is absent in most entries: their vtable's
+  slot 2 is pointed at the table's padding byte 4; the one Paldea entry without padding gets weights 0 for a form
+  != 0. Restore writes the originals back. Copies: `raiddata.py` -> `build/mods/encount_pokedata*.bin`. Offline
+  check: DLL export `mons_wild_selftest` (patched Paldea table to a file; read back: all 449 as asked).
+  Open: whether the game keeps the raw buffer (log `mons: <region> wild table at ...` after the F8 scan; 0 copies =
+  it parses into its own structs: then hook the spawner), whether it reads it per spawn or caches per area (walk /
+  fly elsewhere), whether a 1-100 range spawns everywhere. (User: an area change despawns everything, so the
+  per-area cache question is moot.) Schema: `.bfbs` next to each table (`violetrecomp/tools/bfbs.py`): fields as
+  above (21 bandrate, 22 bandtype, 23 bandpoke, 25 bandFormno, 18 enabletable land / up_water / underwater / air1 /
+  air2). `pokedata_lc` exists too but its Oodle decode fails in trinity.py (not patched).
+  - **Tried 2026-11-06: rewriting the tables in memory changes nothing** (the bytes stay patched, normal mons keep
+    spawning): the spawner reads them into its own lists when the save loads. F8 no longer patches them (enc_* code
+    kept for the scan / self-test). Spawn-pool rule edits (versions, times, flags, weights) must therefore happen
+    before the load (patch the file as it is read) or in the spawner's own lists.
+  - `main+10cd434` (fields +0x120 DevID .. +0x130 level) is NOT the spawner: it makes the same ~26 mons at every
+    save load. Hooks moved from Create (debe4c) into the constructor `debf7c` (entry debf88: x1 spec; end debff8:
+    x19 param), which also covers `1245474`, an inlined Create on a global heap.
+  - **The wild spawner is Lua (NX_WILD_LOG run with call chains, 287 creates: Mareep, Fletchling, Hoppip, ...):**
+    chain `1245528 <- 1245224 <- Lua VM`; native `12451d0` = `c113335A8.f7AC1FE6B(spec)` (luaL_Reg at main+443a538,
+    the class registered at 140ce30). The script maker is `C2B428A63695FD2C7.S988D7D0A4EEF693D(?, DevID, form, sex,
+    level, ...)` (fills a spec from `cC99399C3.f101D811F()`: devId f2247607A, form f81738FA1, sex f88C47BAC, level
+    f02983AD3, `rarePercentage` -> shiny, `scale`, `ribbon`), called only by the wild manager `C4EE52E49562F8277`
+    (methods F71A61170646F68AF, F61D1ABB7697071EB, F316E31E09886ADC9; it also has `wildPokeType`, bosses /
+    minions, position / rotation). F8 now wraps it through the Lua bridge (**user-checked 2026-11-06: works**, Hisuian
+    Arcanine spawned in Paldea): share % of calls
+    get our DevID / form / level, original kept as `C.__nx_orig`; "Count" reports swaps. `tools/img.py ptr <off>`
+    finds luaL_Reg entries (name before the function pointer) in build/image/main.img.
+  - **The rest of the spec: `violetrecomp/wild.c`** (built; species swap user-checked, shiny / IVs / nature / moves
+    on a caught one not yet confirmed). Every mon param is built by the constructor `debf7c(obj, spec)` (callers:
+    `PokemonParam::Create` main+debe4c, x1 heap, x2 InitialSpec, 24 callers; and the inlined Create 1245474).
+    patches.txt `after wild_create` at debf88 rewrites the spec when DevID + form match (shiny mode, IVs, EVs,
+    nature, ability slot, gender, level); `after wild_created` at debff8 sets moves / PP and Tera type on param+0x70.
+    InitialSpec layout and setters in wild.c's header (from SetupInitialSpec `160ffd0` and its caller `160df74`,
+    the PokeData path, `pokepara_make.cpp`). The mod calls the exe's export `violet_wild_set` (GetProcAddress).
+    `NX_WILD_LOG=1` logs every create with five return addresses up the frame chain. Unknown: whether the overworld
+    model shows the shiny (the spec is the param's; the symbol may roll its own). Any other mon of the chosen
+    species made while it is on (raids, trades) gets the spec too.
+  - Tools this session (kept): `violetrecomp/tools/luabc.py` (Lua 5.4 bytecode: find / dis / callers, names
+    functions Class.prototype.Fxxx), `tools/xref.py` (ADRP+ADD refs to a string or address), `tools/bfbs.py`
+    (FlatBuffers .bfbs schemas, also straight from the romfs), `tools/img.py` (pointers in main's relocated image).
+    Static mons on fixed points come through the Lua PokeData maker `cA20E9FCA.f80B8DD7C` (native 160dd10; the
+    fixed-symbol path P14484); `cA20E9FCA.f6644EFDC` is native 90d010.
+- **Native Lua classes map** (session scripts, not kept): each `luaL_requiref(L, "c<hash>", open, 1)` call (callers
+  of main+e7d200; name in x1, open function in x2) names a class; its open function's ADRP+ADD refs are the
+  luaL_Reg tables ({name, fn} pairs to a null pair). The mon object class is `c113335A8` (172 methods),
+  `cA20E9FCA` the makers (f80B8DD7C from PokeData; f2ADD8E7F / f23C35B8C are just == / ~=).
+- **Mon spawner while playing (first look).** Lead: the in-game NPC trade. `P2882` (trade class method
   `FA1D3529002C3A75C(tray, pos, receivePoke)`) makes the mon with `CF7739C6C4D25CC45.S470187B7637D37DC(spec)`
   (spec = a FlatBuffers PokeData record from eventTradeList, through natives c919391D3 / cA20E9FCA / c5F9AB88A and
   `C9021E7F99581DB97.SDA35F5D36FE7531F`) and stores it with `CD081B219DEE96EEF.S644D748FB7CE5439(tray, pos, mon)`.
@@ -495,6 +574,42 @@ a second backend next to the room. Not started: needs the adapter.
     host. The Switch hosting needs one association per remote player. A USB mt76 adapter into WSL2 (usbipd +
     a kernel with the mt76 USB drivers) would keep it on Windows. Redirecting the Switch's DNS to our own server
     does not work for unmodified consoles: NPLN is TLS against Nintendo's CA plus Nintendo account / NSO tokens.
+
+## Planned next (written 2026-11-06 evening, the user's list in order)
+
+1. **Confirm the rest of the wild spec** on a caught mon: overworld shiny, nature, IVs, moves, Tera, level. If the
+   overworld model is not shiny while the battle one is, the symbol takes its rare flag elsewhere (look at the
+   wild maker's `rarePercentage` call `r0:f52C8AF50(...)` and the spec's `f82BDE968`).
+2. **Spawn one right in front of the player ("Spawn nearby" in F8).** The wild manager `C4EE52E49562F8277` is Lua:
+   find its method that places a symbol at a position (`position` / `rotation` / `viewParam` in
+   `FACD32B6F06B461B1`, the wild-mon list `bosses` / `minions`) and call it through the bridge with the player's
+   position (find the player object's position getter in Lua) and our species; the maker wrap and wild.c do the
+   rest. Fallback: start a wild battle directly from script (`EncountWild` users in `CA5A5606298DDCB29`).
+3. **Spawn-pool rules** (user: "mess with the normal spawning rules"). The encounter tables are read into the
+   spawner's own lists at save load, so either (a) find in the wild manager's Lua where candidates are filtered
+   (version table, time table, flagName, biome / weight, area, enabletable, height, level range vs the spawn
+   point's `level_range` in `encount_data_*.bin`) and wrap it, or (b) patch the tables in memory, then reload the
+   save (title -> continue), or (c) patch the file as the game reads it (hook the romfs read of
+   `pokedata*_array.bin`). Ideas the user liked: version exclusives in both versions, any time of day, ignore story
+   flags, equal weights, every species everywhere. Spawn density / rate: parameters `encounterCountMax`,
+   `encounterCheckInterval`, `encounterUnregisterFrameCount` (named-parameter file, loader main+1513f24; refs at
+   main+1514048 / 151415c / 15142cc) and the Lua `SpawnLimit` / `SpawnTimer` / `radiusSpawnArea` classes near
+   main.blua line 259k (unclear which system those are). Mass outbreaks are separate (BCAT
+   `encountOutbreak/*_3_0_0`, save `KBCATOutbreak*` blocks): custom outbreaks are another route.
+4. **Custom event raids** (user: wants it; room broadcast "probably option two, later"). Delivery blocks in the
+   save (PKHeX.Core SaveBlockAccessor9SV): KBCATRaidEnemyArray 0520A1B0 (30,000 bytes), KBCATRaidFixedRewardItemArray
+   7D6C2B82 (27,456), KBCATRaidLotteryRewardItemArray A52B4811 (53,464), KBCATRaidPriorityArray 095451E4 (88),
+   KBCATRaidIdentifier 37B99B4D (4); all zero in the user's save (never opened Poke Portal News). svedit `dump
+   <main> <dir> <key>...` writes them out. Next: the delivery schema (a .bfbs in the romfs? PKHeX.Core's
+   EncounterDist9 / EncounterMight9 readers), how a den picks a delivered raid (den content 2 = distribution,
+   3 = 7-star; group id from the priority table), then `svedit addraid` into a copy of the save, then F6 support.
+   Species without a model in Violet will not load. Later, option 2: the room server (`--event <file>`) sends the
+   event to joiners, a new nxmod hook hands it to the raids mod, which writes the blocks in memory. Option 1 (one
+   player hosts, guests join; guests get the boss from the host as with public raid bots) may need nothing.
+5. **The two F12 captures from 2026-11-06 14:32 / 14:33** (`build/frames/frame_49186*`, `frame_55343*`): one is the
+   missing-letters text, one the rain (the user to say which). See "Rain" and the glyph-atlas notes above.
+- Dropped by the user: an obedience patch (Eternatus disobeys above the badge level cap).
+- `pokedata_lc_array.bin`: trinity.py's Oodle decode fails on it (not looked into).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
 
