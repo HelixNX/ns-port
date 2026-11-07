@@ -123,6 +123,11 @@ cannot send raw action frames or run such an access point (this machine's RZ616 
 with a USB MediaTek adapter (mt76: MT7612U or MT7921AU; the Pi's own CYW43455 is FullMAC, no good) runs our daemon
 for the over-the-air protocol (kinnay's LDN docs/library for behaviour only), bridged to the recomp over the LAN as
 a second backend next to the room. Not started: needs the adapter.
+**Changed 2026-11-06:** the bridge runs on the user's laptop instead (HP Omen MAX 16, Ryzen AI 7 350, Wi-Fi
+**MediaTek MT7925**, `mt7925e` / mt76: AP + monitor), booted from a CachyOS live USB (Ventoy with persistence), wired
+to the LAN by Ethernet (the radio is busy as the LDN network). First test, by the user: `iw list` (modes,
+interface combinations) and a monitor capture on channels 1 / 6 / 11 while the Switch hosts local play (look for
+action frames with OUI 00:22:AA); the .pcap is the reference for the daemon. The Pi + USB adapter is the fallback.
 
 - **Done over rooms** (nxrecomp `8b5de5a`, violetrecomp `9ab9a71`): Violet builds with NETPLAY; two instances in
   one room did Union Circle and a full Tera raid (local mode; link codes typed into the new input box).
@@ -547,6 +552,37 @@ a second backend next to the room. Not started: needs the adapter.
     (FlatBuffers .bfbs schemas, also straight from the romfs), `tools/img.py` (pointers in main's relocated image).
     Static mons on fixed points come through the Lua PokeData maker `cA20E9FCA.f80B8DD7C` (native 160dd10; the
     fixed-symbol path P14484); `cA20E9FCA.f6644EFDC` is native 90d010.
+- **Spawn on me, the area's spawn list, the no-battles dev toggle (2026-11-06 evening; built, NOT yet tried in
+  game).** F8 section "Around you" (mons.cpp, the header comment above `FIELD_PRELUDE` has the whole map):
+  - Wild manager instance `C4EE52E49562F8277.SF3075AB31C9E8AF4` (W). Its update `F648B6B775BCC730B` is a state
+    machine on W[17] (0 = spawning: `FA9A2EC1E99B58D55`; 1 = waiting for the group's field objects). Spawn step:
+    player position `K.SBF5E0EFFB821427F:f7360ED03()`, a spawn point near it (`cFB7F03A4.f42A4ADE3` / `f35A39D75(x,
+    y, z, 0, radius, 0)`), its info `W:F654580D678C85C0E(pt)` (pos, min/max_level, biome, areano, areaname,
+    enable_table), group into W[23] (bosses / minions) by `W:F61D1ABB7697071EB(info)`, placed by
+    `W:F9B7FBB66FA56765E(W[23])`. "Spawn on me" does the same with info.pos moved to the player (+ offset slider,
+    default 3 m), only while W[17] == 0.
+  - Encounter table W[26] (class `CE1BA7320ED1C2331`): `F2F6C7BBE115AFBCB(info, ctx, flag, list, weights)` fills the
+    allowed entries + weights (0-based Haxe arrays) and returns the total; `FCEEA7F4134055567` picks by weight;
+    per-entry rules in `F67A9C2A9373A0AC6` (named checks: CheckArea, CheckLocation, a ground ray, four more), so
+    item 3 below (spawn-pool rules) can wrap those. ctx = `W[28]:FDCCDAF4C1D58AECA(pos)`; ctx[4] / ctx[5] force a
+    DevID / form (the game's own forced-species path). Entry getters: f2BF366A2 DevID, fE15E9D0A form, f5B8A3FE2
+    sex, f4646F546 / f61FD9277 level range. F8 lists the entries at the nearest point, spawns a chosen row (picker
+    overridden once on the instance), and sets weights (filter wrapped on the instance, K.__nx_w; lost when the
+    table instance is remade at save load: Apply again).
+  - Contact battles: the mon AI's behaviour-tree nodes SetEnableEncount / SetEnableEncountBlackboard (type names
+    main+2995db0 / 29954e0, vtables 4474d48 / 4474a00) call `main+1d0e5d4(component, enable)`, which stores a 1 / 0
+    byte and notifies. wild.c `h_encount_enable` (patches.txt main+1d0e5e4, after `mov w19, w1`) zeroes the bit
+    while the toggle is on (export `violet_no_battles`). Unconfirmed that this byte gates contact battles; mons
+    enabled before the toggle keep it until their AI sets it again. Other leads if it does not: the event flag
+    `FEVT_COMMON_0140_NO_ENCOUNT` (scripts set it with `C10578806AC30DCA3.SBA6FF574C1C9AA09.h[name] = v` plus
+    native `c37452BA0.f4BEF3427(name, v)`; read only natively, saved in the save), or the 5 callers of 1d0e5d4.
+  - Ghidra headless (decomp.ps1) worked for this; REA was down.
+  - In multiplayer (Union Circle) the wild manager has a network path: spawned groups become network objects
+    (netOwnerIndex / netSerialId, c2CA78EB7.*), and F47FB4E501540CBF7 keeps spawns off other players' mons. The user:
+    the world is simulated by one player at a time (it moves between them), so "Spawn on me" can only take effect
+    on the instance currently simulating. Untested.
+  - Real-Switch local play is a separate project now: `../ldn-beacon/` (priority: a Windows recomp hosts a raid in
+    the room, a real Switch joins through the beacon).
 - **Native Lua classes map** (session scripts, not kept): each `luaL_requiref(L, "c<hash>", open, 1)` call (callers
   of main+e7d200; name in x1, open function in x2) names a class; its open function's ADRP+ADD refs are the
   luaL_Reg tables ({name, fn} pairs to a null pair). The mon object class is `c113335A8` (172 methods),
@@ -580,7 +616,7 @@ a second backend next to the room. Not started: needs the adapter.
 1. **Confirm the rest of the wild spec** on a caught mon: overworld shiny, nature, IVs, moves, Tera, level. If the
    overworld model is not shiny while the battle one is, the symbol takes its rare flag elsewhere (look at the
    wild maker's `rarePercentage` call `r0:f52C8AF50(...)` and the spec's `f82BDE968`).
-2. **Spawn one right in front of the player ("Spawn nearby" in F8).** The wild manager `C4EE52E49562F8277` is Lua:
+2. **(Built 2026-11-06 evening, see "Spawn on me" above; the user to try it.)** Spawn one right in front of the player ("Spawn nearby" in F8). The wild manager `C4EE52E49562F8277` is Lua:
    find its method that places a symbol at a position (`position` / `rotation` / `viewParam` in
    `FACD32B6F06B461B1`, the wild-mon list `bosses` / `minions`) and call it through the bridge with the player's
    position (find the player object's position getter in Lua) and our species; the maker wrap and wild.c do the

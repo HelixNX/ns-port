@@ -8,6 +8,7 @@ root.
 |---|---|
 | `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (AArch64 lifter, SDK over emulated kernel/services, NVN on Vulkan). See `mk8dx/CLAUDE.md` |
 | `pokemon-violet/` | Pokémon Violet 4.0.0 + DLC (V4 graphics in progress: first-boot screens and the opening cutscene render). See `pokemon-violet/CLAUDE.md` |
+| `ldn-beacon/` | a real Switch's local play bridged into our (Eden-compatible) rooms, run on a Linux laptop next to the Switch; own git repo, local only for now. See `ldn-beacon/CLAUDE.md` |
 
 Current focus (the user's call, 2026-10-18): **Pokémon Violet only**. Changes to the shared `nxrecomp/` need no MK8
 regression checks (no MK8 builds, boots or shader diffs); the user checks MK8 themselves.
