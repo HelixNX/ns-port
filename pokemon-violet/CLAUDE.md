@@ -28,8 +28,10 @@ Never script input (`NX_INPUT`, pressing A) unless the user asks; bench.ps1 pass
 **In game:** Esc frees the mouse and shows the menu bar at the top (it fades in on mouse movement; F1 pins it; a
 click on the game hides it): **Options** > Video (frame rate, render scale, FPS counter, borderless fullscreen;
 Alt+Enter; the user: borderless only, never exclusive fullscreen) and Controls (keyboard, mouse, gamepad, hotkeys;
-all rebindable, saved in `build\settings.ini`), **Mods** (each mod's windows with its hotkey; Manage turns a DLL off
-for the next start). F3 FPS counter, F5 frame rate cycle (development), F12 captures a frame to `build\frames\`. The
+all rebindable, saved in `build\settings.ini`) and Interface (theme: the game's from game.json `theme` (violet and
+gold), Dark, Light, Classic; menu size), **Mods** (each mod's windows with its hotkey; Manage turns a DLL off for the
+next start), **Multiplayer** (the room, Rooms...: the public list, nickname, direct connect with password; leave;
+switching or leaving during a local session asks first and ends it; `net/netmenu.c`). F3 FPS counter, F5 frame rate cycle (development), F12 captures a frame to `build\frames\`. The
 menu is nxrecomp's `nxui.dll` next to the exe (ui/nxui.cpp; without it the game runs with plain hotkeys). Mods are
 optional DLLs in `build\cmake\mods\` (`NX_MODS=0` loads none), one each: **violet_raids** (Tera Raids, F6: find
 seeds, write dens), **violet_items** (Items, F7: give / set, a Lua console in the game's VM), **violet_mons** (Spawn
@@ -64,8 +66,8 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 ## Open (the user's list, in order)
 
 0. Try the new menu: Esc / F1, Options (Video, Controls: rebind a key and a pad button), Mods (the three windows,
-   Manage). Next asked for: change rooms during play (a Multiplayer menu: current room, leave, the public list,
-   direct connect; leaving drops a local session in progress), then a theme choice for the menu.
+   Manage), Interface (themes), Multiplayer (Rooms: join, switch between two rooms, leave, rejoin; a switch between
+   Union Circle sessions). Built 2026-11-07; only start-up checked unattended.
 1. Try the F8 changes above; confirm the wild spec on a caught mon (overworld shiny vs battle shiny).
 2. Spawn-pool rules: wrap the encounter table's filter / per-entry rules (version, time, flags, weights; F8 weights
    are the first step), spawn density parameters. NOTES.md, "Planned next" item 3.
