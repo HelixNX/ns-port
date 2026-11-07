@@ -2,6 +2,8 @@
   "name": "mk8recomp",
   "title": "Mario Kart 8 Deluxe",
   "title_id": "0100152000022000",
+  "version": "3.0.5",
+  "multiplayer": "races and battles",
   "modules": [["main", "0x7100000000"], ["subsdk0", "0x7101400000"], ["sdk", "0x7101c00000"]],
   "dump": "../dump_v21",
   "analysis": "../build/analysis_305",
