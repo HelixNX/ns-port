@@ -77,7 +77,7 @@ void lobby_free(LobbyRoom *rooms, int n);
 void netplay_startup(const char *save_dir, const char *game_dir);
 
 /* ---------------------------------------------------------------------------------------------- services */
-void ldn_net_register(void);                /* services/ldn_net.c: ldn:u on the room */
+void ldn_net_register(const char *game_dir); /* services/ldn_net.c: ldn:u on the room */
 void bsd_register(void);                    /* services/bsd.c: bsd:u sockets on the room's network */
 
 #endif

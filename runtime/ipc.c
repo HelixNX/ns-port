@@ -202,7 +202,7 @@ void services_init(const char *game_dir, const char *save_dir) {
 #ifdef NX_NETPLAY
     /* in a room (net/browser.c): local wireless and sockets on its network; otherwise both stay unavailable */
     if (room_joined()) {
-        ldn_net_register();
+        ldn_net_register(game_dir);
         bsd_register();
     } else
 #endif

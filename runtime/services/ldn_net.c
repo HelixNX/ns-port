@@ -10,6 +10,7 @@
  * Command ids: IUserLocalCommunicationService (SDK 4.4: nn::ldn::Initialize is command 400). */
 #include "../ipc.h"
 #include "../net/net.h"
+#include "../nca.h"
 #include "game_config.h"
 #include <stdlib.h>
 #include <windows.h>
@@ -301,10 +302,36 @@ static void lc_latest_update(SvcObj *o, IpcReq *r) {
     LeaveCriticalSection(&lk);
 }
 
-/* local communication id -1 is "this application's own" (the console takes the first of the NACP's
- * LocalCommunicationIds; for our games, the title id) */
+/* local communication id -1 is "this application's own": the console takes the first of the NACP's
+ * LocalCommunicationIds (0x30B0, 8 u64s), which need not be the title id: Violet's is Scarlet's 0100A3D008C5C000, so
+ * the two versions meet. A real console (ldn-beacon) or Eden filters on it. Read once at registration. */
 #define LOCAL_COMM_DEFAULT 0xffffffffffffffffull
-static u64 own_comm_id(u64 id) { return id == LOCAL_COMM_DEFAULT ? NX_TITLE_ID : id; }
+static u64 nacp_comm_id = NX_TITLE_ID;
+static u64 own_comm_id(u64 id) { return id == LOCAL_COMM_DEFAULT ? nacp_comm_id : id; }
+
+static void load_comm_id(const char *game_dir) {
+    u8 v[8];
+    bool ok = false;
+    if (nx_from_nsp()) {
+        u64 sz;
+        u8 *nacp = nx_game_control_file("control.nacp", &sz);
+        if (nacp && sz >= 0x30B8) { memcpy(v, nacp + 0x30B0, 8); ok = true; }
+        free(nacp);
+    } else {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/control/control.nacp", game_dir);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            ok = !fseek(f, 0x30B0, SEEK_SET) && fread(v, 1, 8, f) == 8;
+            fclose(f);
+        }
+    }
+    u64 id;
+    memcpy(&id, v, 8);
+    if (ok && id) nacp_comm_id = id;
+    hlog(1, "ldn: local communication id %016llx (%s)", (unsigned long long)nacp_comm_id,
+        ok && id ? "the NACP's" : "no NACP: the title id");
+}
 
 static bool scan_match(const u8 *filter, const NetworkInfo *n) {
     u32 flag;
@@ -610,7 +637,8 @@ static const Iface iface_ldn = {"ldn:u", (const IpcCmd[]){
 
 static SvcObj *open_ldn(const char *name) { return svcobj_new(&iface_ldn, NULL, name); }
 
-void ldn_net_register(void) {
+void ldn_net_register(const char *game_dir) {
+    load_comm_id(game_dir);
     InitializeCriticalSection(&lk);
     state_event = event_create();
     room_on_ldn(on_ldn);
