@@ -15,7 +15,9 @@
 #include <atomic>
 #include <mutex>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <vector>
 #include <windows.h>
 
@@ -223,6 +225,182 @@ EXPORT void nxui_show(void) {
     last_move = SDL_GetTicks();
 }
 
+/* ---------------------------------------------------------------------------------------------- the theme
+ * A game's theme is a palette in its game.json ("theme": background, panel, accent, accent2, text as "#rrggbb",
+ * rounding in pixels), baked into the exe (UiHost.theme); every ImGui colour is derived from it. The player picks
+ * the game's theme (the default) or ImGui's Dark / Light / Classic, and a UI scale (auto: by the window's height),
+ * in Options > Interface (settings.ini ui_theme, ui_scale). */
+struct Palette { ImVec4 bg, panel, accent, accent2, text; float rounding; bool ok; };
+static std::atomic<bool> style_dirty{true};
+
+static bool hex_colour(const char *s, ImVec4 *c) {
+    unsigned v;
+    if (!s || *s != '#' || strlen(s) < 7 || sscanf(s + 1, "%6x", &v) != 1) return false;
+    *c = ImVec4(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f, 1.0f);
+    return true;
+}
+
+static Palette game_palette() {
+    Palette p = {};
+    p.rounding = 4;
+    int have = 0;
+    const char *s = H->theme ? H->theme : "";
+    while (*s) {
+        const char *eq = strchr(s, '='), *end = strchr(s, ';');
+        if (!end) end = s + strlen(s);
+        if (eq && eq < end) {
+            char k[32] = "", v[32] = "";
+            snprintf(k, sizeof k, "%.*s", (int)(eq - s), s);
+            snprintf(v, sizeof v, "%.*s", (int)(end - eq - 1), eq + 1);
+            if (!strcmp(k, "background")) have += hex_colour(v, &p.bg);
+            else if (!strcmp(k, "panel")) have += hex_colour(v, &p.panel);
+            else if (!strcmp(k, "accent")) have += hex_colour(v, &p.accent);
+            else if (!strcmp(k, "accent2")) have += hex_colour(v, &p.accent2);
+            else if (!strcmp(k, "text")) have += hex_colour(v, &p.text);
+            else if (!strcmp(k, "rounding")) p.rounding = (float)atof(v);
+        }
+        s = *end ? end + 1 : end;
+    }
+    p.ok = have == 5;
+    return p;
+}
+
+static ImVec4 mix(ImVec4 a, ImVec4 b, float t) {
+    return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+static ImVec4 alpha(ImVec4 c, float a) { return ImVec4(c.x, c.y, c.z, a); }
+
+static void apply_palette(ImGuiStyle &st, const Palette &p) {
+    ImGui::StyleColorsDark(&st);                    /* every colour has a value; the palette's replace them */
+    ImVec4 *c = st.Colors;
+    ImVec4 dim = mix(p.text, p.bg, 0.5f);
+    c[ImGuiCol_Text] = p.text;
+    c[ImGuiCol_TextDisabled] = dim;
+    c[ImGuiCol_WindowBg] = alpha(p.bg, 0.96f);
+    c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_PopupBg] = alpha(p.panel, 0.98f);
+    c[ImGuiCol_Border] = alpha(mix(p.panel, p.accent, 0.45f), 0.8f);
+    c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_FrameBg] = p.panel;
+    c[ImGuiCol_FrameBgHovered] = mix(p.panel, p.accent, 0.30f);
+    c[ImGuiCol_FrameBgActive] = mix(p.panel, p.accent, 0.50f);
+    c[ImGuiCol_TitleBg] = mix(p.bg, p.panel, 0.5f);
+    c[ImGuiCol_TitleBgActive] = mix(p.panel, p.accent, 0.55f);
+    c[ImGuiCol_TitleBgCollapsed] = alpha(p.bg, 0.8f);
+    c[ImGuiCol_MenuBarBg] = p.panel;
+    c[ImGuiCol_ScrollbarBg] = alpha(p.bg, 0.6f);
+    c[ImGuiCol_ScrollbarGrab] = mix(p.panel, p.accent, 0.45f);
+    c[ImGuiCol_ScrollbarGrabHovered] = mix(p.panel, p.accent, 0.70f);
+    c[ImGuiCol_ScrollbarGrabActive] = p.accent;
+    c[ImGuiCol_CheckMark] = p.accent2;
+    c[ImGuiCol_SliderGrab] = p.accent;
+    c[ImGuiCol_SliderGrabActive] = p.accent2;
+    c[ImGuiCol_Button] = mix(p.panel, p.accent, 0.45f);
+    c[ImGuiCol_ButtonHovered] = p.accent;
+    c[ImGuiCol_ButtonActive] = mix(p.accent, p.accent2, 0.5f);
+    c[ImGuiCol_Header] = mix(p.panel, p.accent, 0.40f);
+    c[ImGuiCol_HeaderHovered] = mix(p.panel, p.accent, 0.75f);
+    c[ImGuiCol_HeaderActive] = p.accent;
+    c[ImGuiCol_Separator] = alpha(mix(p.panel, p.accent, 0.35f), 0.9f);
+    c[ImGuiCol_SeparatorHovered] = p.accent;
+    c[ImGuiCol_SeparatorActive] = p.accent2;
+    c[ImGuiCol_ResizeGrip] = alpha(p.accent, 0.25f);
+    c[ImGuiCol_ResizeGripHovered] = alpha(p.accent, 0.65f);
+    c[ImGuiCol_ResizeGripActive] = p.accent2;
+    c[ImGuiCol_Tab] = mix(p.panel, p.accent, 0.25f);
+    c[ImGuiCol_TabHovered] = p.accent;
+    c[ImGuiCol_TabSelected] = mix(p.panel, p.accent, 0.65f);
+    c[ImGuiCol_TabSelectedOverline] = p.accent2;
+    c[ImGuiCol_TabDimmed] = p.panel;
+    c[ImGuiCol_TabDimmedSelected] = mix(p.panel, p.accent, 0.40f);
+    c[ImGuiCol_TableHeaderBg] = mix(p.panel, p.accent, 0.20f);
+    c[ImGuiCol_TableBorderStrong] = mix(p.panel, p.accent, 0.35f);
+    c[ImGuiCol_TableBorderLight] = mix(p.panel, p.accent, 0.20f);
+    c[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TableRowBgAlt] = alpha(p.panel, 0.45f);
+    c[ImGuiCol_TextSelectedBg] = alpha(p.accent, 0.40f);
+    c[ImGuiCol_PlotHistogram] = p.accent2;
+    c[ImGuiCol_PlotLines] = p.accent;
+    c[ImGuiCol_NavCursor] = p.accent2;
+    c[ImGuiCol_DragDropTarget] = p.accent2;
+    st.WindowRounding = p.rounding;
+    st.ChildRounding = p.rounding;
+    st.PopupRounding = p.rounding;
+    st.FrameRounding = p.rounding * 0.6f;
+    st.GrabRounding = p.rounding * 0.6f;
+    st.ScrollbarRounding = p.rounding;
+    st.TabRounding = p.rounding * 0.6f;
+    st.WindowBorderSize = 1;
+    st.FrameBorderSize = 0;
+    st.WindowPadding = ImVec2(12, 10);
+    st.FramePadding = ImVec2(8, 4);
+    st.ItemSpacing = ImVec2(8, 6);
+}
+
+static const char *theme_choice() { return H->setting("ui_theme", "game"); }
+
+/* render thread, before a frame: the style for the theme and scale chosen (from scratch: ScaleAllSizes adds up) */
+static void build_style(uint32_t height) {
+    static float last_scale;
+    int pct = atoi(H->setting("ui_scale", "0"));
+    float scale = pct > 0 ? pct / 100.0f : height >= 1400 ? 1.75f : height >= 1000 ? 1.35f : 1.0f;
+    if (!style_dirty.exchange(false) && scale == last_scale) return;
+    last_scale = scale;
+    ImGuiStyle st;
+    const char *t = theme_choice();
+    Palette p = game_palette();
+    if (!strcmp(t, "light")) ImGui::StyleColorsLight(&st);
+    else if (!strcmp(t, "classic")) ImGui::StyleColorsClassic(&st);
+    else if (!strcmp(t, "game") && p.ok) apply_palette(st, p);
+    else ImGui::StyleColorsDark(&st);
+    st.ScaleAllSizes(scale);
+    st.FontScaleMain = scale;
+    ImGui::GetStyle() = st;
+}
+
+static void page_interface() {
+    Palette p = game_palette();
+    struct Choice { const char *id, *name; };
+    char game_name[128];
+    snprintf(game_name, sizeof game_name, "%s (the game's)", H->title ? H->title : "This game");
+    const Choice choices[] = {{"game", game_name}, {"dark", "Dark"}, {"light", "Light"}, {"classic", "Classic"}};
+    const char *cur = theme_choice();
+    ImGui::SetNextItemWidth(300);
+    const char *shown = "Dark";
+    for (const Choice &c : choices) if (!strcmp(c.id, cur)) shown = c.name;
+    if (ImGui::BeginCombo("Theme", shown)) {
+        for (const Choice &c : choices) {
+            if (!strcmp(c.id, "game") && !p.ok) continue;       /* a game without a theme: ImGui's dark */
+            if (ImGui::Selectable(c.name, !strcmp(c.id, cur))) { H->set_setting("ui_theme", c.id); style_dirty = true; }
+        }
+        ImGui::EndCombo();
+    }
+    int pct = atoi(H->setting("ui_scale", "0"));
+    static const int scales[] = {0, 75, 100, 125, 150, 175, 200, 250};
+    char cs[32];
+    snprintf(cs, sizeof cs, pct ? "%d%%" : "Auto (by window size)", pct);
+    ImGui::SetNextItemWidth(300);
+    if (ImGui::BeginCombo("Menu size", cs)) {
+        for (int s : scales) {
+            snprintf(cs, sizeof cs, s ? "%d%%" : "Auto (by window size)", s);
+            if (ImGui::Selectable(cs, s == pct)) {
+                snprintf(cs, sizeof cs, "%d", s);
+                H->set_setting("ui_scale", cs);
+                style_dirty = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (p.ok) {                                         /* the game's palette, for reference */
+        ImGui::TextDisabled("This game's colours:");
+        ImVec4 sw[] = {p.bg, p.panel, p.accent, p.accent2, p.text};
+        for (int i = 0; i < 5; i++) {
+            ImGui::SameLine();
+            ImGui::ColorButton(("##sw" + std::to_string(i)).c_str(), sw[i], ImGuiColorEditFlags_NoTooltip, ImVec2(18, 18));
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------------------------------- the pages */
 static const char *key_name(int sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return "(none)";
@@ -400,6 +578,10 @@ static void window_options() {
                 page_video();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Interface", nullptr, want == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                page_interface();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Controls", nullptr, want == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
                 if (ImGui::BeginTabBar("##controls")) {
                     if (ImGui::BeginTabItem("Keyboard")) { page_keyboard(); ImGui::EndTabItem(); }
@@ -467,6 +649,7 @@ static void menu_bar() {
     if (ImGui::BeginMenu("Options")) {
         if (ImGui::MenuItem("Video...")) { opt_open = true; opt_tab = 0; }
         if (ImGui::MenuItem("Controls...")) { opt_open = true; opt_tab = 1; }
+        if (ImGui::MenuItem("Interface...")) { opt_open = true; opt_tab = 2; }
         ImGui::Separator();
         bool full = H->fullscreen(), fps = H->fps_counter();
         if (ImGui::MenuItem("Fullscreen", "Alt+Enter", full)) H->set_fullscreen(!full);
@@ -534,10 +717,6 @@ static void drain(ImGuiIO &io) {
 static bool backend(const NxModFrame *f) {
     if (R.ready) return true;
     if (R.failed) return false;
-    ImGuiStyle &st = ImGui::GetStyle();
-    float scale = f->height >= 1400 ? 1.75f : f->height >= 1000 ? 1.35f : 1.0f;
-    st.ScaleAllSizes(scale);
-    st.FontScaleMain = scale;
     ImGui_ImplVulkan_InitInfo ii = {};
     ii.ApiVersion = VK_API_VERSION_1_3;
     ii.Instance = f->instance;
@@ -576,6 +755,7 @@ EXPORT void nxui_draw(const NxModFrame *f) {
     io.DeltaTime = dt > 0 ? (dt < 0.25f ? dt : 0.25f) : 1.0f / 60;
     io.DisplaySize = ImVec2((float)f->width, (float)f->height);
     drain(io);
+    build_style(f->height);
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (visible()) {
@@ -617,7 +797,6 @@ EXPORT bool nxui_init(const UiHost *host) {
     snprintf(g_ini, sizeof g_ini, "%s\\ui.ini", host->cache_dir);
     io.IniFilename = g_ini;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    ImGui::StyleColorsDark();
     was_visible = !host->mouse_captured();
     return true;
 }

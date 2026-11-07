@@ -188,6 +188,21 @@ function(nx_game)
     if(no_fr)
         set(NX_DEFAULT_FRAMERATE -1)
     endif()
+    # the menu's theme, e.g. "theme": {"background": "#17121f", "panel": "#241b33", "accent": "#8b5cf6",
+    # "accent2": "#f5c542", "text": "#f3eefc", "rounding": 6} (nxui derives ImGui's colours; absent: ImGui's dark)
+    set(NX_UI_THEME "")
+    string(JSON _theme ERROR_VARIABLE no_theme GET "${json}" theme)
+    if(NOT no_theme)
+        string(JSON _n LENGTH "${_theme}")
+        if(_n GREATER 0)
+            math(EXPR _last "${_n} - 1")
+            foreach(_i RANGE ${_last})
+                string(JSON _k MEMBER "${_theme}" ${_i})
+                string(JSON _v GET "${_theme}" "${_k}")
+                string(APPEND NX_UI_THEME "${_k}=${_v};")
+            endforeach()
+        endif()
+    endif()
     list(LENGTH NX_DLC NX_DLC_COUNT)
     list(APPEND NX_DLC 0)                               # a C array may not be empty
     list(JOIN NX_DLC ", " NX_DLC)
@@ -207,6 +222,7 @@ function(nx_game)
 #define NX_DLC_COUNT @NX_DLC_COUNT@
 #define NX_DLC_INDICES {@NX_DLC@}
 #define NX_DEFAULT_FRAMERATE (@NX_DEFAULT_FRAMERATE@)
+#define NX_UI_THEME "@NX_UI_THEME@"
 ]] @ONLY)
 
     set(LIFTED_DIR "${build}/lifted" CACHE PATH "C sources written by tools/lifter/a64lift.py")

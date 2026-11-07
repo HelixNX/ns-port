@@ -74,6 +74,7 @@ bool ui_init(SDL_Window *window) {
         .set_pad_deadzone = input_set_pad_deadzone, .pad_connected = input_pad_connected,
         .mods_files = mods_files, .mods_windows = mods_windows, .mods_window_toggle = mods_window_toggle,
         .mods_set_enabled = mods_set_enabled, .mods_any_window_open = mods_any_window_open, .mods_ui = mods_ui,
+        .theme = NX_UI_THEME, .setting = options_get, .set_setting = options_set,
     };
     if (!init || !dll_imgui || !dll_event || !dll_tick || !dll_toggle || !dll_show || !dll_wants_kb || !dll_active ||
         !dll_draw || !init(&h)) {

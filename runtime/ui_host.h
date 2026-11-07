@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define NXUI_VERSION 1
+#define NXUI_VERSION 2
 
 typedef struct UiHost {
     uint32_t version;                       /* NXUI_VERSION */
@@ -66,6 +66,10 @@ typedef struct UiHost {
     void (*mods_set_enabled)(uint32_t i, bool on);
     bool (*mods_any_window_open)(void);
     void (*mods_ui)(void);
+    /* version 2: the game's theme (game.json "theme": "key=value;...", empty: none) and settings.ini itself */
+    const char *theme;
+    const char *(*setting)(const char *key, const char *def);
+    void (*set_setting)(const char *key, const char *value);
 } UiHost;
 
 /* nxui.dll's exports */
