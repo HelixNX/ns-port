@@ -76,7 +76,9 @@ if ($ShaderPack) {
     $pth = Get-ChildItem "$Out\translator\python" -Filter 'python*._pth' | Select-Object -First 1
     Add-Content $pth.FullName '..'
 }
-cmd /c "`"$tools\room\build.bat`" `"$Out\room`""
+$room = [IO.Path]::GetFullPath("$tools\..\..\room\build.bat")      # the room server: its own folder next to nxrecomp
+if (-not (Test-Path $room)) { throw "no room server at $room (the room/ folder next to nxrecomp)" }
+cmd /c "`"$room`" `"$Out\room`""
 if ($LASTEXITCODE) { throw 'the room server build failed' }
 Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
 Copy-Item $vcrt $Out -Force
