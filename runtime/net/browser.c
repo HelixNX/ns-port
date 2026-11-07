@@ -598,3 +598,27 @@ void netplay_startup(const char *save_dir, const char *game_dir) {
     if (result == R_NONE) exit(0);
     if (result == R_OFFLINE) hlog(1, "netplay: playing offline");
 }
+
+/* the in-game menu (netmenu.c) shares the nickname with the browser: netplay.ini's nickname= line */
+void netplay_nickname(char *out, size_t n) {
+    ini_get("nickname", out, n, "");
+    if (!*out) default_nick(out, n);
+}
+
+bool netplay_set_nickname(const char *nick) {
+    if (!valid_nick(nick)) return false;
+    char lines[32][600];
+    int nl = 0;
+    bool found = false;
+    FILE *f = fopen(ini_path, "r");
+    while (f && nl < 32 && fgets(lines[nl], sizeof lines[nl], f)) {
+        if (!strncmp(lines[nl], "nickname=", 9)) { snprintf(lines[nl], sizeof lines[nl], "nickname=%s\n", nick); found = true; }
+        nl++;
+    }
+    if (f) fclose(f);
+    if (!found && nl < 32) snprintf(lines[nl++], sizeof lines[0], "nickname=%s\n", nick);
+    if (!(f = fopen(ini_path, "w"))) return false;
+    for (int i = 0; i < nl; i++) fputs(lines[i], f);
+    fclose(f);
+    return true;
+}

@@ -14,6 +14,7 @@
 #include <imgui_impl_vulkan.h>
 #include <atomic>
 #include <mutex>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@ static ImGuiContext *g_ctx;
 /* ---------------------------------------------------------------------------------------------- shared state */
 static std::atomic<bool> want_mouse{false}, want_kb{false}, want_text{false}, menu_open{false};
 static std::atomic<bool> pinned{false}, req_release{false}, opt_open{false}, mods_open{false}, was_visible{false};
+static std::atomic<bool> rooms_open{false}, modal_wanted{false};
 static std::atomic<uint64_t> last_move{0};          /* SDL_GetTicks of the last mouse movement over the game */
 enum { CAP_NONE, CAP_KEY, CAP_PAD, CAP_HOTKEY };
 static std::atomic<int> cap_kind{CAP_NONE}, cap_index{-1};     /* rebinding: waiting for a key or a button */
@@ -209,7 +211,8 @@ EXPORT bool nxui_wants_keyboard(void) { return visible() && (want_kb || want_tex
 
 EXPORT bool nxui_active(void) {
     if (!visible()) return false;
-    return bar_visible(SDL_GetTicks()) || opt_open || mods_open || H->mods_any_window_open() || cap_kind != CAP_NONE;
+    return bar_visible(SDL_GetTicks()) || opt_open || mods_open || rooms_open || modal_wanted ||
+           H->mods_any_window_open() || cap_kind != CAP_NONE;
 }
 
 /* the menu hotkey (window thread) */
@@ -644,6 +647,187 @@ static void window_mods() {
     if (!open) mods_open = false;
 }
 
+/* ---------------------------------------------------------------------------------------------- rooms
+ * Multiplayer (games built with NETPLAY): the room we are in, the public list, direct connect, leaving; joins run
+ * in the background (net/netmenu.c). Switching or leaving during a local session ends that session, so it asks. */
+static UiRoom g_rooms[256];
+static struct {
+    bool active, need_pw, leave;            /* a join (or a leave) waiting for the modal's answer */
+    char host[128], name[128];
+    uint16_t port;
+} pend;
+static char pw_buf[128], nick_buf[64], direct_buf[160], direct_pw[128], search_buf[64], nick_msg[96];
+static bool game_only = true;
+
+static void want_join(const char *host, uint16_t port, bool need_pw, const char *name) {
+    if (!need_pw && !H->in_session()) { H->room_join(host, port, ""); return; }
+    pend.active = true;
+    pend.leave = false;
+    pend.need_pw = need_pw;
+    snprintf(pend.host, sizeof pend.host, "%s", host);
+    snprintf(pend.name, sizeof pend.name, "%s", name ? name : host);
+    pend.port = port;
+    pw_buf[0] = 0;
+    modal_wanted = true;
+}
+
+static void want_leave() {
+    if (!H->in_session()) { H->room_leave(); return; }
+    pend.active = true;
+    pend.leave = true;
+    modal_wanted = true;
+}
+
+/* at the root of the frame: the password / "you are in a session" question */
+static void room_modal() {
+    if (!pend.active) { modal_wanted = false; return; }
+    if (!ImGui::IsPopupOpen("Room##modal")) ImGui::OpenPopup("Room##modal");
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Room##modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (pend.leave) ImGui::TextUnformatted("Leave the room?");
+    else ImGui::Text("Join \"%s\"?", pend.name);
+    if (H->in_session())
+        ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "You are in a local session (Union Circle, a raid, ...): it ends.");
+    if (!pend.leave && pend.need_pw) {
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::InputText("Password", pw_buf, sizeof pw_buf, ImGuiInputTextFlags_Password);
+    }
+    bool go = ImGui::Button(pend.leave ? "Leave" : "Join");
+    ImGui::SameLine();
+    bool cancel = ImGui::Button("Cancel");
+    if (go) {
+        if (pend.leave) H->room_leave();
+        else H->room_join(pend.host, pend.port, pw_buf);
+    }
+    if (go || cancel) { pend.active = false; modal_wanted = false; ImGui::CloseCurrentPopup(); }
+    ImGui::EndPopup();
+}
+
+static void room_status_line() {
+    int s = H->room_state();
+    const char *m = H->room_message();
+    if (s == UI_ROOM_JOINED) ImGui::Text("In room: %s", m);
+    else if (s == UI_ROOM_JOINING) ImGui::Text("Joining %s ...", m);
+    else if (s == UI_ROOM_FAILED) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s", m);
+    else ImGui::TextDisabled("Not in a room (local play is offline).");
+}
+
+static bool host_port(const char *in, char *host, size_t n, uint16_t *port) {
+    while (*in == ' ') in++;
+    if (!*in) return false;
+    snprintf(host, n, "%s", in);
+    char *c = strrchr(host, ':');
+    *port = 0;
+    if (c && c[1] && strspn(c + 1, "0123456789") == strlen(c + 1)) { *port = (uint16_t)atoi(c + 1); *c = 0; }
+    size_t l = strlen(host);
+    while (l && host[l - 1] == ' ') host[--l] = 0;
+    return *host != 0;
+}
+
+static bool contains_nocase(const char *s, const char *sub) {
+    for (; *s; s++) {
+        size_t k = 0;
+        while (sub[k] && s[k] && tolower((unsigned char)s[k]) == tolower((unsigned char)sub[k])) k++;
+        if (!sub[k]) return true;
+    }
+    return !*sub;
+}
+
+static void window_rooms() {
+    bool open = rooms_open;
+    ImGui::SetNextWindowSize(ImVec2(820, 560), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Rooms", &open)) {
+        if (ImGui::IsWindowAppearing()) {
+            H->nickname(nick_buf, sizeof nick_buf);
+            nick_msg[0] = 0;
+            H->lobby_refresh();
+        }
+        room_status_line();
+        int s = H->room_state();
+        if (s == UI_ROOM_JOINED) { ImGui::SameLine(); if (ImGui::SmallButton("Leave")) want_leave(); }
+        if (H->in_session())
+            ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "In a local session: switching rooms ends it.");
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputText("Nickname", nick_buf, sizeof nick_buf);
+        ImGui::SameLine();
+        if (ImGui::Button("Save")) snprintf(nick_msg, sizeof nick_msg, "%s", H->set_nickname(nick_buf) ?
+            "Saved (used from the next join)." : "4 to 20 letters, digits, spaces, . _ or -");
+        if (*nick_msg) { ImGui::SameLine(); ImGui::TextDisabled("%s", nick_msg); }
+
+        ImGui::SeparatorText("Public rooms");
+        bool loading;
+        char err[256];
+        int n = H->lobby(g_rooms, 256, &loading, err, sizeof err);
+        if (ImGui::Button(loading ? "Loading..." : "Refresh") && !loading) H->lobby_refresh();
+        ImGui::SameLine();
+        ImGui::Checkbox("Only this game's rooms", &game_only);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputTextWithHint("##search", "search", search_buf, sizeof search_buf);
+        if (*err) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s", err);
+        float list_h = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 3.2f;
+        if (ImGui::BeginTable("##rooms", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp |
+                                            ImGuiTableFlags_BordersInnerV, ImVec2(0, list_h > 80 ? list_h : 80))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Room", 0, 3.0f);
+            ImGui::TableSetupColumn("Game", 0, 2.0f);
+            ImGui::TableSetupColumn("Players", 0, 0.8f);
+            ImGui::TableSetupColumn("Host", 0, 1.4f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < n; i++) {
+                const UiRoom &r = g_rooms[i];
+                if (game_only && !r.this_game) continue;
+                if (*search_buf && !contains_nocase(r.name, search_buf) && !contains_nocase(r.owner, search_buf) &&
+                    !contains_nocase(r.game, search_buf)) continue;
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                bool pick = ImGui::Selectable(r.name, false, ImGuiSelectableFlags_SpanAllColumns |
+                                                             ImGuiSelectableFlags_AllowDoubleClick |
+                                                             ImGuiSelectableFlags_AllowOverlap) &&
+                            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                if (r.password) { ImGui::SameLine(); ImGui::TextDisabled("(password)"); }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(r.game);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d / %d", r.players, r.max_players);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(r.owner);
+                ImGui::TableNextColumn();
+                bool full = r.max_players && r.players >= r.max_players;
+                ImGui::BeginDisabled(full || s == UI_ROOM_JOINING);
+                if (ImGui::SmallButton(full ? "Full" : "Join")) pick = true;
+                ImGui::EndDisabled();
+                if (pick && !full) want_join(r.address, r.port, r.password, r.name);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::SeparatorText("Direct connect");
+        ImGui::SetNextItemWidth(260);
+        ImGui::InputTextWithHint("##direct", "host or host:port (24872)", direct_buf, sizeof direct_buf);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160);
+        ImGui::InputTextWithHint("##dpw", "password (if any)", direct_pw, sizeof direct_pw, ImGuiInputTextFlags_Password);
+        ImGui::SameLine();
+        char host[128];
+        uint16_t port;
+        ImGui::BeginDisabled(s == UI_ROOM_JOINING || !host_port(direct_buf, host, sizeof host, &port));
+        if (ImGui::Button("Join##direct")) {
+            if (H->in_session()) {
+                want_join(host, port, true, host);
+                snprintf(pw_buf, sizeof pw_buf, "%s", direct_pw);
+            } else
+                H->room_join(host, port, direct_pw);
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
+    if (!open) rooms_open = false;
+}
+
 static void menu_bar() {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("Options")) {
@@ -666,6 +850,17 @@ static void menu_bar() {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Manage mods...")) mods_open = true;
+        ImGui::EndMenu();
+    }
+    if (H->netplay && ImGui::BeginMenu("Multiplayer")) {
+        int s = H->room_state();
+        const char *m = H->room_message();
+        if (s == UI_ROOM_JOINED) ImGui::MenuItem(m, nullptr, false, false);
+        else if (s == UI_ROOM_JOINING) ImGui::MenuItem("Joining...", nullptr, false, false);
+        else ImGui::MenuItem("Not in a room", nullptr, false, false);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Rooms...")) rooms_open = true;
+        if (ImGui::MenuItem("Leave the room", nullptr, false, s == UI_ROOM_JOINED)) want_leave();
         ImGui::EndMenu();
     }
     const char *hint = "Esc frees the mouse  |  click the game to play";
@@ -762,7 +957,9 @@ EXPORT void nxui_draw(const NxModFrame *f) {
         if (bar_visible(SDL_GetTicks())) menu_bar();
         if (opt_open) window_options();
         if (mods_open) window_mods();
+        if (H->netplay && rooms_open) window_rooms();
         H->mods_ui();
+        if (H->netplay) room_modal();
     }
     menu_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
     ImGui::Render();

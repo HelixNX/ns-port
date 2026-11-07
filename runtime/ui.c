@@ -17,6 +17,17 @@
 #include <windows.h>
 
 void input_release_mouse(SDL_WindowID id);
+#ifdef NX_NETPLAY                                       /* net/netmenu.c, net/browser.c */
+int netmenu_state(void);
+const char *netmenu_message(void);
+void netmenu_join(const char *host, uint16_t port, const char *password);
+void netmenu_leave(void);
+bool netmenu_in_session(void);
+void netmenu_lobby_refresh(void);
+int netmenu_lobby(UiRoom *out, int max, bool *loading, char *err, size_t errn);
+void netplay_nickname(char *out, size_t n);
+bool netplay_set_nickname(const char *nick);
+#endif
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
 
@@ -75,6 +86,11 @@ bool ui_init(SDL_Window *window) {
         .mods_files = mods_files, .mods_windows = mods_windows, .mods_window_toggle = mods_window_toggle,
         .mods_set_enabled = mods_set_enabled, .mods_any_window_open = mods_any_window_open, .mods_ui = mods_ui,
         .theme = NX_UI_THEME, .setting = options_get, .set_setting = options_set,
+#ifdef NX_NETPLAY
+        .netplay = true, .room_state = netmenu_state, .room_message = netmenu_message, .room_join = netmenu_join,
+        .room_leave = netmenu_leave, .in_session = netmenu_in_session, .lobby_refresh = netmenu_lobby_refresh,
+        .lobby = netmenu_lobby, .nickname = netplay_nickname, .set_nickname = netplay_set_nickname,
+#endif
     };
     if (!init || !dll_imgui || !dll_event || !dll_tick || !dll_toggle || !dll_show || !dll_wants_kb || !dll_active ||
         !dll_draw || !init(&h)) {

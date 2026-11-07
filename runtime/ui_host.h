@@ -7,12 +7,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "mods_list.h"                      /* nxmod.h (SDL, Vulkan types, NxModFrame) and the mod lists */
+#include "net/uiroom.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define NXUI_VERSION 2
+#define NXUI_VERSION 3
 
 typedef struct UiHost {
     uint32_t version;                       /* NXUI_VERSION */
@@ -70,6 +71,17 @@ typedef struct UiHost {
     const char *theme;
     const char *(*setting)(const char *key, const char *def);
     void (*set_setting)(const char *key, const char *value);
+    /* version 3: rooms during play (net/netmenu.c; netplay false: a build without NETPLAY, no Multiplayer menu) */
+    bool netplay;
+    int (*room_state)(void);                /* UI_ROOM_* (net/uiroom.h) */
+    const char *(*room_message)(void);      /* the room's name, what is being joined, or why it failed */
+    void (*room_join)(const char *host, uint16_t port, const char *password);  /* in the background */
+    void (*room_leave)(void);
+    bool (*in_session)(void);               /* a local session is in progress: leaving ends it */
+    void (*lobby_refresh)(void);
+    int (*lobby)(UiRoom *out, int max, bool *loading, char *err, size_t errn);
+    void (*nickname)(char *out, size_t n);
+    bool (*set_nickname)(const char *nick); /* false: not 4-20 of letters, digits, space . _ - */
 } UiHost;
 
 /* nxui.dll's exports */

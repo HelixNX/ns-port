@@ -395,7 +395,10 @@ bool room_join(const char *hostname, u16 port, const char *nick, const char *pas
     return true;
 }
 
+/* also before a join (switching rooms during play, the menu's Multiplayer): the services hear it as a lost
+ * connection (a local session in progress ends as if out of range; ldn_net.c) */
 void room_leave(void) {
+    bool had = loop_thread != NULL;
     if (loop_thread) {
         stopping = true;
         WaitForSingleObject(loop_thread, INFINITE);
@@ -405,6 +408,11 @@ void room_leave(void) {
     drop_connection();
     joined = false;
     memset(fake_ip, 255, 4);
+    if (had) {
+        hlog(0, "room: left \"%s\"", room_title);
+        room_title[0] = 0;
+        if (disconnect_handler) disconnect_handler();
+    }
 }
 
 /* ---------------------------------------------------------------------------------------------- sending */

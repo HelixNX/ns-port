@@ -224,6 +224,14 @@ static void on_ldn(const NetLdnPacket *p) {
     LeaveCriticalSection(&lk);
 }
 
+/* the menu (net/netmenu.c): a local session is in progress (hosting with the network up, or joined to one) */
+bool ldn_net_in_session(void) {
+    EnterCriticalSection(&lk);
+    bool r = state == ST_AP_CREATED || state == ST_STATION_CONNECTED;
+    LeaveCriticalSection(&lk);
+    return r;
+}
+
 static void on_room_lost(void) {
     EnterCriticalSection(&lk);
     if (state == ST_STATION_CONNECTED) {

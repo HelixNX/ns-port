@@ -79,7 +79,7 @@ list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 #   vcpkg (x64-windows: `vcpkg install enet zstd`): the vcpkg SDL3 came from, then $VCPKG_ROOT and
 #   $VCPKG_INSTALLATION_ROOT; DLLs go next to the exe
 #   deps/enet (v1.3.18) and deps/zstd (v1.5.6, lib/ only), built from source
-set(NX_NETPLAY_SOURCES net/room.c net/lobby.c net/browser.c services/ldn_net.c services/bsd.c)
+set(NX_NETPLAY_SOURCES net/room.c net/lobby.c net/browser.c net/netmenu.c services/ldn_net.c services/bsd.c)
 list(TRANSFORM NX_NETPLAY_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # defines nx_enet and nx_zstd; NX_NETPLAY_DLLS lists DLLs to copy next to the exe
