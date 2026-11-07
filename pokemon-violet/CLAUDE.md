@@ -61,7 +61,9 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
   in game:** F8 "Spawn \<species\> on me" and the row spawn fix (a kept native entry crashed the game; now found again
   at spawn time), held items, the no-battles toggle, the rest of the wild spec (shiny, IVs, moves, Tera on a caught
   one). **The new menu (2026-11-07)**: built and it loads (nxui.dll, the three mods as separate DLLs, ImGui on the
-  swapchain; a 45 s unattended run); nothing in it clicked yet.
+  swapchain; a 45 s unattended run). **User-checked 2026-11-07: joining a room from the menu after an offline start works**
+  (it first crashed: ldn:u / bsd:u were chosen once at start-up, the offline stub when not in a room; now NETPLAY builds
+  always register the room-backed ones, which answer as airplane mode until a room is joined).
 
 ## Open (the user's list, in order)
 
