@@ -22,7 +22,9 @@ function Show-Help {
            (no -Room: starts offline, rooms are in the game's menu; other options pass through: -Log 2, ...)
 
   Local play
-    room   [violet|mk8] [-Name "..."] [-Password pw] [-Port 24872]   host a room (builds it the first time)
+    room   [violet|mk8] [-Name "..."] [-Password pw] [-Port 24872] [-Beacon]
+                                   host a room (builds it the first time); -Beacon: the beacon too (the room
+                                   in a window of its own, closed when the beacon stops)
     beacon [ldnbeacon options]     a real Switch into the room on 127.0.0.1:24872 through the ESP32-S3;
                                    log and pcap go to ldn-beacon\captures\<time>\
 
@@ -82,6 +84,20 @@ function Build-Project([string]$name) {
     if ($LASTEXITCODE) { throw "the $name build failed" }
 }
 
+# the beacon (ldn-beacon\build\ldnbeacon.exe), into the room at 127.0.0.1:<port> unless --room is given
+function Start-Beacon([string[]]$a, [string]$port = '24872') {
+    if (-not $a) { $a = @() }
+    $exe = "$ws\ldn-beacon\build\ldnbeacon.exe"
+    if (-not (Test-Path $exe)) { Build-Project 'beacon' }
+    $run = "$ws\ldn-beacon\captures\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    New-Item -ItemType Directory -Force $run | Out-Null
+    if ($a -notcontains '--room') { $a = @('--room', "127.0.0.1:$port") + $a }
+    if ($a -notcontains '--pcap') { $a += @('--pcap', "$run\beacon.pcap") }
+    "log: $run\beacon.log"
+    Push-Location "$ws\ldn-beacon"
+    try { & $exe @a 2>&1 | Tee-Object -FilePath "$run\beacon.log" } finally { Pop-Location }
+}
+
 switch ($What) {
     { $_ -in 'violet', 'mk8' } { Start-Game $What (@($Target) + $Rest | Where-Object { $_ }) }
 
@@ -96,21 +112,19 @@ switch ($What) {
                    '--game-id', $g.id, '--game', $g.title)
         $pw = Get-Opt $a '-Password'
         if ($pw) { $args2 += @('--password', $pw) }
-        & $exe @args2
+        if ($a -notcontains '-Beacon') { & $exe @args2; break }
+        # the room in its own window, the beacon here; stopping the beacon (Ctrl+C) closes the room too
+        $quoted = $args2 | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }
+        $proc = Start-Process -FilePath $exe -ArgumentList $quoted -WorkingDirectory "$ws\room\build" -PassThru
+        Start-Sleep -Milliseconds 800
+        if ($proc.HasExited) { throw "the room server stopped at once (exit $($proc.ExitCode)): is the port in use?" }
+        "room: $($args2[3]) on UDP $($args2[1]) (its own window)"
+        if (-not (Test-Path "$ws\ldn-beacon\build\ldnbeacon.exe")) { Build-Project 'beacon' }
+        try { Start-Beacon @() $args2[1] }
+        finally { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -Confirm:$false } }
     }
 
-    'beacon' {
-        $a = @(@($Target) + $Rest | Where-Object { $_ })
-        $exe = "$ws\ldn-beacon\build\ldnbeacon.exe"
-        if (-not (Test-Path $exe)) { Build-Project 'beacon' }
-        $run = "$ws\ldn-beacon\captures\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        New-Item -ItemType Directory -Force $run | Out-Null
-        if ($a -notcontains '--room') { $a = @('--room', '127.0.0.1:24872') + $a }
-        if ($a -notcontains '--pcap') { $a += @('--pcap', "$run\beacon.pcap") }
-        "log: $run\beacon.log"
-        Push-Location "$ws\ldn-beacon"
-        try { & $exe @a 2>&1 | Tee-Object -FilePath "$run\beacon.log" } finally { Pop-Location }
-    }
+    'beacon' { Start-Beacon (@(@($Target) + $Rest | Where-Object { $_ })) }
 
     'build' { Build-Project $Target }
 
