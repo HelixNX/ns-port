@@ -608,7 +608,6 @@ a second backend next to the room. Not started: needs the adapter.
    player hosts, guests join; guests get the boss from the host as with public raid bots) may need nothing.
 5. **The two F12 captures from 2026-11-06 14:32 / 14:33** (`build/frames/frame_49186*`, `frame_55343*`): one is the
    missing-letters text, one the rain (the user to say which). See "Rain" and the glyph-atlas notes above.
-- Dropped by the user: an obedience patch (Eternatus disobeys above the badge level cap).
 - `pokedata_lc_array.bin`: trinity.py's Oodle decode fails on it (not looked into).
 
 ## Next (written 2026-10-22, updated 2026-10-31)
