@@ -1,4 +1,4 @@
-/* Item giver (F7), part of the raids mod's DLL (one ImGui context for both windows).
+/* Item giver: a mod of its own (violet_items.dll, optional), window "Items" (F7 by default; Options > Controls > Hotkeys).
  *
  * The bag lives in the save's item block (PKHeX: KItem 0x21C9BD44), which the game keeps current in memory:
  * 3,000 entries of 0x10 bytes indexed by item id, each {u32 pocket, u32 count, u32 flags, u32 0}; flags bit 0 new,
@@ -16,7 +16,6 @@
  * it from the start) with every held item in its own pocket, as the raid blocks are. Item names and pockets:
  * <build>\mods\items.txt, lines of "id \t pocket \t name" (violetrecomp\tools\svedit `items`, PKHeX.Core, for now;
  * to come from the game's own item data). */
-#include "items.h"
 #include "filtercombo.h"
 #include "modkit.h"
 #include <atomic>
@@ -270,7 +269,7 @@ void items_ui() {
     if (!g_open) return;
     ImGui::SetNextWindowSize(ImVec2(620, 620), ImGuiCond_FirstUseEver);
     bool open = true;
-    if (!ImGui::Begin("Items (F7)", &open)) { ImGui::End(); if (!open) g_open = false; return; }
+    if (!ImGui::Begin("Items", &open)) { ImGui::End(); if (!open) g_open = false; return; }
     if (!open) g_open = false;
     if (!g_error.empty()) { ImGui::TextWrapped("%s", g_error.c_str()); ImGui::End(); return; }
 
@@ -369,4 +368,18 @@ void items_ui() {
         if (!g_status.empty()) ImGui::TextWrapped("%s", g_status.c_str());
     }
     ImGui::End();
+}
+
+/* ---------------------------------------------------------------------------------------------- the mod */
+static void mod_ui() { items_ui(); }
+
+static const NxMod mod = {"Items", nullptr, nullptr, nullptr, "1", "Give, set or take away bag items through the game's own bag code (shows at once), with a Lua console in the game's VM. Needs build\\mods\\items.txt (svedit items).", mod_ui};
+
+extern "C" __declspec(dllexport) const NxMod *nx_mod_init(const NxModHost *host) {
+    if (host->version != NXMOD_VERSION) return NULL;
+    if (strcmp(host->title_id, "01008F6008C5E000") && strcmp(host->title_id, "0100A3D008C5C000")) return NULL;
+    if (!modkit::init(host, "items")) return NULL;
+    items_init(host->cache_dir);
+    modkit::window("Items", "F7", items_open, items_toggle);
+    return &mod;
 }

@@ -1,4 +1,5 @@
-/* Tera raid editor (a mod: nxrecomp/runtime/nxmod.h, ImGui through nxrecomp/modkit). F6 shows it.
+/* Tera raid editor: a mod of its own (violet_raids.dll, optional; nxrecomp/runtime/nxmod.h, ImGui through nxrecomp/modkit),
+ * window "Tera Raids" (F6 by default).
  *
  * Raid dens live in the save's raid blocks, which the game keeps on its heap (PKHeX's RaidSpawnList9: Paldea
  * KTeraRaidPaldea 0xCAAC8800 = {u64 current seed, u64 tomorrow seed} + 72 dens; KTeraRaidDLC 0x100B93DA = 100
@@ -17,10 +18,8 @@
  * types). The tables come from the game's files (raiddata.py -> <build>\mods\raids.dat).
  *
  * The finder searches seeds for a species (and shiny / Tera type) and writes them into dens. The world's crystals
- * show a den's new raid once the area reloads. F7 opens the item giver (items.cpp) and F8 the mon spawner (mons.cpp) in
- * the same DLL. */
-#include "items.h"
-#include "mons.h"
+ * show a den's new raid once the area reloads. The item giver and the mon spawner are mods of their own
+ * (mods/items, mods/mons). */
 #include "filtercombo.h"
 #include "modkit.h"
 #include <algorithm>
@@ -441,7 +440,7 @@ static void stats_line(const Result &r) {
 static void ui() {
     ImGui::SetNextWindowSize(ImVec2(900, 640), ImGuiCond_FirstUseEver);
     bool open = true;
-    if (!ImGui::Begin("Tera Raids (F6)", &open)) { ImGui::End(); if (!open) g_open = false; return; }
+    if (!ImGui::Begin("Tera Raids", &open)) { ImGui::End(); if (!open) g_open = false; return; }
     if (!open) g_open = false;
     if (!D.loaded) { ImGui::TextWrapped("%s", D.error.c_str()); ImGui::End(); return; }
 
@@ -622,45 +621,24 @@ static void ui() {
 }
 
 /* ---------------------------------------------------------------------------------------------- the mod */
-static bool any_open() { return g_open || items_open() || mons_open(); }
-
-static bool mod_event(const SDL_Event *e) {
-    if (e->type == SDL_EVENT_KEY_DOWN && (e->key.scancode == SDL_SCANCODE_F6 || e->key.scancode == SDL_SCANCODE_F7 ||
-                                          e->key.scancode == SDL_SCANCODE_F8)) {
-        if (!e->key.repeat) {
-            if (e->key.scancode == SDL_SCANCODE_F6) {
-                g_open = !g_open;
-                if (g_open && D.loaded) scan_start();   /* every time it opens: the dens move between loads */
-            } else if (e->key.scancode == SDL_SCANCODE_F7) items_toggle();
-            else mons_toggle();
-        }
-        modkit::set_open(any_open());
-        return true;
-    }
-    modkit::set_open(any_open());           /* after a window's close button (render thread): SDL calls here */
-    return modkit::event(e, any_open());
+static bool is_open() { return g_open; }
+static void toggle() {
+    g_open = !g_open;
+    if (g_open && D.loaded) scan_start();       /* every time it opens: the dens move between loads */
 }
+static void mod_ui() { if (g_open) ui(); }
 
-static bool mod_wants_input(void) { return any_open(); }
-
-static void mod_draw(const NxModFrame *f) {
-    if (!any_open() || !modkit::begin(f)) return;
-    if (g_open) ui();
-    items_ui();
-    mons_ui();
-    modkit::end(f);
-}
-
-static const NxMod mod = {"Tera raids", mod_event, mod_wants_input, mod_draw};
+static const NxMod mod = {"Tera raids", nullptr, nullptr, nullptr, "1",
+                          "Find raid seeds for a species (shiny, Tera type) and write them into the world's dens. "
+                          "Needs build\\mods\\raids.dat (mods\\raids\\raiddata.py).", mod_ui};
 
 extern "C" __declspec(dllexport) const NxMod *nx_mod_init(const NxModHost *host) {
     if (host->version != NXMOD_VERSION) return NULL;
     if (strcmp(host->title_id, "01008F6008C5E000") && strcmp(host->title_id, "0100A3D008C5C000")) return NULL;
     g_rom = strcmp(host->title_id, "0100A3D008C5C000") ? 2 : 1;
-    modkit::init(host, "raids");
+    if (!modkit::init(host, "raids")) return NULL;
     load_data(host->cache_dir);
-    items_init(host->cache_dir);
-    mons_init(host->cache_dir);
+    modkit::window("Tera Raids", "F6", is_open, toggle);
     if (!D.loaded) host->log(0, "raids: %s", D.error.c_str());
     else host->log(1, "raids: %zu raid table entries, %s", D.raids.size(), g_rom == 2 ? "Violet" : "Scarlet");
     return &mod;

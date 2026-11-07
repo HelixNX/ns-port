@@ -1,4 +1,5 @@
-/* Mon spawner (F8), part of the raids mod's DLL: a Pokemon made to order, written into the first free box slot.
+/* Mon spawner: a mod of its own (violet_mons.dll, optional), window "Spawn a Pokemon" (F8 by default): a Pokemon made to
+ * order, written into the first free box slot.
  *
  * The boxes are the save's box block (PKHeX: KBox 0x0D66012C), which the game keeps in memory and reads when the box
  * screen opens: 990 slots of 0x158 bytes, each an encrypted PK9 (empty slots too: an encrypted blank). We write our
@@ -18,7 +19,6 @@
  * The block is found by scanning guest memory for 960+ consecutive slots whose checksums hold (the window scans each
  * time it opens). The trainer (OT name, ids, language) is copied from the most common one in the boxes.
  * Tables: <build>\mods\mons_*.txt (svedit `monsdata`, PKHeX.Core's personal / move / experience data). */
-#include "mons.h"
 #include "filtercombo.h"
 #include "modkit.h"
 #include <algorithm>
@@ -1001,7 +1001,7 @@ void mons_ui() {
     if (!g_open) return;
     ImGui::SetNextWindowSize(ImVec2(640, 700), ImGuiCond_FirstUseEver);
     bool open = true;
-    if (!ImGui::Begin("Spawn a Pokemon (F8)", &open)) { ImGui::End(); if (!open) g_open = false; return; }
+    if (!ImGui::Begin("Spawn a Pokemon", &open)) { ImGui::End(); if (!open) g_open = false; return; }
     if (!open) g_open = false;
     if (!g_error.empty()) { ImGui::TextWrapped("%s", g_error.c_str()); ImGui::End(); return; }
 
@@ -1329,4 +1329,18 @@ extern "C" __declspec(dllexport) int mons_wild_selftest(const char *cache_dir, c
     fwrite(mem.data(), 1, mem.size(), f);
     fclose(f);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------- the mod */
+static void mod_ui() { mons_ui(); }
+
+static const NxMod mod = {"Spawn a Pokemon", nullptr, nullptr, nullptr, "1", "Write a made-to-order Pokemon into the boxes, make wild spawns a chosen species, spawn groups on the player, list and weight the area's spawns. Needs build\\mods\\mons_*.txt (svedit monsdata) and the wild hooks in the exe.", mod_ui};
+
+extern "C" __declspec(dllexport) const NxMod *nx_mod_init(const NxModHost *host) {
+    if (host->version != NXMOD_VERSION) return NULL;
+    if (strcmp(host->title_id, "01008F6008C5E000") && strcmp(host->title_id, "0100A3D008C5C000")) return NULL;
+    if (!modkit::init(host, "mons")) return NULL;
+    mons_init(host->cache_dir);
+    modkit::window("Spawn a Pokemon", "F8", mons_open, mons_toggle);
+    return &mod;
 }
