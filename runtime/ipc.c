@@ -200,13 +200,13 @@ void services_init(const char *game_dir, const char *save_dir) {
     nifm_register();
     friends_register();
 #ifdef NX_NETPLAY
-    /* in a room (net/browser.c): local wireless and sockets on its network; otherwise both stay unavailable */
-    if (room_joined()) {
-        ldn_net_register(game_dir);
-        bsd_register();
-    } else
-#endif
+    /* local wireless and sockets on a room's network, whether or not a room is joined yet: rooms are joined, switched
+     * and left during play (the menu's Multiplayer); without one, ldn:u's Initialize answers as in airplane mode */
+    ldn_net_register(game_dir);
+    bsd_register();
+#else
     ldn_register();
+#endif
     bcat_register();
     system_register();
     audout_register();
