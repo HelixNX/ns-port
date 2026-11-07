@@ -1,26 +1,19 @@
-/* modkit: Dear ImGui for mods (runtime/nxmod.h), drawn over the game.
+/* modkit: Dear ImGui for mods (runtime/nxmod.h, version 4). The runtime owns the ImGui context and draws its menu;
+ * a mod draws its windows into the same frame, from its ui() callback (render thread).
  *
- * The window's events arrive on the window thread and drawing happens on the render thread, so ImGui's own SDL3
- * backend (which calls SDL from NewFrame) is not used: event() queues what ImGui needs and begin() feeds it in on
- * the render thread. Rendering is ImGui's Vulkan backend with dynamic rendering into the swapchain image; its
- * uploads go to the runtime's queue under the runtime's queue lock.
- *
- *   nx_mod_init:  modkit::init(host, "my_mod");
- *   event():      return modkit::event(e, open);      // open: the mod's window shows (it then takes every key
- *                                                       // and mouse event, and the game gets no input)
- *   draw():       if (modkit::begin(f)) { ImGui::Begin(...) ...; modkit::end(f); }
- * modkit::set_open() (window thread) starts and stops SDL's text input and frees the mouse. */
+ *   nx_mod_init:  if (!modkit::init(host, "my_mod")) return NULL;     // the runtime's ImGui, or decline
+ *                 modkit::window("My window", "F6", my_is_open, my_toggle);   // Mods menu + a rebindable hotkey
+ *   ui():         if (my_is_open()) { ImGui::Begin("My window", &open) ...; ImGui::End(); }
+ * Opening a window frees the mouse; the game keeps its keyboard unless the window has keyboard focus. */
 #pragma once
 #include "nxmod.h"
 #include <imgui.h>
 
 namespace modkit {
 
-void init(const NxModHost *host, const char *name);  /* ImGui's settings go to <cache>\mods\<name>.ini */
+bool init(const NxModHost *host, const char *name);  /* false: an older runtime or a different ImGui: decline */
 const NxModHost *host();
-bool event(const SDL_Event *e, bool open);   /* window thread: true when it was used */
-void set_open(bool open);                     /* window thread: the UI shows (text input on, mouse freed) */
-bool begin(const NxModFrame *f);              /* render thread: a new ImGui frame (false: not ready) */
-void end(const NxModFrame *f);                /* render thread: render it into f->view */
+const char *name();
+bool window(const char *title, const char *default_key, bool (*is_open)(void), void (*toggle)(void));
 
 }  // namespace modkit

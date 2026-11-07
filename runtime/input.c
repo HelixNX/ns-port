@@ -1,12 +1,13 @@
 /* Input: the keyboard and the first gamepad (SDL3) as player 1's Pro Controller (services/hid.c).
  *
- * Keyboard: WASD = left stick, IJKL = right stick, arrows = D-pad (games give the D-pad its own actions, e.g.
- * Violet's emotes, so it is not also a stick), Z = A, X = B, C = X, V = Y, Q = L, R = R, 1 = ZL, 3 = ZR,
- * Enter = +, Backspace = -. Gamepads map by label (an Xbox pad's bottom button is A).
- * Mouse: the right stick while captured (a click in the window captures it, Esc or losing focus releases it): the
- * stick follows the mouse's smoothed speed, full at 1000 pixels a second times the sensitivity (options.c: the
- * options panel Esc opens, settings.ini, NX_MOUSE_SENS; default 1); below 150 pixels a second (a resting hand on a
- * high-resolution mouse) it stays centred. While the options panel is open the game gets no input.
+ * Bindings (input.h; the menu's Controls page rebinds them, settings.ini keeps them). Default keyboard: WASD = left
+ * stick, IJKL = right stick, arrows = D-pad (games give the D-pad its own actions, e.g. Violet's emotes, so it is
+ * not also a stick), Z = A, X = B, C = X, V = Y, Q = L, R = R, 1 = ZL, 3 = ZR, Enter = +, Backspace = -.
+ * Default gamepad: by label (an Xbox pad's bottom button is A); "by position" puts A on the right as on a Switch.
+ * Mouse: the right stick while captured (a click in the game captures it, Esc or losing focus releases it): the
+ * stick follows the mouse's smoothed speed, full at 1000 pixels a second times the sensitivity (settings.ini,
+ * NX_MOUSE_SENS; default 1); below the resting speed (150 pixels a second: a resting hand on a high-resolution
+ * mouse) it stays centred. The game gets no keyboard while the menu (ui.cpp) has keyboard focus.
  * NX_INPUT="first-last:A+B;..." holds buttons over ranges of presented frames (unattended runs);
  * "first-last/n:A" presses A for 3 frames every n frames (mashing through screens). Names: A B X Y
  * L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN (D-pad), LSLEFT LSUP LSRIGHT LSDOWN and RSLEFT ... (sticks)
@@ -14,14 +15,17 @@
  * recorded by hand, replayed unattended), on top of live input. */
 #include <math.h>
 #include "hos.h"
+#include "input.h"
 #include "options.h"
 #include "mods.h"
 #include <SDL3/SDL.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 void hid_set_input(int npad, u64 buttons, s32 lx, s32 ly, s32 rx, s32 ry);
 u64 gpu_frames(void);
+bool ui_wants_keyboard(void);
 
 enum {
     B_A = 1 << 0, B_B = 1 << 1, B_X = 1 << 2, B_Y = 1 << 3, B_LSTICK = 1 << 4, B_RSTICK = 1 << 5, B_L = 1 << 6,
@@ -31,24 +35,134 @@ enum {
     B_RS_LEFT = 1 << 20, B_RS_UP = 1 << 21, B_RS_RIGHT = 1 << 22, B_RS_DOWN = 1 << 23,
 };
 
-static SDL_Gamepad *pad;
-static bool mouse_captured;
-static float mouse_dx, mouse_dy;        /* motion since the last poll (window thread: events and polls alike) */
+/* ---------------------------------------------------------------------------------------------- bindings */
+static const u64 act_bit[ACT_COUNT] = {
+    B_A, B_B, B_X, B_Y, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LSTICK, B_RSTICK, B_LEFT, B_UP, B_RIGHT, B_DOWN,
+    B_LS_LEFT, B_LS_UP, B_LS_RIGHT, B_LS_DOWN, B_RS_LEFT, B_RS_UP, B_RS_RIGHT, B_RS_DOWN};
+static const char *const act_id[ACT_COUNT] = {
+    "a", "b", "x", "y", "l", "r", "zl", "zr", "plus", "minus", "lstick", "rstick", "dleft", "dup", "dright", "ddown",
+    "ls_left", "ls_up", "ls_right", "ls_down", "rs_left", "rs_up", "rs_right", "rs_down"};
+static const char *const act_label[ACT_COUNT] = {
+    "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+ (Plus)", "- (Minus)", "Left stick click", "Right stick click",
+    "D-pad left", "D-pad up", "D-pad right", "D-pad down", "Left stick left", "Left stick up", "Left stick right",
+    "Left stick down", "Right stick left", "Right stick up", "Right stick right", "Right stick down"};
+static const SDL_Scancode key_def[ACT_COUNT] = {
+    SDL_SCANCODE_Z, SDL_SCANCODE_X, SDL_SCANCODE_C, SDL_SCANCODE_V, SDL_SCANCODE_Q, SDL_SCANCODE_R, SDL_SCANCODE_1,
+    SDL_SCANCODE_3, SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_LEFT, SDL_SCANCODE_UP, SDL_SCANCODE_RIGHT, SDL_SCANCODE_DOWN,
+    SDL_SCANCODE_A, SDL_SCANCODE_W, SDL_SCANCODE_D, SDL_SCANCODE_S, SDL_SCANCODE_J, SDL_SCANCODE_I, SDL_SCANCODE_L,
+    SDL_SCANCODE_K};
+static const int pad_label[ACT_PAD_COUNT] = {
+    SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_WEST,
+    SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_LEFT_TRIGGER, PAD_RIGHT_TRIGGER,
+    SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+    SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_DOWN};
+static volatile SDL_Scancode keys[ACT_COUNT];
+static volatile int pads[ACT_PAD_COUNT];
+static volatile float deadzone = 6000.0f / 32767.0f;
 
-static void mouse_capture(SDL_WindowID id, bool on) {
-    SDL_Window *w = SDL_GetWindowFromID(id);
+const char *input_action_label(int a) { return a >= 0 && a < ACT_COUNT ? act_label[a] : ""; }
+SDL_Scancode input_key(int a) { return a >= 0 && a < ACT_COUNT ? keys[a] : SDL_SCANCODE_UNKNOWN; }
+void input_set_key(int a, SDL_Scancode k) {
+    if (a < 0 || a >= ACT_COUNT) return;
+    keys[a] = k;
+    char id[32];
+    snprintf(id, sizeof id, "key.%s", act_id[a]);
+    options_set(id, k == SDL_SCANCODE_UNKNOWN ? "" : SDL_GetScancodeName(k));
+}
+int input_pad(int a) { return a >= 0 && a < ACT_PAD_COUNT ? pads[a] : PAD_NONE; }
+static const char *pad_id(int b) {
+    return b == PAD_LEFT_TRIGGER ? "lefttrigger" : b == PAD_RIGHT_TRIGGER ? "righttrigger" :
+           b >= 0 ? SDL_GetGamepadStringForButton((SDL_GamepadButton)b) : "";
+}
+void input_set_pad(int a, int b) {
+    if (a < 0 || a >= ACT_PAD_COUNT) return;
+    pads[a] = b;
+    char id[32];
+    snprintf(id, sizeof id, "pad.%s", act_id[a]);
+    options_set(id, pad_id(b));
+}
+const char *input_pad_name(int b) {
+    switch (b) {
+    case PAD_NONE: return "(none)";
+    case PAD_LEFT_TRIGGER: return "Left trigger";
+    case PAD_RIGHT_TRIGGER: return "Right trigger";
+    case SDL_GAMEPAD_BUTTON_SOUTH: return "Bottom face button";
+    case SDL_GAMEPAD_BUTTON_EAST: return "Right face button";
+    case SDL_GAMEPAD_BUTTON_WEST: return "Left face button";
+    case SDL_GAMEPAD_BUTTON_NORTH: return "Top face button";
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "Left shoulder";
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "Right shoulder";
+    case SDL_GAMEPAD_BUTTON_START: return "Start / Menu";
+    case SDL_GAMEPAD_BUTTON_BACK: return "Back / View";
+    case SDL_GAMEPAD_BUTTON_GUIDE: return "Guide";
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "Left stick click";
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "Right stick click";
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return "D-pad left";
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: return "D-pad up";
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return "D-pad right";
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return "D-pad down";
+    default: { const char *s = SDL_GetGamepadStringForButton((SDL_GamepadButton)b); return s ? s : "?"; }
+    }
+}
+void input_reset_keys(void) { for (int a = 0; a < ACT_COUNT; a++) input_set_key(a, key_def[a]); }
+void input_reset_pad(bool nintendo) {
+    for (int a = 0; a < ACT_PAD_COUNT; a++) input_set_pad(a, pad_label[a]);
+    if (nintendo) {                     /* a Switch's A is on the right, B at the bottom, X on top, Y on the left */
+        input_set_pad(ACT_A, SDL_GAMEPAD_BUTTON_EAST);
+        input_set_pad(ACT_B, SDL_GAMEPAD_BUTTON_SOUTH);
+        input_set_pad(ACT_X, SDL_GAMEPAD_BUTTON_NORTH);
+        input_set_pad(ACT_Y, SDL_GAMEPAD_BUTTON_WEST);
+    }
+}
+float input_pad_deadzone(void) { return deadzone; }
+void input_set_pad_deadzone(float d) {
+    deadzone = d < 0 ? 0 : d > 0.5f ? 0.5f : d;
+    options_set_float("pad_deadzone", deadzone);
+}
+
+void input_init(void) {
+    char id[32];
+    for (int a = 0; a < ACT_COUNT; a++) {
+        snprintf(id, sizeof id, "key.%s", act_id[a]);
+        const char *v = options_get(id, NULL);
+        keys[a] = !v ? key_def[a] : !*v ? SDL_SCANCODE_UNKNOWN : SDL_GetScancodeFromName(v);
+    }
+    for (int a = 0; a < ACT_PAD_COUNT; a++) {
+        snprintf(id, sizeof id, "pad.%s", act_id[a]);
+        const char *v = options_get(id, NULL);
+        if (!v) pads[a] = pad_label[a];
+        else if (!*v) pads[a] = PAD_NONE;
+        else if (!strcmp(v, "lefttrigger")) pads[a] = PAD_LEFT_TRIGGER;
+        else if (!strcmp(v, "righttrigger")) pads[a] = PAD_RIGHT_TRIGGER;
+        else pads[a] = SDL_GetGamepadButtonFromString(v);
+    }
+    deadzone = options_get_float("pad_deadzone", 6000.0f / 32767.0f);
+}
+
+/* ---------------------------------------------------------------------------------------------- devices */
+static SDL_Gamepad *pad;
+static volatile bool mouse_captured;
+static float mouse_dx, mouse_dy;        /* motion since the last poll (window thread: events and polls alike) */
+SDL_Window *vk_window(void);
+
+static void mouse_capture(SDL_Window *w, bool on) {
     if (w && SDL_SetWindowRelativeMouseMode(w, on)) mouse_captured = on;
     mouse_dx = mouse_dy = 0;
 }
 
-/* options.c: Esc opens the options panel, which frees the mouse */
+bool input_mouse_captured(void) { return mouse_captured; }
+void input_capture_mouse(bool on) { if (on != mouse_captured) mouse_capture(vk_window(), on); }
+const char *input_pad_connected(void) { return pad ? SDL_GetGamepadName(pad) : NULL; }
+
+/* mods.c (a mod's host->release_mouse) */
 void input_release_mouse(SDL_WindowID id) {
-    if (mouse_captured) mouse_capture(id, false);
+    if (mouse_captured) mouse_capture(SDL_GetWindowFromID(id), false);
 }
 
 void input_event(const SDL_Event *e) {
-    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouse_captured) mouse_capture(e->button.windowID, true);
-    else if (e->type == SDL_EVENT_WINDOW_FOCUS_LOST && mouse_captured) mouse_capture(e->window.windowID, false);
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouse_captured) mouse_capture(SDL_GetWindowFromID(e->button.windowID), true);
+    else if (e->type == SDL_EVENT_WINDOW_FOCUS_LOST && mouse_captured) mouse_capture(SDL_GetWindowFromID(e->window.windowID), false);
     else if (e->type == SDL_EVENT_MOUSE_MOTION && mouse_captured) {
         mouse_dx += e->motion.xrel;
         mouse_dy += e->motion.yrel;
@@ -140,7 +254,8 @@ static bool replayed(u64 frame, u64 *b, s32 *lx, s32 *ly, s32 *rx, s32 *ry) {
 }
 
 void input_poll(void) {
-    if (options_is_open() || mods_want_input()) {       /* the panel (or a mod's window) has the keyboard and mouse */
+    bool no_keys = ui_wants_keyboard();                 /* the menu has keyboard focus (or a text box) */
+    if (mods_want_input()) {                            /* an older mod's window has the keyboard and mouse */
         mouse_dx = mouse_dy = 0;
         hid_set_input(0, 0, 0, 0, 0, 0);
         return;
@@ -148,45 +263,33 @@ void input_poll(void) {
     const bool *k = SDL_GetKeyboardState(NULL);
     u64 b = 0;
     s32 lx = 0, ly = 0, rx = 0, ry = 0;
-    static const struct { SDL_Scancode sc; u64 bit; } keys[] = {
-        {SDL_SCANCODE_Z, B_A}, {SDL_SCANCODE_X, B_B}, {SDL_SCANCODE_C, B_X}, {SDL_SCANCODE_V, B_Y},
-        {SDL_SCANCODE_Q, B_L}, {SDL_SCANCODE_R, B_R}, {SDL_SCANCODE_1, B_ZL}, {SDL_SCANCODE_3, B_ZR},
-        {SDL_SCANCODE_RETURN, B_PLUS}, {SDL_SCANCODE_BACKSPACE, B_MINUS},
-        {SDL_SCANCODE_LEFT, B_LEFT}, {SDL_SCANCODE_UP, B_UP}, {SDL_SCANCODE_RIGHT, B_RIGHT}, {SDL_SCANCODE_DOWN, B_DOWN},
-    };
-    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
-        if (k[keys[i].sc]) b |= keys[i].bit;
-    if (k[SDL_SCANCODE_A]) lx -= 32767;                /* the left stick on WASD, apart from the D-pad */
-    if (k[SDL_SCANCODE_D]) lx += 32767;
-    if (k[SDL_SCANCODE_W]) ly += 32767;
-    if (k[SDL_SCANCODE_S]) ly -= 32767;
-    if (k[SDL_SCANCODE_J]) rx -= 32767;
-    if (k[SDL_SCANCODE_L]) rx += 32767;
-    if (k[SDL_SCANCODE_I]) ry += 32767;
-    if (k[SDL_SCANCODE_K]) ry -= 32767;
+    if (!no_keys) {
+        for (int a = 0; a < ACT_LS_LEFT; a++)
+            if (keys[a] != SDL_SCANCODE_UNKNOWN && k[keys[a]]) b |= act_bit[a];
+        const struct { int a; s32 *v; s32 d; } dirs[] = {
+            {ACT_LS_LEFT, &lx, -32767}, {ACT_LS_RIGHT, &lx, 32767}, {ACT_LS_UP, &ly, 32767}, {ACT_LS_DOWN, &ly, -32767},
+            {ACT_RS_LEFT, &rx, -32767}, {ACT_RS_RIGHT, &rx, 32767}, {ACT_RS_UP, &ry, 32767}, {ACT_RS_DOWN, &ry, -32767}};
+        for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++)
+            if (keys[dirs[i].a] != SDL_SCANCODE_UNKNOWN && k[keys[dirs[i].a]]) *dirs[i].v += dirs[i].d;
+    }
     if (pad) {
-        static const struct { SDL_GamepadButton gb; u64 bit; } map[] = {
-            {SDL_GAMEPAD_BUTTON_SOUTH, B_A}, {SDL_GAMEPAD_BUTTON_EAST, B_B}, {SDL_GAMEPAD_BUTTON_NORTH, B_X},
-            {SDL_GAMEPAD_BUTTON_WEST, B_Y}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, B_L},
-            {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, B_R}, {SDL_GAMEPAD_BUTTON_START, B_PLUS},
-            {SDL_GAMEPAD_BUTTON_BACK, B_MINUS}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, B_LSTICK},
-            {SDL_GAMEPAD_BUTTON_RIGHT_STICK, B_RSTICK}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT},
-            {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT},
-            {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
-        };
-        for (size_t i = 0; i < sizeof map / sizeof *map; i++)
-            if (SDL_GetGamepadButton(pad, map[i].gb)) b |= map[i].bit;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) b |= B_ZL;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) b |= B_ZR;
+        for (int a = 0; a < ACT_PAD_COUNT; a++) {
+            int pb = pads[a];
+            bool on = pb == PAD_LEFT_TRIGGER ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000 :
+                      pb == PAD_RIGHT_TRIGGER ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000 :
+                      pb >= 0 && SDL_GetGamepadButton(pad, (SDL_GamepadButton)pb);
+            if (on) b |= act_bit[a];
+        }
         s32 ax = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
         s32 bx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), by = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
-        if (ax * ax + ay * ay > 6000 * 6000) { lx = axis(ax); ly = axis(-ay); }      /* SDL's y points down */
-        if (bx * bx + by * by > 6000 * 6000) { rx = axis(bx); ry = axis(-by); }
+        double dz = deadzone * 32767.0, dz2 = dz * dz;
+        if ((double)ax * ax + (double)ay * ay > dz2) { lx = axis(ax); ly = axis(-ay); }      /* SDL's y points down */
+        if ((double)bx * bx + (double)by * by > dz2) { rx = axis(bx); ry = axis(-by); }
     }
     {                                                   /* the mouse's speed (pixels a second), smoothed over ~50 ms */
         static float vx, vy;
         static u64 last;
-        float sens = options_mouse_sens();
+        float sens = options_mouse_sens(), rest = options_mouse_rest();
         u64 now = SDL_GetTicksNS();
         float dt = last ? (float)(now - last) * 1e-9f : 0.008f;
         last = now;
@@ -199,7 +302,8 @@ void input_poll(void) {
         mouse_dx = mouse_dy = 0;
         if (!mouse_captured) vx = vy = 0;
         float mx = vx * sens * (32767.0f / 1000.0f), my = -vy * sens * (32767.0f / 1000.0f);   /* y points down */
-        if (vx * vx + vy * vy > 150.0f * 150.0f) {
+        if (options_mouse_invert_y()) my = -my;
+        if (vx * vx + vy * vy > rest * rest) {
             rx = mx > 32767 ? 32767 : mx < -32767 ? -32767 : (s32)mx;
             ry = my > 32767 ? 32767 : my < -32767 ? -32767 : (s32)my;
         }

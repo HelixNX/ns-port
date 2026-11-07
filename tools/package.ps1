@@ -2,6 +2,9 @@
 # player's own NSPs and keys in game\, data under %LOCALAPPDATA%\<title>\), its DLLs, the shaders (translated
 # beforehand in shaders.pak, or the translator: an embeddable Python, translate.py, glslang) and the room server.
 # Usage: package.ps1 -Out <dir> [-ShaderPack <shaders.pak> | -PythonZip <python-3.x-embed-amd64.zip>] [-NoBuild]
+#                    [-Mods <name>,<name> | -Mods all]
+#   -Mods        mods to include (optional DLLs from <build>\cmake\mods, e.g. violet_raids), copied into mods\; their
+#                data files (game-derived) are not: players put them in %LOCALAPPDATA%\<title>\mods\
 #   (neither)    the default: every shader in the game's shader folder (<build>\shaders) translated now
 #                (translate.py --spv) and packed (nxshpack: tools/shader/pack.c) into <build>\shaders.pak, which goes
 #                next to the exe; no translator in the package. Built from the game's files, as the exe's lifted code is
@@ -9,7 +12,7 @@
 #   -PythonZip   Python's official "Windows embeddable package (64-bit)" (python.org), unpacked into translator\python:
 #                shaders translated on the player's PC as the game first uses them; glslang comes from
 #                %VULKAN_SDK%\Bin\glslangValidator.exe
-param([Parameter(Mandatory)] [string]$Out, [string]$ShaderPack, [string]$PythonZip, [switch]$NoBuild)
+param([Parameter(Mandatory)] [string]$Out, [string]$ShaderPack, [string]$PythonZip, [switch]$NoBuild, [string[]]$Mods = @())
 $ErrorActionPreference = 'Stop'
 if ($ShaderPack -and $PythonZip) { throw 'give -ShaderPack or -PythonZip, not both' }
 if ($ShaderPack -and -not (Test-Path $ShaderPack)) { throw "no $ShaderPack" }
@@ -83,6 +86,22 @@ if ($LASTEXITCODE) { throw 'the room server build failed' }
 Remove-Item "$Out\room\*.obj" -ErrorAction SilentlyContinue
 Copy-Item $vcrt $Out -Force
 Copy-Item $vcrt "$Out\room" -Force
+# mods: optional DLLs, only the ones asked for (each is built here; a stale folder from an earlier package is cleared)
+if (Test-Path "$Out\mods") { Remove-Item -Recurse -Force -Confirm:$false "$Out\mods" }
+if ($Mods.Count) {
+    if ($Mods -contains 'all') {
+        $Mods = @(Get-Content "$d\CMakeLists.txt" | Select-String -Pattern '^\s*nx_mod\((\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+    }
+    New-Item -ItemType Directory -Force "$Out\mods" | Out-Null
+    foreach ($m in $Mods) {
+        if (-not $NoBuild) {
+            cmd /c "`"$d\build.bat`" --target $m"
+            if ($LASTEXITCODE) { throw "the $m build failed" }
+        }
+        if (-not (Test-Path "$build\cmake\mods\$m.dll")) { throw "no mod $m (<build>\cmake\mods\$m.dll)" }
+        Copy-Item "$build\cmake\mods\$m.dll" "$Out\mods" -Force
+    }
+}
 
 $title = $cfg.title
 $shaders = if ($ShaderPack) { @"
@@ -113,10 +132,13 @@ first minutes of play stutter again).
 
 Controls: WASD moves, the mouse looks (click in the window to capture it), Z = A, X = B, C = X, V = Y, Q = L,
 R = R, 1 = ZL, 3 = ZR, Enter = +, Backspace = -, arrow keys = D-pad. A gamepad works too.
-Esc opens the options (mouse sensitivity, 30 or 60 fps, FPS counter, render scale 1-4x: 2x draws at 4K and is much
-smoother on a 1440p or 4K screen if your graphics card keeps up); Esc again closes them.
-F3 shows the frame rate. F12 captures the next frame into %LOCALAPPDATA%\$title\dumps: if something looks wrong,
-press it and send that folder's newest files with log.txt.
+Esc frees the mouse and shows the menu at the top of the window (F1 too): Options > Video (30 or 60 fps, render
+scale 1-4x: 2x draws at 4K and is much smoother on a 1440p or 4K screen if your graphics card keeps up, FPS counter,
+fullscreen) and Options > Controls (every key and gamepad button, the mouse, the hotkeys). Click the game to play on.
+Alt+Enter switches fullscreen. F3 shows the frame rate. F12 captures the next frame into
+%LOCALAPPDATA%\$title\dumps: if something looks wrong, press it and send that folder's newest files with log.txt.
+Mods (if this folder has a mods folder) are listed under the menu's Mods; each is a DLL in mods\: delete one to
+remove it.
 
 Multiplayer (local play, Union Circle, Tera raids) goes through a room server that relays the game's traffic: one
 player runs room\room_server.exe (UDP port 24872), everyone else picks that address in the room browser when the

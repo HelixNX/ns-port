@@ -4,6 +4,7 @@
 # LIFTED_DIR (written by tools/lifter/a64lift.py), and nx_mod(<name> SOURCES ...) for mods (DLLs, runtime/nxmod.h).
 # Configure from a vcvars64 shell with clang-cl and Ninja.
 set(NX_ROOT "${CMAKE_CURRENT_LIST_DIR}")
+enable_language(CXX)                        # the menu (ui/nxui.cpp) and mods are C++
 set(NX_DEPS "${NX_ROOT}/../deps")
 # third-party locations, found in this order (each can be set on the cmake command line instead):
 #   Vulkan headers: deps/Vulkan-Headers, then the Vulkan SDK ($VULKAN_SDK)
@@ -70,7 +71,7 @@ set(NX_RUNTIME_SOURCES
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
-    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c mods.c movie.c swkbd.c)
+    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c mods.c ui.c movie.c swkbd.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
@@ -258,7 +259,8 @@ function(nx_game)
                            "${_dll}" "$<TARGET_FILE_DIR:nxshpack>")
     endforeach()
 
-    # the game: the runtime (kernel, SVCs, services) around the lifted code
+    # the menu (nxui.dll), then the game: the runtime (kernel, SVCs, services) around the lifted code
+    nx_ui_dll()
     nx_game_exe(${NX_NAME} OFF)
     # the same for players (NX_PACKAGE: the game read from their own NSPs in game\, data under %LOCALAPPDATA%, no
     # console, no developer keys), named after the game; built on request (`--target <name>_pkg`, package.ps1)
@@ -293,6 +295,7 @@ function(nx_game_exe target package)
     # /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
     # /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)
     target_link_options(${target} PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO /MAP)
+    add_dependencies(${target} nxui)            # loaded at run time from next to the exe (ui.c)
     if(package)
         target_compile_definitions(${target} PRIVATE NX_PACKAGE)
         target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
@@ -308,12 +311,9 @@ function(nx_game_exe target package)
     endif()
 endfunction()
 
-# A mod (runtime/nxmod.h): a DLL built into <build>/mods, which the runtime loads from mods\ next to the exe, with
-# Dear ImGui through modkit/. ImGui comes from vcpkg (x64-windows: `vcpkg install imgui[vulkan-binding]`), in the
-# vcpkg tree SDL3 came from, then $VCPKG_ROOT and $VCPKG_INSTALLATION_ROOT. Needs the CXX language in project().
-#   nx_mod(<name> SOURCES <files>)
-function(nx_mod name)
-    cmake_parse_arguments(M "" "" "SOURCES" ${ARGN})
+# Dear ImGui (the menu, nxui.dll, and mods) from vcpkg (x64-windows: `vcpkg install imgui[vulkan-binding]`), in the
+# vcpkg tree SDL3 came from, then $VCPKG_ROOT and $VCPKG_INSTALLATION_ROOT. Sets NX_IMGUI_BASE.
+function(nx_imgui_find)
     if(NOT NX_IMGUI_BASE)
         get_filename_component(_sdl_base "${NX_SDL3_INCLUDE}" DIRECTORY)
         set(_bases "${_sdl_base}")
@@ -330,10 +330,39 @@ function(nx_mod name)
             endif()
         endforeach()
         if(NOT NX_IMGUI_BASE)
-            message(FATAL_ERROR "mods need Dear ImGui: `vcpkg install imgui[vulkan-binding]` (x64-windows)")
+            message(FATAL_ERROR "the menu and mods need Dear ImGui: `vcpkg install imgui[vulkan-binding]` (x64-windows)")
         endif()
         message(STATUS "nxrecomp: Dear ImGui from ${NX_IMGUI_BASE}")
     endif()
+endfunction()
+
+# The menu over the game (ui/nxui.cpp, runtime/ui_host.h): a DLL next to the exe (ui.c loads it), with Dear ImGui and
+# its Vulkan backend. A DLL because the runtime's Vulkan function pointers have Vulkan's own names (vk.h).
+function(nx_ui_dll)
+    if(TARGET nxui)
+        return()
+    endif()
+    nx_imgui_find()
+    add_library(nxui SHARED "${NX_ROOT}/ui/nxui.cpp")
+    target_include_directories(nxui PRIVATE "${NX_VULKAN_INCLUDE}" "${NX_ROOT}/runtime" "${NX_SDL3_INCLUDE}"
+                               "${NX_IMGUI_BASE}/include")
+    target_compile_definitions(nxui PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(nxui PRIVATE /clang:-O2 /W3)
+    target_link_libraries(nxui PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_IMGUI_BASE}/lib/vulkan-1.lib"
+                          "${NX_SDL3_LIB}")
+    set_target_properties(nxui PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+                          LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    # the package's copy (package.ps1 takes the folder as it is)
+    add_custom_command(TARGET nxui POST_BUILD COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/package"
+                       COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:nxui>" "${CMAKE_BINARY_DIR}/package")
+endfunction()
+
+# A mod (runtime/nxmod.h): a DLL built into <build>/mods, which the runtime loads from mods\ next to the exe; it draws
+# into the menu's Dear ImGui through modkit/. Each mod is optional: one DLL each.
+#   nx_mod(<name> SOURCES <files>)
+function(nx_mod name)
+    cmake_parse_arguments(M "" "" "SOURCES" ${ARGN})
+    nx_imgui_find()
     add_library(${name} SHARED ${M_SOURCES} "${NX_ROOT}/modkit/modkit.cpp")
     # the Vulkan headers ahead of vcpkg's include folder, as the runtime has them
     target_include_directories(${name} PRIVATE "${NX_VULKAN_INCLUDE}" "${NX_ROOT}/runtime" "${NX_ROOT}/modkit"
@@ -341,8 +370,7 @@ function(nx_mod name)
     target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(${name} PRIVATE /clang:-O2 /W3)
     # ImGui's Vulkan backend was built with prototypes: vulkan-1.lib (the loader the runtime uses too)
-    target_link_libraries(${name} PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_IMGUI_BASE}/lib/vulkan-1.lib"
-                          "${NX_SDL3_LIB}")
+    target_link_libraries(${name} PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_SDL3_LIB}")
     set_target_properties(${name} PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mods"
                           LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mods")
 endfunction()

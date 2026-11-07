@@ -33,7 +33,11 @@ static SDL_Window *window;
 void input_event(const SDL_Event *e);
 void input_poll(void);
 #include "options.h"
+#include "input.h"
 #include "mods.h"
+#include "ui.h"
+
+SDL_Window *vk_window(void) { return window; }
 void gpu_capture_next(void);
 void gpu_reload_textures(void);
 void gpu_save_pipelines(void);
@@ -86,13 +90,15 @@ void window_init(void) {
 
 /* the host's main thread: window events until the guest's main thread ends or the window is closed */
 void window_loop(void *guest_main_thread) {
-    options_init();
+    options_init();                                     /* settings.ini, then the controls and the menu (ui.c) */
+    input_init();
+    ui_init(window);
     mods_load(window);
     for (;;) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 8)) {
             do {
-                bool used = options_event(&e);          /* Esc and the options panel's keys and clicks */
+                bool used = e.type != SDL_EVENT_QUIT && ui_event(&e);   /* Esc, the menu, rebinding, hotkeys */
                 if (!used && e.type != SDL_EVENT_QUIT) used = mods_event(&e);   /* then the mods' (mods.c) */
 #ifdef NX_PACKAGE                                       /* no input while the start-up's shaders are translated */
                 if (!gpu_shaders_starting())
@@ -105,15 +111,14 @@ void window_loop(void *guest_main_thread) {
                     ExitProcess(0);
                 }
                 if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) InterlockedExchange(&resized, 1);
-                /* F12: a capture of the next frame (players send it with log.txt when something looks wrong) */
-                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) gpu_capture_next();
-#ifndef NX_PACKAGE                                      /* developer keys: not in a package for players */
+                /* the menu, FPS counter, frame capture (F12) and frame rate keys are hotkeys (options.c, ui.c) */
+#ifndef NX_PACKAGE                                      /* developer key: not in a package for players */
                 if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F11 && !e.key.repeat) gpu_reload_textures();
-                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F5 && !e.key.repeat) nx_framerate_cycle();
 #endif
-                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) overlay_toggle();
             } while (SDL_PollEvent(&e));
         }
+        options_tick();                                 /* the menu's changes, applied here; settings.ini saved */
+        ui_tick();
 #ifdef NX_PACKAGE
         if (!gpu_shaders_starting())
 #endif
@@ -1210,37 +1215,23 @@ static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, 
                                 .imageOffset = {8, 8, 0}, .imageExtent = {OV_W, OV_H, 1}};
         vkCmdCopyBufferToImage(cmd, ov.buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     }
-    static VkBuf opt_buf[PRESENT_FRAMES];
-    if (options_is_open() && sw.extent.width >= OPT_W + 8 && sw.extent.height >= OPT_H + 8 &&
-        (sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB ||
-         sw.format == VK_FORMAT_R8G8B8A8_UNORM || sw.format == VK_FORMAT_R8G8B8A8_SRGB)) {
-        if (!opt_buf[f].buf)
-            vk_buffer(OPT_W * OPT_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &opt_buf[f]);
-        if (opt_buf[f].a.map) {
-            options_draw((u32 *)opt_buf[f].a.map);
-            image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                    .imageOffset = {(s32)(sw.extent.width - OPT_W) / 2, (s32)(sw.extent.height - OPT_H) / 2, 0},
-                                    .imageExtent = {OPT_W, OPT_H, 1}};
-            vkCmdCopyBufferToImage(cmd, opt_buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-        }
-    }
     if (msg_draw(f)) {
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageOffset = {8, (s32)sw.extent.height - MSG_H - 8, 0}, .imageExtent = {MSG_W, MSG_H, 1}};
         vkCmdCopyBufferToImage(cmd, msg_buf[f].buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     }
-    if (!sw.views[idx] && mods_draw_any()) {           /* made on first use: mods load on the window thread */
+    bool draw_ui = ui_active(), draw_mods = mods_draw_any();
+    if (!sw.views[idx] && (draw_ui || draw_mods)) {     /* made on first use */
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = dst,
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sw.format,
                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         VKCHECK(vkCreateImageView(vk.dev, &vi, NULL, &sw.views[idx]));
     }
-    if (sw.views[idx]) {                                /* mods draw last, over everything (mods.c) */
+    if (sw.views[idx] && (draw_ui || draw_mods)) {      /* the menu and mods' windows (ui.c), then mods' raw draws */
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        mods_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
+        if (draw_ui) ui_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
+        if (draw_mods) mods_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
