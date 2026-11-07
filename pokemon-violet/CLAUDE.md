@@ -571,7 +571,11 @@ action frames with OUI 00:22:AA); the .pcap is the reference for the daemon. The
     item 3 below (spawn-pool rules) can wrap those. ctx = `W[28]:FDCCDAF4C1D58AECA(pos)`; ctx[4] / ctx[5] force a
     DevID / form (the game's own forced-species path). Entry getters: f2BF366A2 DevID, fE15E9D0A form, f5B8A3FE2
     sex, f4646F546 / f61FD9277 level range. F8 lists the entries at the nearest point, spawns a chosen row (picker
-    overridden once on the instance), and sets weights (filter wrapped on the instance, K.__nx_w; lost when the
+    overridden once on the instance; the entry is found again by DevID / form at spawn time: returning one kept from
+    the listing crashed the game, 2026-11-07), spawns the species chosen at the top of F8 ("Spawn <species> on me":
+    the script maker C2B428A63695FD2C7.S988D7D0A4EEF693D wrapped for that one call; the member maker
+    F316E31E09886ADC9 calls it synchronously inside the group maker; the spec hook gets shiny / IVs / held item;
+    before, the only buttons spawned the area's own pick), and sets weights (filter wrapped on the instance, K.__nx_w; lost when the
     table instance is remade at save load: Apply again).
   - Contact battles: the mon AI's behaviour-tree nodes SetEnableEncount / SetEnableEncountBlackboard (type names
     main+2995db0 / 29954e0, vtables 4474d48 / 4474a00) call `main+1d0e5d4(component, enable)`, which stores a 1 / 0
