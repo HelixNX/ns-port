@@ -1315,3 +1315,35 @@ In order:
     Commits: nxrecomp `e122065` (translator), `abb28ce` (runtime fixes), `dda831d` (storage images), `8024860`
     (lifter jump tables), `576381c` (audren work buffer), `f408ac0` (debugging tools).
 
+## Event raids from "online" (in progress 2026-11-07; pick up here)
+
+The user wants event raids (and maybe outbreaks) that a console gets online. How the game gets them: Poke Portal
+News syncs Nintendo's BCAT delivery cache, then `BcatClient::ParseAndSave` (bcat_client.cpp; "BcatLoad Raid",
+"BcatLoad EncountOutbreak", "BcatLoad Stadium", "Bcat Sync", "bcat file load thread"; also
+mystery_gift_bcat_list.cpp) reads the cache files and stores them in save blocks, size-checked against
+`cmn::savedata::RaidSaveDataAccessor::kDeliveryRaid{Enemy,FixedRewardItem,LotteryRewardItem,Priority}DataSize`.
+Delivery file names (strings in dump/elf/main.elf, file offsets ~0x3c5c4e4-0x3c5c5a4):
+`raid/raid_enemy_array_3_0_0`, `raid/fixed_reward_item_array_3_0_0`, `raid/lottery_reward_item_array_3_0_0`,
+`raid/raid_priority_array_3_0_0`; outbreaks: kEncountOutbreakPokedataPath, kEncountOutbreakZone{Main,Su1,Su2}Path
+(and `world/data/encount/point_data/outbreak_point_data/outbreak_point_{main,su2}.bin|bfbs`). nn::bcat API used:
+MountDeliveryCacheStorage, DeliveryCacheDirectory Open/Read, DeliveryCacheFile Open/GetSize/Read,
+RequestSyncDeliveryCache + DeliveryCacheProgress. nxrecomp `runtime/services/bcat.c` is an empty stub (every Open
+-> not found, nothing syncs). Found with a throwaway string scan of main.elf (printable runs matching
+raid|bcat|delivery|outbreak; not kept).
+Save blocks (PKHeX.Core SaveBlockAccessor9SV): KBCATRaidEnemyArray 0520A1B0 (30,000 bytes), FixedRewardItemArray
+7D6C2B82 (27,456), LotteryRewardItemArray A52B4811 (53,464), PriorityArray 095451E4 (88), Identifier 37B99B4D (4),
+plus KBCATOutbreak* blocks. `build/bcat/*.bin` are the user's (all zero) dumps of the five raid blocks. Dens: content
+2 = event, 3 = 7-star.
+Routes (the user's choices so far):
+1. **A friend's homebrewed Switch** (the user's own has none): he opens Poke Portal (news downloads), saves, dumps
+   with JKSV / Checkpoint and sends the save. To write: an svedit command that copies the event blocks above (and the
+   outbreak ones) from his save into a backup-first copy of ours. Only those blocks are used. Waiting on the save.
+2. **Past and custom events, no downloads** (the user said yes; step 1 started): confirm the blocks hold the
+   delivered files as they are (sizes are fixed maximums; content likely FlatBuffers with the same raid schema as
+   `world/data/raid/raid_enemy_0N/*_array.bin`, which raiddata.py reads; look for the delivery schema's .bfbs in the
+   romfs, e.g. next to the raid tables, and check with tools/bfbs.py). Bosses of past events: PKHeX.Core's embedded
+   event lists (EncounterDist9 / EncounterMight9), already in the NuGet cache svedit uses. Then either serve
+   `build/bcat/delivery/raid/*_3_0_0` from bcat.c (the game parses and saves them itself; most faithful) or write the
+   blocks from the F6 mod / svedit, and point dens at content 2 / 3.
+Not wanted: fetching from Nintendo's servers. Downloading community archives of past event files: ask first.
+Multiplayer: joiners should get the boss from the host (unconfirmed), so only the host needs the event.

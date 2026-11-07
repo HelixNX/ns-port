@@ -78,7 +78,8 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 1. Try the F8 changes above; confirm the wild spec on a caught mon (overworld shiny vs battle shiny).
 2. Spawn-pool rules: wrap the encounter table's filter / per-entry rules (version, time, flags, weights; F8 weights
    are the first step), spawn density parameters. NOTES.md, "Planned next" item 3.
-3. Custom event raids (delivery blocks in the save, then a room broadcast). NOTES.md, "Planned next" item 4.
+3. **In progress: event raids** (past, custom, and a friend's homebrewed Switch save). Start from NOTES.md, the last section,
+   "Event raids from online" (delivery file names, save blocks, both routes, what is waiting).
 4. The two F12 captures of 2026-11-06 (missing letters, rain).
 5. Performance: NOTES.md, "Next (written 2026-10-22 ...)".
 
