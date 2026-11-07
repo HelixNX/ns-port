@@ -5,5 +5,6 @@
   "modules": [["main", "0x7100000000"], ["subsdk0", "0x7101400000"], ["sdk", "0x7101c00000"]],
   "dump": "../dump_v21",
   "analysis": "../build/analysis_305",
-  "build": "../build"
+  "build": "../build",
+  "theme": {"background": "#141416", "panel": "#24242a", "accent": "#e4002b", "accent2": "#ffd400", "text": "#f5f5f7", "rounding": 5}
 }
