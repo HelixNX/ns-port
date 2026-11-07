@@ -45,6 +45,8 @@ typedef struct VioletWild {
     u8 ev[6];
     u16 moves[4];               /* all 0: the species' level-up moves */
     u32 swap_pct;               /* wild spawns turned into this species: 0 none, 100 all */
+    u16 item;                   /* held item, 0 as rolled */
+    u16 pad;
 } VioletWild;
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -103,6 +105,7 @@ void h_wild_create(Ctx *c) {
     if (w.sex != 0xff) *(u16 *)(s + 0x30) = w.sex;
     if (w.nature != 0xffff) *(u16 *)(s + 0x32) = *(u16 *)(s + 0x34) = w.nature;
     if (w.ability != 0xff) s[0x36] = w.ability;
+    if (w.item) *(u16 *)(s + 0x2c) = w.item;
     int fixed = 0;
     for (int i = 0; i < 6; i++) {
         if (w.iv[i] != 0xff) { *(u16 *)(s + 0x38 + 2 * i) = w.iv[i]; fixed++; }

@@ -116,6 +116,7 @@ std::vector<Species> g_species;
 std::vector<Move> g_moves;
 std::map<u16, std::string> g_ability_names;
 std::vector<std::pair<u8, std::string>> g_balls;
+std::vector<std::pair<u16, std::string>> g_held;   /* items a mon can hold (items.txt, by name) */
 std::vector<u32> g_exp[6];
 struct Trainer { u16 tid = 0, sid = 0; u8 name[26] = {}; u8 gender = 0, language = 2, version = 51; u16 location = 6; bool ok = false; };
 Trainer g_save_trainer;                     /* mons_trainer.txt (svedit monsdata, from the save); else the boxes' */
@@ -163,6 +164,17 @@ void load_tables(const char *cache_dir) {
     std::sort(g_moves.begin(), g_moves.end(), [](const Move &a, const Move &b) { return a.name < b.name; });
     for (auto &r : read_tsv(d + "mons_abilities.txt")) if (r.size() >= 2) g_ability_names[(u16)atoi(r[0].c_str())] = r[1];
     for (auto &r : read_tsv(d + "mons_balls.txt")) if (r.size() >= 2) g_balls.push_back({(u8)atoi(r[0].c_str()), r[1]});
+    {   /* optional: no list, no held item choice */
+        std::string keep = g_error;
+        for (auto &r : read_tsv(d + "items.txt")) {
+            if (r.size() < 3) continue;
+            int pocket = atoi(r[1].c_str());     /* not TMs, picnic items, key items, materials */
+            if (pocket == 5 || pocket == 7 || pocket == 8 || pocket == 9) continue;
+            g_held.push_back({(u16)atoi(r[0].c_str()), r[2]});
+        }
+        std::sort(g_held.begin(), g_held.end(), [](const auto &a, const auto &b) { return a.second < b.second; });
+        g_error = keep;
+    }
     int g = 0;
     for (auto &r : read_tsv(d + "mons_exp.txt")) {
         if (g >= 6) break;
@@ -201,6 +213,7 @@ struct Spec {
     u16 moves[4] = {};
     int tera = -1;                  /* -1: the species' first type; 18: Stellar */
     u8 ball = 4;                    /* Poke Ball */
+    u16 item = 0;                   /* held item (0 none) */
     char nickname[13] = "";
 };
 
@@ -230,6 +243,7 @@ void build(const Spec &p, const Trainer &t, u8 *d) {
     else if (((pid >> 16) ^ lo ^ t.tid ^ t.sid) < 16) pid ^= 0x10000000;      /* not shiny by chance */
     wr32(d + 0x00, ec);
     wr16(d + 0x08, s.internal);
+    wr16(d + 0x0A, p.item);
     wr16(d + 0x0C, t.tid);
     wr16(d + 0x0E, t.sid);
     int lv = p.level < 1 ? 1 : p.level > 100 ? 100 : p.level;
@@ -596,9 +610,11 @@ struct VioletWild {
     u8 iv[6], ev[6];
     u16 moves[4];
     u32 swap_pct;
+    u16 item;                       /* 0 as rolled */
+    u16 pad;
 };
 #pragma pack(pop)
-static_assert(sizeof(VioletWild) == 40, "wild.c's VioletWild");
+static_assert(sizeof(VioletWild) == 44, "wild.c's VioletWild");
 typedef void (*WildSet)(const VioletWild *);
 
 WildSet wild_set_fn() {
@@ -627,6 +643,7 @@ bool wild_spec_apply(const Spec &p, int level, int shiny, bool all, int pct) {
         if (p.tera >= 0 && p.tera < 18) w.tera = (int8_t)p.tera;
         for (int i = 0; i < 6; i++) { w.iv[i] = (u8)p.iv[i]; w.ev[i] = (u8)p.ev[i]; }
         for (int i = 0; i < 4; i++) w.moves[i] = p.moves[i];
+        w.item = p.item;
     }
     f(&w);
     return true;
@@ -777,7 +794,7 @@ void area_done(void *, bool ok, const char *r) {
 }
 
 /* the entries allowed at a spawn point near the player, as the game's own filter lists them (unwrapped: the game's
- * weights); kept in K.__nx_area (0-based) for "Spawn on me" on a row */
+ * weights) */
 bool area_list() {
     const NxModHost *h = modkit::host();
     if (h->version < 3 || !h->run_script) return false;
@@ -791,10 +808,8 @@ bool area_list() {
            "local total = f(T, info, ctx, false, list, wts)\n"
            "local out = {'ok|' .. tostring(info.areaname or info.areano) .. '|' .. tostring(info.biome) .. '|' ..\n"
            "  tostring(info.min_level) .. '|' .. tostring(info.max_level) .. '|' .. tostring(total)}\n"
-           "K.__nx_area = {}\n"
            "for i = 0, list.length - 1 do\n"
            "  local e = list[i]\n"
-           "  K.__nx_area[i] = e\n"
            "  out[#out + 1] = get(e, 'f2BF366A2') .. '|' .. get(e, 'fE15E9D0A') .. '|' .. get(e, 'f5B8A3FE2') .. '|' ..\n"
            "    get(e, 'f4646F546') .. '|' .. get(e, 'f61FD9277') .. '|' .. tostring(wts[i])\n"
            "end\n"
@@ -808,12 +823,17 @@ void field_done(void *, bool ok, const char *r) {
     field_status(ok ? s : "Script error: " + s);
 }
 
-/* row: an index into K.__nx_area, or -1 for the game's own pick; dist: metres from the player */
-bool spawn_on_me(int row, float dist) {
+/* One group on the player (dist metres away). pick_dev >= 0: the area's entry with that DevID / form, found again
+ * at spawn time (an entry kept from an earlier listing is a native object that may be gone by then: using one
+ * crashed); if the point no longer allows it, the game picks. swap_dev >= 0: the members become that
+ * DevID / form (and level, if > 0) through the script maker (C2B428A63695FD2C7.S988D7D0A4EEF693D, called by the
+ * member maker F316E31E09886ADC9 inside the group maker), wrapped only for this one call. */
+bool spawn_on_me(float dist, int pick_dev = -1, int pick_form = 0, int swap_dev = -1, int swap_form = 0, int swap_lv = 0) {
     const NxModHost *h = modkit::host();
     if (h->version < 3 || !h->run_script) return false;
-    char head[160];
-    snprintf(head, sizeof head, "local row, dist = %d, %.2f\n", row, dist);
+    char head[200];
+    snprintf(head, sizeof head, "local dist, pdev, pform, sdev, sform, slv = %.2f, %d, %d, %d, %d, %d\n", dist, pick_dev,
+             pick_form, swap_dev, swap_form, swap_lv);
     std::string lua = FIELD_PRELUDE;
     lua += head;
     lua += "if W[17] ~= 0 then return '" NXMOD_SCRIPT_AGAIN "' end\n"
@@ -824,18 +844,41 @@ bool spawn_on_me(int row, float dist) {
            "local a = math.random() * 6.283185\n"
            "info.pos = {x + dist * math.cos(a), y, z + dist * math.sin(a)}\n"
            "local T = W[26]\n"
-           "if row >= 0 then\n"
-           "  local e = K.__nx_area and K.__nx_area[row]\n"
-           "  if e == nil then return 'error|list the area first' end\n"
-           "  T.FCEEA7F4134055567 = function() return e end\n"
+           "local found = false\n"
+           "if pdev >= 0 then\n"
+           "  T.FCEEA7F4134055567 = function(self, inf, rng, ctx, flag)\n"
+           "    T.FCEEA7F4134055567 = nil\n"
+           "    local list, wts = newarr(), newarr()\n"
+           "    local f = T.__nx_f2 or T.F2F6C7BBE115AFBCB\n"
+           "    f(T, inf, ctx, flag, list, wts)\n"
+           "    for i = 0, list.length - 1 do\n"
+           "      local e = list[i]\n"
+           "      if get(e, 'f2BF366A2') == pdev and get(e, 'fE15E9D0A') == pform then found = true; return e end\n"
+           "    end\n"
+           "    return T:FCEEA7F4134055567(inf, rng, ctx, flag)\n"
+           "  end\n"
+           "end\n"
+           "local C = C2B428A63695FD2C7\n"
+           "local maker = C and C.S988D7D0A4EEF693D\n"
+           "local swapped = 0\n"
+           "if sdev >= 0 and maker then\n"
+           "  C.S988D7D0A4EEF693D = function(m, dev, form, sex, lv, ...)\n"
+           "    swapped = swapped + 1\n"
+           "    if slv > 0 then lv = slv end\n"
+           "    return maker(m, sdev, sform, sex, lv, ...)\n"
+           "  end\n"
            "end\n"
            "local ok, made = pcall(W.F61D1ABB7697071EB, W, info)\n"
-           "if row >= 0 then T.FCEEA7F4134055567 = nil end\n"
+           "T.FCEEA7F4134055567 = nil\n"
+           "if sdev >= 0 and maker then C.S988D7D0A4EEF693D = maker end\n"
            "if not ok then g.bosses:resize(0); g.minions:resize(0); return 'error|the group maker failed: ' .. tostring(made) end\n"
            "if not made then g.bosses:resize(0); g.minions:resize(0); return 'error|the game refused this spot (no ground under the player, or no entry allowed here); try again or step aside' end\n"
            "local n = g.bosses.length + g.minions.length\n"
            "W:F9B7FBB66FA56765E(g)\n"
-           "return 'Spawned a group of ' .. n .. ' at ' .. string.format('%.1f', dist) .. ' m'\n";
+           "local how = ''\n"
+           "if sdev >= 0 then how = ' (' .. swapped .. ' made as the chosen species)' end\n"
+           "if pdev >= 0 and sdev < 0 and not found then how = ' (that entry is not allowed at this spot now: the game picked)' end\n"
+           "return 'Spawned a group of ' .. n .. ' at ' .. string.format('%.1f', dist) .. ' m' .. how\n";
     return h->run_script(lua.c_str(), field_done, nullptr);
 }
 
@@ -888,7 +931,7 @@ NoBattles no_battles_fn() {
 /* ---------------------------------------------------------------------------------------------- UI */
 std::atomic<bool> g_open;
 Spec g_spec;
-FilterCombo fc_species, fc_nature, fc_ability, fc_tera, fc_ball, fc_moves[4];
+FilterCombo fc_species, fc_nature, fc_ability, fc_tera, fc_ball, fc_item, fc_moves[4];
 
 const char *move_name(u16 id) {
     for (auto &m : g_moves) if (m.id == id) return m.name.c_str();
@@ -1030,6 +1073,17 @@ void mons_ui() {
             fc_ball.end();
         }
     }
+    if (!g_held.empty()) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200);
+        const char *in = "(none)";
+        for (auto &it : g_held) if (it.first == p.item) in = it.second.c_str();
+        if (fc_item.begin("Held item", in)) {
+            if (fc_item.item("(none)", !p.item)) p.item = 0;
+            for (auto &it : g_held) if (fc_item.item(it.second.c_str(), it.first == p.item)) p.item = it.first;
+            fc_item.end();
+        }
+    }
     ImGui::SetNextItemWidth(200);
     ImGui::InputTextWithHint("Nickname", s->name.c_str(), p.nickname, sizeof p.nickname);
 
@@ -1070,10 +1124,10 @@ void mons_ui() {
         if (k % 2 == 0) ImGui::SameLine();
     }
 
+    static int lv_mode = 0, shiny_mode = 2;   /* shared by the wild spawns and "Spawn <species> on me" */
+    static bool all = true;
     ImGui::SeparatorText("Wild spawns (the game's own spawner)");
     {
-        static int lv_mode = 0, shiny_mode = 2;
-        static bool all = true;
         static int pct = 100;
         ImGui::RadioButton("Level: the area's", &lv_mode, 0);
         ImGui::SameLine();
@@ -1124,7 +1178,14 @@ void mons_ui() {
         }
         ImGui::SameLine();
         if (ImGui::Button("Spawn on me (the game's pick)")) {
-            if (!spawn_on_me(-1, dist)) field_status("No script runner (the Lua bridge) in this build.");
+            if (!spawn_on_me(dist)) field_status("No script runner (the Lua bridge) in this build.");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(("Spawn " + s->label + " on me").c_str())) {
+            /* the spec (shiny, IVs, ... as in Wild spawns above) stays on for this species until Restore wild spawns */
+            wild_spec_apply(p, lv_mode ? p.level : 0, shiny_mode, all, 0);
+            if (!spawn_on_me(dist, -1, 0, s->internal, s->form, lv_mode ? p.level : 0))
+                field_status("No script runner (the Lua bridge) in this build.");
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
@@ -1171,7 +1232,7 @@ void mons_ui() {
                     ImGui::InputInt("##w", &r.set, 1, 10);
                     if (r.set < -1) r.set = -1;
                     ImGui::TableNextColumn();
-                    if (ImGui::SmallButton("Spawn on me")) spawn_on_me((int)i, dist);
+                    if (ImGui::SmallButton("Spawn on me")) spawn_on_me(dist, r.dev, r.form);
                     ImGui::PopID();
                 }
                 ImGui::EndTable();

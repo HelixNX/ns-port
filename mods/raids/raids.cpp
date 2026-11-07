@@ -421,21 +421,11 @@ static void find_thread(Want w, u32 count) {
 static std::atomic<bool> g_open;
 static int g_region = R_PALDEA, g_progress = 4, g_sel = 0;
 static Want g_want = {R_PALDEA, 4, -1, false, -1};
-static char g_filter[64];
 static char g_seed_text[16];
 static bool g_enable = true;
 static Den g_dens[100];
 static bool g_have_dens;
 static std::string g_status;
-
-static bool contains_nocase(const char *s, const char *sub) {
-    for (; *s; s++) {
-        size_t k = 0;
-        while (sub[k] && s[k] && tolower((unsigned char)s[k]) == tolower((unsigned char)sub[k])) k++;
-        if (!sub[k]) return true;
-    }
-    return false;
-}
 
 static void stats_line(const Result &r) {
     const Raid &e = *r.raid;
@@ -532,9 +522,6 @@ static void ui() {
     }
 
     ImGui::SeparatorText("Find a raid");
-    ImGui::SetNextItemWidth(200);
-    ImGui::InputTextWithHint("##filter", "filter species", g_filter, sizeof g_filter);
-    ImGui::SameLine();
     char preview[96] = "(choose)";
     if (g_want.raid >= 0 && g_want.raid < (int)D.raids.size()) {
         const Raid &e = D.raids[g_want.raid];
@@ -549,7 +536,6 @@ static void ui() {
                 const Raid &e = D.raids[i];
                 if (e.rom != 0 && e.rom != g_rom) continue;
                 const char *nm = name_of(D.species, e.dev);
-                if (g_filter[0] && !contains_nocase(nm, g_filter)) continue;
                 char lbl[128];
                 snprintf(lbl, sizeof lbl, "%s  %d stars%s  Lv.%u  (%u%%)##%u", nm, e.stars, e.form ? " (form)" : "",
                          e.level, e.rate / 100, i);
