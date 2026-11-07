@@ -4,6 +4,7 @@
 !/.gitignore
 !/.gitmodules
 !/README.md
+!/start.ps1
 !/CLAUDE.md
 !/.mcp.json
 
@@ -31,6 +32,7 @@
 !/pokemon-violet/
 /pokemon-violet/*
 !/pokemon-violet/CLAUDE.md
+!/pokemon-violet/NOTES.md
 !/pokemon-violet/rom/
 /pokemon-violet/rom/*
 !/pokemon-violet/rom/.gitkeep

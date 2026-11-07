@@ -9,6 +9,15 @@ Workspace rules, toolchain and shared tools are in `../CLAUDE.md`. Paths below a
 Debug environment variables are `NX_*` (formerly `MK8_*`).
 Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
 
+## Start here
+
+From the workspace root (`..\start.ps1` wraps `mk8recomp\build.bat` and `run.ps1`, which also work on their own):
+`.\start.ps1 mk8` plays (builds first; runs until the game is closed since 2026-11-07, `-Timeout <s>` for unattended
+runs; `-NoBuild`; log `build\run.log`), `.\start.ps1 build mk8` builds, `.\start.ps1 room mk8` hosts a room with
+MK8's game id, `.\start.ps1 mk8 -Room host:port -Nick name` joins one directly (no `-Room`: the room browser;
+`NX_NETPLAY=0` skips it), `.\start.ps1 package mk8 <dir>` makes a folder for players. The room server is `../room`.
+MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
+
 ## Design decisions (2026-10-15)
 
 1. **CPU: our own AArch64 → C lifter** (`../nxrecomp/tools/lifter/a64lift.py`, new). Lift `main`, `sdk` and `subsdk0`.
@@ -148,7 +157,7 @@ Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
     both ways (needs the Eden player's log of that moment); with async shaders, a green-tinted, washed-out screen
     on one track and bright flashes (suspect: a skipped draw into a texture drawn once per track, e.g. colour
     grading or exposure; test: the same track again with its shaders cached).
-  - `../nxrecomp/tools/room` (`build.bat <out dir>`; built to `build/room/room_server.exe`): a room server of our
+  - `../room` (its own folder since 2026-11-07, was `nxrecomp/tools/room`; `build.bat`, built to `room/build/room_server.exe`): a room server of our
     own (same protocol, 192.168.1.x for everyone as Eden's rooms; `--log 2` prints every relayed packet with its
     decompressed first bytes: Pia's packets start `32 ab 98 64`). To host: run it on UDP 24872 and expose that
     port (playit.gg UDP tunnel worked; ngrok has no UDP); join with `NX_ROOM=127.0.0.1:24872`.

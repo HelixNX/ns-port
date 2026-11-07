@@ -8,6 +8,24 @@ SDK running over an emulated kernel and services, and NVN replayed into Vulkan.
 | `nxrecomp/` | shared runtime (kernel, SVCs, IPC, services, NVN on Vulkan, audio, input) and tools (lifter, shader translator, IDA export) | [s1099/nxrecomp](https://github.com/s1099/nxrecomp) |
 | `pokemon-violet/violetrecomp/` | Pokémon Violet 4.0.0 + DLC | [s1099/violetrecomp](https://github.com/s1099/violetrecomp) |
 | `mk8dx/mk8recomp/` | Mario Kart 8 Deluxe 3.0.5 | [s1099/mk8recomp](https://github.com/s1099/mk8recomp) |
+| `room/` | the multiplayer room server (the protocol Citra, yuzu and Eden rooms speak); Windows or Linux | local repo |
+| `ldn-beacon/` | a real Switch's local play bridged into a room, with an ESP32-S3 on USB as the radio | local repo |
+
+## Start here
+
+Everything starts from `start.ps1` at the root (PowerShell); `.\start.ps1` alone lists it:
+
+```powershell
+.\start.ps1 violet                 # build and play Pokemon Violet (-NoBuild to skip the build)
+.\start.ps1 mk8                    # the same for Mario Kart 8 Deluxe
+.\start.ps1 room                   # host a room for local play (UDP 24872); the games' room browser lists it
+.\start.ps1 violet -Room 127.0.0.1:24872 -Nick Host   # join a room directly
+.\start.ps1 beacon                 # bring a real Switch into the room (ESP32-S3 on USB)
+.\start.ps1 build violet|mk8|room|beacon
+.\start.ps1 package violet <dir>   # a folder for players
+```
+
+The first time, a game needs its setup (below: unpack, dump, export, lift); after that `start.ps1` is all.
 
 This repo is the workspace: it ties the three repos together as submodules, holds the project notes (`CLAUDE.md`
 files) and keeps the empty folders your own game data goes into. **No game data, keys or firmware are included, and
@@ -40,10 +58,13 @@ ns-port/
 │   ├── dump/                made by setup: exefs/, elf/, romfs/, aoc/
 │   ├── build/               made by setup: analysis/, lifted/, cmake/, the .exe
 │   └── violetrecomp/        game repo (submodule): game.json, CMakeLists.txt, build.bat, run.ps1
-└── mk8dx/
-    ├── rom/                 game.nsp (base 1.0.0), mk8u_v1376256.nsp (update 3.0.5)
-    ├── extract_v21/, dump_v21/, build/   made by setup
-    └── mk8recomp/           game repo (submodule)
+├── mk8dx/
+│   ├── rom/                 game.nsp (base 1.0.0), mk8u_v1376256.nsp (update 3.0.5)
+│   ├── extract_v21/, dump_v21/, build/   made by setup
+│   └── mk8recomp/           game repo (submodule)
+├── room/                    room server (own repo): build.bat or CMake, build/room_server.exe
+├── ldn-beacon/              real-Switch bridge (own repo): build.bat or CMake, s3/ = the ESP32-S3 firmware
+└── start.ps1                the front door (Start here)
 ```
 
 ### ROMs
@@ -112,5 +133,13 @@ Keyboard: ESDF = left stick, IJKL = right stick, arrows = D-pad, R = R; gamepads
 
 ## Status
 
-See each project's `CLAUDE.md`. Violet renders the first-boot screens, the opening cutscene and the bedroom. MK8 is
-further along.
+See each project's `CLAUDE.md`. Violet is playable (story, raids, local play over rooms, and with a real Switch through the beacon), with mods
+(F6 raids, F7 items, F8 mons). MK8 races, with online play over rooms.
+
+## Going public (open)
+
+If this goes public it will be fresh repositories under an organisation (a snapshot, not this history): build tools
+(Windows and Linux build scripts side by side), the runtime, one repository per game, the room server and the
+beacon. To settle first: a licence for each (none yet: all rights reserved by default; svedit links PKHeX.Core,
+GPLv3); whether the NSP / NCA reader that decrypts with the player's keys (`nxrecomp/runtime/nca.c`) ships, or
+public builds read an nstool dump instead; and the notes (CLAUDE.md / NOTES.md) stay private.

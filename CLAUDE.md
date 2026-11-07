@@ -8,7 +8,16 @@ root.
 |---|---|
 | `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (AArch64 lifter, SDK over emulated kernel/services, NVN on Vulkan). See `mk8dx/CLAUDE.md` |
 | `pokemon-violet/` | Pokémon Violet 4.0.0 + DLC (V4 graphics in progress: first-boot screens and the opening cutscene render). See `pokemon-violet/CLAUDE.md` |
-| `ldn-beacon/` | a real Switch's local play bridged into our (Eden-compatible) rooms; runs on Windows or Linux, with an ESP32-S3 on USB as the antenna (its firmware in `ldn-beacon/s3/`, ESP-IDF 5.5.6 from Espressif's EIM, installed outside the workspace) or, on Linux, the built-in Wi-Fi card; own git repo, local only for now. See `ldn-beacon/CLAUDE.md` |
+| `ldn-beacon/` | a real Switch's local play bridged into our (Eden-compatible) rooms; runs on Windows or Linux, with an ESP32-S3 on USB as the antenna (its firmware in `ldn-beacon/s3/`, ESP-IDF 5.5.6 from Espressif's EIM, installed outside the workspace) or, on Linux, the built-in Wi-Fi card; own git repo, local only for now, builds on its own. See `ldn-beacon/CLAUDE.md` |
+| `room/` | the multiplayer room server (Citra / yuzu / Eden protocol) the games, Eden and the beacon meet in; one C file, ENet + zstd, Windows or Linux; own git repo (local; moved out of `nxrecomp/tools/room` on 2026-11-07, its history stays there). See `room/README.md` |
+
+**Start anything with `.\start.ps1`** at the root (alone it lists the commands): `violet` / `mk8` play (builds
+first), `room` hosts a room, `beacon` bridges a real Switch, `build <project>`, `package <game> <dir>`. It wraps each
+project's own scripts, which still work on their own.
+
+Notes: each project's `CLAUDE.md` is kept short (start here, state, what is open); its `NOTES.md` holds the history,
+findings and runs (pokemon-violet, ldn-beacon; mk8dx's notes are reference and stay in its CLAUDE.md). Grep both
+before proposing a tool or an experiment; add new findings to NOTES.md and update the state / open lists.
 
 Current focus (the user's call, 2026-10-18): **Pokémon Violet only**. Changes to the shared `nxrecomp/` need no MK8
 regression checks (no MK8 builds, boots or shader diffs); the user checks MK8 themselves.
@@ -22,9 +31,9 @@ behaviour only: our own implementation, never copied code.
 
 | Path | What |
 |---|---|
-| `/` | workspace repo `s1099/ns-port` (private): README, CLAUDE.md files, placeholder folders; nxrecomp, mk8recomp and violetrecomp are submodules (each private on GitHub, branch `main`). Its `.gitignore` is a whitelist: game data, keys, firmware, deps and tools stay out |
+| `/` | workspace repo `s1099/ns-port` (private): README, `start.ps1`, CLAUDE.md / NOTES.md files, placeholder folders; nxrecomp, mk8recomp and violetrecomp are submodules (each private on GitHub, branch `main`); `ldn-beacon/` and `room/` are local repos of their own, not tracked here. Its `.gitignore` is a whitelist: game data, keys, firmware, deps and tools stay out. A public release would be fresh repos (a snapshot, no history), under an organisation: open questions in README.md, "Going public" |
 | `<project>/` | one game: `rom/` (the user's NSPs), extracted/dumped data, `build/`, and the source repo |
-| `nxrecomp/` | shared source, a git repo (split from MK8's on 2026-10-17, history kept): `runtime/` (kernel, SVCs, IPC and services, NVN on Vulkan, audio, input), `tools/` (lifter, image builder, shader translator, IDA export), `nxrecomp.cmake` (`nx_game`). A game's repo holds `game.json` (name, title, title id, modules with fixed bases, dump/analysis/build paths; see `tools/gamecfg.py`), an optional `overrides.txt` and a `CMakeLists.txt` calling `nx_game`; run the tools from inside the game's repo |
+| `nxrecomp/` | shared source, a git repo (split from MK8's on 2026-10-17, history kept): `runtime/` (kernel, SVCs, IPC and services, NVN on Vulkan, audio, input), `tools/` (lifter, image builder, shader translator, IDA export, `package.ps1`, which builds `../room` into packages), `nxrecomp.cmake` (`nx_game`). A game's repo holds `game.json` (name, title, title id, modules with fixed bases, dump/analysis/build paths; see `tools/gamecfg.py`), an optional `overrides.txt` and a `CMakeLists.txt` calling `nx_game`; run the tools from inside the game's repo |
 | `keys/` | `prod.keys`, `title.keys`; `.switch/` holds copies for nstool (see Tool notes) |
 | `firmware/` | `Firmware_22.5.0.zip` and its contents in `22.5.0/` (NCAs; `keys/prod.keys` covers it; on the AMD machine unpacked 2026-11-04). `Firmware.23.0.1.zip` added 2026-11-06, not unpacked; whether `prod.keys` covers it is unchecked. A game's system data goes to `<project>/build/sysdata/<data id>/` (`nstool -x /0 <dir> <nca>`), e.g. NgWord2 `0100000000000823` = `00d460df….nca`, which the SDK's NG word filter mounts in local play. MiiModel is `99d7c22f….nca`; find others with `nstool <nca>` (ProgID) and extract with `nstool -x / <dir> <nca>` |
 | `deps/` | `SDL3/SDL3-3.4.18` (VC), `Vulkan-Headers` (v1.4.341), `glslang` (16.6.0 release), `suyu` (sparse Eden checkout of the service, network and shader directories consulted so far; widen it with `git -C deps/suyu sparse-checkout add <dir>`. On the AMD machine, where `deps/` was otherwise empty, it is a shallow blobless clone of `src/video_core` and `src/shader_recompiler` from 2026-10-31, read for GPU translator design), `enet` (v1.3.18) and `zstd` (v1.5.6, `lib/` only) for netplay, only where vcpkg has neither (the user prefers vcpkg: `vcpkg install enet zstd`; on the AMD machine they come from vcpkg and `deps/` has no copies). In `nxrecomp/tools/vcenv.bat`'s environment `VCPKG_ROOT` points at Visual Studio's own vcpkg, so `nxrecomp.cmake` looks in the vcpkg tree SDL3 came from first. `ooz` (github.com/powzix/ooz, GPLv3+, cloned 2026-11-05 on the AMD machine): Oodle Kraken decoder for
