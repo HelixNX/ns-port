@@ -25,12 +25,18 @@ From the workspace root (`..\start.ps1` wraps the scripts in `violetrecomp\`, wh
 
 Never script input (`NX_INPUT`, pressing A) unless the user asks; bench.ps1 passes `NX_INPUT=` empty.
 
-**In game:** Esc = settings panel (frame rate, render scale, ...); F3 FPS overlay; F5 cycles game / 60 / 120 /
-uncapped; F12 captures a frame to `build\frames\`. Mods (`build\cmake\mods\violet_raids.dll`, built with the exe;
-`NX_MODS=0` loads none): **F6** raids (find seeds, write dens), **F7** items (give / set, a Lua console in the
-game's VM), **F8** mons (into the boxes; wild spawns made to order; "Around you": spawn on the player, the area's
-spawn list and weights; held items). Their data: `python mods\raids\raiddata.py` (raids.dat, encounter tables;
-needs `build\ooz`), `mons_*.txt` and `items.txt` in `build\mods\` from svedit (`monsdata`, `items`).
+**In game:** Esc frees the mouse and shows the menu bar at the top (it fades in on mouse movement; F1 pins it; a
+click on the game hides it): **Options** > Video (frame rate, render scale, FPS counter, borderless fullscreen;
+Alt+Enter; the user: borderless only, never exclusive fullscreen) and Controls (keyboard, mouse, gamepad, hotkeys;
+all rebindable, saved in `build\settings.ini`), **Mods** (each mod's windows with its hotkey; Manage turns a DLL off
+for the next start). F3 FPS counter, F5 frame rate cycle (development), F12 captures a frame to `build\frames\`. The
+menu is nxrecomp's `nxui.dll` next to the exe (ui/nxui.cpp; without it the game runs with plain hotkeys). Mods are
+optional DLLs in `build\cmake\mods\` (`NX_MODS=0` loads none), one each: **violet_raids** (Tera Raids, F6: find
+seeds, write dens), **violet_items** (Items, F7: give / set, a Lua console in the game's VM), **violet_mons** (Spawn
+a Pokemon, F8: into the boxes; wild spawns made to order; "Around you": spawn on the player, the area's spawn list
+and weights; held items). Sources `mods\<name>\`, shared `mods\common\`. Their data: `python mods\raids\raiddata.py`
+(raids.dat, encounter tables; needs `build\ooz`), `mons_*.txt` and `items.txt` in `build\mods\` from svedit
+(`monsdata`, `items`). Packages: `-Mods all` (or names) copies the DLLs; the data is not packaged (game-derived).
 
 **Saves:** the game's save is `build\save\`; backups and test saves are in `build\saves\` (`save-backup-<date>`,
 `save-net-a` / `-b` for two instances in one room, ...). bench.ps1 copies `save` to `build\save-idle-run`. Closed-game
@@ -52,10 +58,14 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 - Mods: F6 raids and F7 items user-checked; F8 box writer and the wild species swap user-checked. **Not yet tried
   in game:** F8 "Spawn \<species\> on me" and the row spawn fix (a kept native entry crashed the game; now found again
   at spawn time), held items, the no-battles toggle, the rest of the wild spec (shiny, IVs, moves, Tera on a caught
-  one).
+  one). **The new menu (2026-11-07)**: built and it loads (nxui.dll, the three mods as separate DLLs, ImGui on the
+  swapchain; a 45 s unattended run); nothing in it clicked yet.
 
 ## Open (the user's list, in order)
 
+0. Try the new menu: Esc / F1, Options (Video, Controls: rebind a key and a pad button), Mods (the three windows,
+   Manage). Next asked for: change rooms during play (a Multiplayer menu: current room, leave, the public list,
+   direct connect; leaving drops a local session in progress), then a theme choice for the menu.
 1. Try the F8 changes above; confirm the wild spec on a caught mon (overworld shiny vs battle shiny).
 2. Spawn-pool rules: wrap the encounter table's filter / per-entry rules (version, time, flags, weights; F8 weights
    are the first step), spawn density parameters. NOTES.md, "Planned next" item 3.
