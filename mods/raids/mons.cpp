@@ -674,6 +674,217 @@ bool wild_lua(int dev, int form, int level, int pct) {
     return h->run_script(lua, wild_lua_done, nullptr);
 }
 
+/* ---------------------------------------------------------------------------------------------- around the player
+ * The wild manager's instance is C4EE52E49562F8277.SF3075AB31C9E8AF4 (W). Its spawn step (prototype.FA9A2EC1E99B58D55,
+ * called by its update F648B6B775BCC730B while W[17] == 0) takes the player's position (K.SBF5E0EFFB821427F:
+ * f7360ED03() -> x, y, z), finds a spawn point near a random offset (cFB7F03A4.f42A4ADE3 / f35A39D75 -> a point with
+ * a 'position'), reads it into an info table (W:F654580D678C85C0E(point): pos {x, y, z}, min_level, max_level,
+ * biome, attribute, areano, areaname, enable_table), builds the group into W[23] (bosses / minions) with
+ * W:F61D1ABB7697071EB(info), which picks the species with W[26]:FCEEA7F4134055567(info, rng, ctx, false), and puts
+ * it in the world with W:F9B7FBB66FA56765E(W[23]) (field objects at each member's position; W[17] = 1 until loaded).
+ * W[26] is the encounter table (class CE1BA7320ED1C2331): F2F6C7BBE115AFBCB(info, ctx, flag, list, weights) fills
+ * the entries allowed at that point (rules in F67A9C2A9373A0AC6: area, location, ground ray, ...) and their weights
+ * (Haxe arrays, 0-based) and returns the total; an entry has f2BF366A2() DevID, fE15E9D0A() form, f5B8A3FE2() sex,
+ * f4646F546() / f61FD9277() level range. ctx = W[28]:FDCCDAF4C1D58AECA(pos) (ctx[4] / ctx[5] force a DevID / form).
+ *
+ * "Spawn on me" does the spawn step itself with the point's info moved to the player (plus an offset), only while
+ * the manager is between spawns (W[17] == 0, else retried); a chosen row forces the pick once (an instance field
+ * over the table's picker). Weights: the filter is wrapped on the instance (original kept in T.__nx_f2); overrides in
+ * K.__nx_w ["DevID/form"] = weight, '*' for every other entry. A new table instance (save load) drops the wrap:
+ * Apply again. */
+const char *const FIELD_PRELUDE =
+    "local K = C4EE52E49562F8277\n"
+    "if K == nil then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+    "local W = K.SF3075AB31C9E8AF4\n"
+    "if W == nil or W[26] == nil then return 'error|no wild manager: load into the overworld' end\n"
+    "local function here()\n"
+    "  local x, y, z = K.SBF5E0EFFB821427F:f7360ED03()\n"
+    "  for _, r in ipairs({15, 40, 100, 250}) do\n"
+    "    for t = 1, 6 do\n"
+    "      local ok, pt = pcall(cFB7F03A4.f35A39D75, x, y, z, 0, r, 0)\n"
+    "      if ok and pt ~= nil then\n"
+    "        local ok2, has = pcall(function() return pt:fDC284F58('position') end)\n"
+    "        if ok2 and has then return W:F654580D678C85C0E(pt), x, y, z end\n"
+    "      end\n"
+    "    end\n"
+    "  end\n"
+    "  return nil, x, y, z\n"
+    "end\n"
+    "local function newarr() return setmetatable({length = 0}, getmetatable(W[23].bosses)) end\n"
+    "local function get(e, m) local ok, v = pcall(function() return e[m](e) end); if ok then return v end; return -1 end\n";
+
+struct AreaRow { int dev = 0, form = 0, sex = -1, minl = 0, maxl = 0, weight = 0, set = -1; };
+struct AreaList { bool ok = false; std::string msg, area, biome; int minl = 0, maxl = 0, total = 0; std::vector<AreaRow> rows; };
+std::mutex g_area_lock;
+AreaList g_area;
+std::string g_field_status;
+int g_weight_others = -1;                  /* the weight of every entry without its own (-1 as is) */
+
+void field_status(const std::string &s) { std::lock_guard<std::mutex> l(g_area_lock); g_field_status = s; }
+
+const char *species_label(int dev, int form) {
+    for (auto &s : g_species) if (s.internal == dev && s.form == form) return s.label.c_str();
+    for (auto &s : g_species) if (s.internal == dev) return s.name.c_str();
+    return nullptr;
+}
+
+/* the reply: "ok|area|biome|minl|maxl|total" then one line per entry "dev|form|sex|minl|maxl|weight" */
+void area_done(void *, bool ok, const char *r) {
+    std::vector<std::string> lines;
+    for (const char *p = r; *p;) {
+        const char *e = strchr(p, '\n');
+        lines.emplace_back(p, e ? (size_t)(e - p) : strlen(p));
+        if (!e) break;
+        p = e + 1;
+    }
+    AreaList a;
+    std::vector<std::string> f;
+    auto split = [&f](const std::string &s) {
+        f.clear();
+        size_t at = 0;
+        for (;;) {
+            size_t b = s.find('|', at);
+            f.push_back(s.substr(at, b == std::string::npos ? std::string::npos : b - at));
+            if (b == std::string::npos) break;
+            at = b + 1;
+        }
+    };
+    if (!ok || lines.empty()) a.msg = std::string("Script error: ") + r;
+    else {
+        split(lines[0]);
+        if (f[0] != "ok" || f.size() < 6) a.msg = f.size() > 1 ? f[1] : lines[0];
+        else {
+            a.ok = true;
+            a.area = f[1]; a.biome = f[2];
+            a.minl = atoi(f[3].c_str()); a.maxl = atoi(f[4].c_str()); a.total = atoi(f[5].c_str());
+            for (size_t i = 1; i < lines.size(); i++) {
+                split(lines[i]);
+                if (f.size() < 6) continue;
+                AreaRow w;
+                w.dev = atoi(f[0].c_str()); w.form = atoi(f[1].c_str()); w.sex = atoi(f[2].c_str());
+                w.minl = atoi(f[3].c_str()); w.maxl = atoi(f[4].c_str()); w.weight = atoi(f[5].c_str());
+                a.rows.push_back(w);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> l(g_area_lock);
+    /* keep the weight boxes the user filled for species still listed */
+    for (auto &w : a.rows)
+        for (auto &o : g_area.rows)
+            if (o.dev == w.dev && o.form == w.form) w.set = o.set;
+    g_area = a;
+    g_field_status = a.ok ? "" : a.msg;
+}
+
+/* the entries allowed at a spawn point near the player, as the game's own filter lists them (unwrapped: the game's
+ * weights); kept in K.__nx_area (0-based) for "Spawn on me" on a row */
+bool area_list() {
+    const NxModHost *h = modkit::host();
+    if (h->version < 3 || !h->run_script) return false;
+    std::string lua = FIELD_PRELUDE;
+    lua += "local info = here()\n"
+           "if info == nil then return 'error|no spawn point within 250 m (towns and buildings have none)' end\n"
+           "local T = W[26]\n"
+           "local f = T.__nx_f2 or T.F2F6C7BBE115AFBCB\n"
+           "local list, wts = newarr(), newarr()\n"
+           "local ctx = W[28]:FDCCDAF4C1D58AECA(info.pos)\n"
+           "local total = f(T, info, ctx, false, list, wts)\n"
+           "local out = {'ok|' .. tostring(info.areaname or info.areano) .. '|' .. tostring(info.biome) .. '|' ..\n"
+           "  tostring(info.min_level) .. '|' .. tostring(info.max_level) .. '|' .. tostring(total)}\n"
+           "K.__nx_area = {}\n"
+           "for i = 0, list.length - 1 do\n"
+           "  local e = list[i]\n"
+           "  K.__nx_area[i] = e\n"
+           "  out[#out + 1] = get(e, 'f2BF366A2') .. '|' .. get(e, 'fE15E9D0A') .. '|' .. get(e, 'f5B8A3FE2') .. '|' ..\n"
+           "    get(e, 'f4646F546') .. '|' .. get(e, 'f61FD9277') .. '|' .. tostring(wts[i])\n"
+           "end\n"
+           "return table.concat(out, '\\n')\n";
+    return h->run_script(lua.c_str(), area_done, nullptr);
+}
+
+void field_done(void *, bool ok, const char *r) {
+    std::string s = r;
+    if (s.rfind("error|", 0) == 0) s = s.substr(6);
+    field_status(ok ? s : "Script error: " + s);
+}
+
+/* row: an index into K.__nx_area, or -1 for the game's own pick; dist: metres from the player */
+bool spawn_on_me(int row, float dist) {
+    const NxModHost *h = modkit::host();
+    if (h->version < 3 || !h->run_script) return false;
+    char head[160];
+    snprintf(head, sizeof head, "local row, dist = %d, %.2f\n", row, dist);
+    std::string lua = FIELD_PRELUDE;
+    lua += head;
+    lua += "if W[17] ~= 0 then return '" NXMOD_SCRIPT_AGAIN "' end\n"
+           "local g = W[23]\n"
+           "g.bosses:resize(0); g.minions:resize(0)\n"
+           "local info, x, y, z = here()\n"
+           "if info == nil then return 'error|no spawn point within 250 m (towns and buildings have none)' end\n"
+           "local a = math.random() * 6.283185\n"
+           "info.pos = {x + dist * math.cos(a), y, z + dist * math.sin(a)}\n"
+           "local T = W[26]\n"
+           "if row >= 0 then\n"
+           "  local e = K.__nx_area and K.__nx_area[row]\n"
+           "  if e == nil then return 'error|list the area first' end\n"
+           "  T.FCEEA7F4134055567 = function() return e end\n"
+           "end\n"
+           "local ok, made = pcall(W.F61D1ABB7697071EB, W, info)\n"
+           "if row >= 0 then T.FCEEA7F4134055567 = nil end\n"
+           "if not ok then g.bosses:resize(0); g.minions:resize(0); return 'error|the group maker failed: ' .. tostring(made) end\n"
+           "if not made then g.bosses:resize(0); g.minions:resize(0); return 'error|the game refused this spot (no ground under the player, or no entry allowed here); try again or step aside' end\n"
+           "local n = g.bosses.length + g.minions.length\n"
+           "W:F9B7FBB66FA56765E(g)\n"
+           "return 'Spawned a group of ' .. n .. ' at ' .. string.format('%.1f', dist) .. ' m'\n";
+    return h->run_script(lua.c_str(), field_done, nullptr);
+}
+
+/* rows' weight boxes (-1 as is) and the weight for every other entry (-1 as is): wrap the filter on the instance */
+bool weights_apply(bool clear) {
+    const NxModHost *h = modkit::host();
+    if (h->version < 3 || !h->run_script) return false;
+    std::string lua = FIELD_PRELUDE;
+    if (clear) lua += "K.__nx_w = nil\nreturn 'Spawn weights back to the game\\'s own'\n";
+    else {
+        lua += "local w = {}\n";
+        std::lock_guard<std::mutex> l(g_area_lock);
+        char ln[96];
+        int n = 0;
+        for (auto &r : g_area.rows)
+            if (r.set >= 0) { snprintf(ln, sizeof ln, "w['%d/%d'] = %d\n", r.dev, r.form, r.set); lua += ln; n++; }
+        if (g_weight_others >= 0) { snprintf(ln, sizeof ln, "w['*'] = %d\n", g_weight_others); lua += ln; n++; }
+        if (!n) return false;
+        lua += "K.__nx_w = w\n"
+               "local T = W[26]\n"
+               "if not T.__nx_f2 then\n"
+               "  local orig = T.F2F6C7BBE115AFBCB\n"
+               "  T.__nx_f2 = orig\n"
+               "  T.F2F6C7BBE115AFBCB = function(self, info, ctx, flag, list, wts)\n"
+               "    local total = orig(self, info, ctx, flag, list, wts)\n"
+               "    local ov = K.__nx_w\n"
+               "    if ov == nil or list == nil or wts == nil then return total end\n"
+               "    local t = 0\n"
+               "    for i = 0, list.length - 1 do\n"
+               "      local e = list[i]\n"
+               "      local v = ov[tostring(e:f2BF366A2()) .. '/' .. tostring(e:fE15E9D0A())]\n"
+               "      if v == nil then v = ov['*'] end\n"
+               "      if v ~= nil then wts[i] = v end\n"
+               "      t = t + wts[i]\n"
+               "    end\n"
+               "    return t\n"
+               "  end\n"
+               "end\n"
+               "return 'Spawn weights set (new spawns; every area until cleared or the save reloads)'\n";
+    }
+    return h->run_script(lua.c_str(), field_done, nullptr);
+}
+
+typedef void (*NoBattles)(int);
+NoBattles no_battles_fn() {
+    static NoBattles f = (NoBattles)(void *)GetProcAddress(GetModuleHandleW(nullptr), "violet_no_battles");
+    return f;
+}
+
 /* ---------------------------------------------------------------------------------------------- UI */
 std::atomic<bool> g_open;
 Spec g_spec;
@@ -902,6 +1113,89 @@ void mons_ui() {
                             "Also applies to any other %s the game makes meanwhile (raids, trades, eggs).", s->name.c_str());
         std::lock_guard<std::mutex> l(g_status_lock);
         if (!g_wild_status.empty()) ImGui::TextWrapped("%s", g_wild_status.c_str());
+    }
+
+    ImGui::SeparatorText("Around you (the spawn point nearest you)");
+    {
+        static float dist = 3.0f;
+        if (ImGui::Button("List what spawns here")) {
+            if (!area_list()) field_status("No script runner (the Lua bridge) in this build.");
+            else field_status("Listing...");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Spawn on me (the game's pick)")) {
+            if (!spawn_on_me(-1, dist)) field_status("No script runner (the Lua bridge) in this build.");
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140);
+        ImGui::SliderFloat("from me", &dist, 0.0f, 15.0f, "%.1f m");
+        static bool no_battles = false;
+        if (ImGui::Checkbox("Dev: wild Pokemon don't start battles", &no_battles)) {
+            if (NoBattles f = no_battles_fn()) f(no_battles ? 1 : 0);
+            else field_status("No battle hook in this build (violet_no_battles missing from the exe).");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(new and re-acting mons; walk away for fresh ones)");
+        if (dist < 2.0f && !no_battles)
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Under 2 m it may touch you and start a battle.");
+
+        std::lock_guard<std::mutex> l(g_area_lock);
+        if (g_area.ok) {
+            ImGui::Text("Area %s, biome %s, levels %d-%d, %zu entries (total weight %d)", g_area.area.c_str(),
+                        g_area.biome.c_str(), g_area.minl, g_area.maxl, g_area.rows.size(), g_area.total);
+            if (ImGui::BeginTable("##area", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                                  ImVec2(0, 260))) {
+                ImGui::TableSetupColumn("Species", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Levels");
+                ImGui::TableSetupColumn("Chance");
+                ImGui::TableSetupColumn("Weight (-1 as is)");
+                ImGui::TableSetupColumn("");
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (size_t i = 0; i < g_area.rows.size(); i++) {
+                    AreaRow &r = g_area.rows[i];
+                    ImGui::PushID((int)i);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const char *name = species_label(r.dev, r.form);
+                    if (name) ImGui::TextUnformatted(name);
+                    else ImGui::Text("DevID %d form %d", r.dev, r.form);
+                    if (r.sex == 0 || r.sex == 1) { ImGui::SameLine(); ImGui::TextDisabled(r.sex ? "(F)" : "(M)"); }
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%d-%d", r.minl, r.maxl);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.1f%%", g_area.total > 0 ? 100.0 * r.weight / g_area.total : 0.0);
+                    ImGui::TableNextColumn();
+                    ImGui::SetNextItemWidth(90);
+                    ImGui::InputInt("##w", &r.set, 1, 10);
+                    if (r.set < -1) r.set = -1;
+                    ImGui::TableNextColumn();
+                    if (ImGui::SmallButton("Spawn on me")) spawn_on_me((int)i, dist);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::SetNextItemWidth(90);
+            ImGui::InputInt("Weight of everything else (-1 as is, 0 never)", &g_weight_others, 1, 10);
+            if (g_weight_others < -1) g_weight_others = -1;
+            if (ImGui::Button("Apply weights")) {
+                g_area_lock.unlock();
+                if (!weights_apply(false)) field_status("Nothing to apply: set a weight (0 = never) on a row first.");
+                g_area_lock.lock();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear weights")) {
+                for (auto &r : g_area.rows) r.set = -1;
+                g_weight_others = -1;
+                g_area_lock.unlock();
+                weights_apply(true);
+                g_area_lock.lock();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Chance is the game's own; weights apply to new spawns everywhere.");
+        }
+        if (!g_field_status.empty()) ImGui::TextWrapped("%s", g_field_status.c_str());
     }
 
     ImGui::Separator();

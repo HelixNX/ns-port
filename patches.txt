@@ -25,3 +25,6 @@ main+b5ddd0 was d10103ff after lua_pcall_entry      # sub sp, sp, #0x40: lua_pca
 # Wild spawns made to order (wild.c, the raids mod's F8): the param constructor's entry (spec in x1) and end (x19).
 main+debf88  was aa0003f3 after wild_create          # mov x19, x0
 main+debff8  was aa1303e0 after wild_created         # mov x0, x19
+#
+# Dev toggle "wild Pokemon don't start battles" (wild.c, the raids mod's F8): the AI's set-encounter-enabled call.
+main+1d0e5e4 was 2a0103f3 after encount_enable       # mov w19, w1: the enable bit

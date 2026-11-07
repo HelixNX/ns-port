@@ -144,3 +144,21 @@ void h_wild_created(Ctx *c) {
     *c = saved;
     busy = 0;
 }
+
+/* Dev toggle "wild Pokemon don't start battles" (the raids mod's F8, through the export violet_no_battles): the mons'
+ * AI turns "touching the player starts a battle" on and off with SetEnableEncount / SetEnableEncountBlackboard
+ * behaviour-tree nodes (type names at main+2995db0 / 29954e0, vtables at main+4474d48 / 4474a00), which call
+ * main+1d0e5d4(component, enable): it stores the flag as a byte (1 / 0) in the component's encounter object, then
+ * notifies it. Hooked after `mov w19, w1` (main+1d0e5e4), where w19 is the enable bit the rest of the function uses:
+ * while the toggle is on every call disables. Mons whose encounter was enabled before the toggle keep it until
+ * their AI sets it again (or they despawn). Not yet confirmed in game that this flag gates contact battles. */
+static volatile LONG no_battles;
+
+__declspec(dllexport) void violet_no_battles(int on) {
+    InterlockedExchange(&no_battles, on ? 1 : 0);
+    hlog(0, "wild: contact battles %s", on ? "off (dev toggle)" : "back on");
+}
+
+void h_encount_enable(Ctx *c) {
+    if (no_battles) c->x[19] = 0;
+}
