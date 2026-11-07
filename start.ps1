@@ -35,6 +35,7 @@ function Show-Help {
 }
 
 function Get-Opt([string[]]$a, [string]$name, $default = $null) {
+    if (-not $a) { return $default }                    # no options at all: PowerShell passes $null, not @()
     $i = [Array]::IndexOf($a, $name)
     if ($i -ge 0 -and $i + 1 -lt $a.Count) { return $a[$i + 1] }
     return $default
