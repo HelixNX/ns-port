@@ -171,11 +171,11 @@ void options_init(void) {
     invert_y = options_get_int("mouse_invert_y", 0) != 0;
     rest = options_get_float("mouse_rest", 150.0f);
     if (options_get_int("fullscreen", 0)) want_full = 1;
-    options_add_hotkey("menu", "Show the menu", SDL_SCANCODE_F1, hk_menu, NULL);
+    options_add_hotkey("menu", "Menu", SDL_SCANCODE_F1, hk_menu, NULL);
     options_add_hotkey("fps", "FPS counter", SDL_SCANCODE_F3, hk_fps, NULL);
-    options_add_hotkey("capture", "Capture a frame (for bug reports)", SDL_SCANCODE_F12, hk_capture, NULL);
+    options_add_hotkey("capture", "Capture frame", SDL_SCANCODE_F12, hk_capture, NULL);
 #ifndef NX_PACKAGE
-    options_add_hotkey("framerate", "Cycle the frame rate (development)", SDL_SCANCODE_F5, hk_rate, NULL);
+    options_add_hotkey("framerate", "Frame rate (dev)", SDL_SCANCODE_F5, hk_rate, NULL);
 #endif
 }
 

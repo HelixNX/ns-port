@@ -67,7 +67,7 @@ static bool add_window(const char *title, const char *default_key, bool (*is_ope
     w->file = loading;
     char id[96], label[160];
     snprintf(id, sizeof id, "mod.%s", title);
-    snprintf(label, sizeof label, "%s (mod)", title);
+    snprintf(label, sizeof label, "%s", title);
     SDL_Scancode k = default_key ? SDL_GetScancodeFromName(default_key) : SDL_SCANCODE_UNKNOWN;
     w->hotkey = options_add_hotkey(id, label, k, hotkey_toggle, (void *)(uintptr_t)nwindows);
     nwindows++;
@@ -116,12 +116,12 @@ void mods_load(SDL_Window *window) {
         snprintf(mf->file, sizeof mf->file, "%s", fd.cFileName);
         mf->enabled = !disabled(fd.cFileName);
         nfiles++;
-        if (!mf->enabled) { snprintf(mf->status, sizeof mf->status, "off (turned on at the next start)"); continue; }
+        if (!mf->enabled) { snprintf(mf->status, sizeof mf->status, "off"); continue; }
         char path[MAX_PATH * 2];
         snprintf(path, sizeof path, "%s\\mods\\%s", dir, fd.cFileName);
         HMODULE m = LoadLibraryExA(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (!m) {
-            snprintf(mf->status, sizeof mf->status, "does not load (error %lu)", GetLastError());
+            snprintf(mf->status, sizeof mf->status, "load error %lu", GetLastError());
             hlog(0, "mods: %s %s", fd.cFileName, mf->status);
             continue;
         }
@@ -132,8 +132,8 @@ void mods_load(SDL_Window *window) {
         loading = -1;
         if (!mod) {
             nwindows = before;                  /* (a declining mod should not have added any) */
-            snprintf(mf->status, sizeof mf->status, "%s", init ? "declined (another game or an older mod version)" :
-                                                                  "not a mod (no nx_mod_init)");
+            snprintf(mf->status, sizeof mf->status, "%s", init ? "declined" :
+                                                                  "not a mod");
             hlog(0, "mods: %s %s", fd.cFileName, mf->status);
             FreeLibrary(m);
             continue;

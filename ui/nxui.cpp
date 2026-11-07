@@ -365,7 +365,7 @@ static void page_interface() {
     Palette p = game_palette();
     struct Choice { const char *id, *name; };
     char game_name[128];
-    snprintf(game_name, sizeof game_name, "%s (the game's)", H->title ? H->title : "This game");
+    snprintf(game_name, sizeof game_name, "%s", H->title ? H->title : "Game");
     const Choice choices[] = {{"game", game_name}, {"dark", "Dark"}, {"light", "Light"}, {"classic", "Classic"}};
     const char *cur = theme_choice();
     ImGui::SetNextItemWidth(300);
@@ -381,11 +381,11 @@ static void page_interface() {
     int pct = atoi(H->setting("ui_scale", "0"));
     static const int scales[] = {0, 75, 100, 125, 150, 175, 200, 250};
     char cs[32];
-    snprintf(cs, sizeof cs, pct ? "%d%%" : "Auto (by window size)", pct);
+    snprintf(cs, sizeof cs, pct ? "%d%%" : "Auto", pct);
     ImGui::SetNextItemWidth(300);
     if (ImGui::BeginCombo("Menu size", cs)) {
         for (int s : scales) {
-            snprintf(cs, sizeof cs, s ? "%d%%" : "Auto (by window size)", s);
+            snprintf(cs, sizeof cs, s ? "%d%%" : "Auto", s);
             if (ImGui::Selectable(cs, s == pct)) {
                 snprintf(cs, sizeof cs, "%d", s);
                 H->set_setting("ui_scale", cs);
@@ -395,7 +395,7 @@ static void page_interface() {
         ImGui::EndCombo();
     }
     if (p.ok) {                                         /* the game's palette, for reference */
-        ImGui::TextDisabled("This game's colours:");
+        ImGui::TextDisabled("Colours:");
         ImVec4 sw[] = {p.bg, p.panel, p.accent, p.accent2, p.text};
         for (int i = 0; i < 5; i++) {
             ImGui::SameLine();
@@ -426,7 +426,7 @@ static void help(const char *text) {
 static void bind_buttons(int kind, int i, const char *what, void (*clear)(int)) {
     ImGui::PushID(kind * 1000 + i);
     if (cap_kind == kind && cap_index == i) {
-        ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "%s (Esc cancels)", what);
+        ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "%s...", what);
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel")) cap_kind = CAP_NONE;
     } else {
@@ -442,7 +442,7 @@ static void clear_hotkey(int i) { H->set_hotkey_key(i, SDL_SCANCODE_UNKNOWN); }
 
 static void page_video() {
     struct Rate { int32_t v; const char *name; bool dev; };
-    static const Rate rates[] = {{-1, "30 (the game's own pace)", false}, {60, "60", false}, {120, "120", true},
+    static const Rate rates[] = {{-1, "30", false}, {60, "60", false}, {120, "120", true},
                                  {0, "Uncapped", true}};
     int32_t r = H->framerate();
     const char *cur = "?";
@@ -453,7 +453,7 @@ static void page_video() {
             if ((!x.dev || H->development) && ImGui::Selectable(x.name, x.v == r)) H->set_framerate(x.v);
         ImGui::EndCombo();
     }
-    help("Above 30 the game runs on our timing hooks; most of it plays right at 60.");
+    help("Above 30, the game runs on our timing hooks.");
     uint32_t s = H->render_scale();
     char cs[32];
     snprintf(cs, sizeof cs, "%ux  (%up)", s, 1080 * s);
@@ -465,17 +465,15 @@ static void page_video() {
         }
         ImGui::EndCombo();
     }
-    help("The game draws at 1080p docked; higher scales draw more pixels and shrink the picture to the window.");
+    help("Draws above 1080p, then scales to the window.");
     bool fps = H->fps_counter();
     if (ImGui::Checkbox("FPS counter", &fps)) H->set_fps_counter(fps);
     bool full = H->fullscreen();
-    if (ImGui::Checkbox("Fullscreen (Alt+Enter)", &full)) H->set_fullscreen(full);
+    if (ImGui::Checkbox("Fullscreen", &full)) H->set_fullscreen(full);
 }
 
 static void page_keyboard() {
-    if (ImGui::Button("Reset to the defaults")) H->reset_keys();
-    ImGui::SameLine();
-    ImGui::TextDisabled("Click Set, then press the key.");
+    if (ImGui::Button("Reset")) H->reset_keys();
     if (!ImGui::BeginTable("##keys", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -494,10 +492,10 @@ static void page_keyboard() {
             for (int b = 0; b < H->action_count; b++)
                 if (b != a && H->key(b) == k) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "also %s", H->action_label(b)); break; }
             for (int h = 0; h < H->hotkey_count(); h++)
-                if (H->hotkey_key(h) == k) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "taken by a hotkey"); break; }
+                if (H->hotkey_key(h) == k) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "hotkey too"); break; }
         }
         ImGui::TableNextColumn();
-        bind_buttons(CAP_KEY, a, "press a key", clear_key);
+        bind_buttons(CAP_KEY, a, "Press a key", clear_key);
     }
     ImGui::EndTable();
 }
@@ -511,20 +509,19 @@ static void page_mouse() {
     float rest = H->mouse_rest();
     ImGui::SetNextItemWidth(300);
     if (ImGui::SliderFloat("Resting speed", &rest, 0.0f, 500.0f, "%.0f px/s")) H->set_mouse_rest(rest);
-    help("Below this speed the camera does not move: a resting hand on a sensitive mouse still sends small motion.");
-    ImGui::TextDisabled("The mouse moves the right stick while it is captured: click the game to capture it, Esc frees it.");
+    help("Slower mouse motion than this is ignored.");
 }
 
 static void page_gamepad() {
     const char *pad = H->pad_connected();
     if (pad) ImGui::Text("Connected: %s", pad);
-    else ImGui::TextDisabled("No gamepad connected (the first one plugged in is player 1).");
+    else ImGui::TextDisabled("No gamepad connected");
     float dz = H->pad_deadzone() * 100.0f;
     ImGui::SetNextItemWidth(300);
     if (ImGui::SliderFloat("Stick dead zone", &dz, 0.0f, 50.0f, "%.0f%%")) H->set_pad_deadzone(dz / 100.0f);
-    if (ImGui::Button("Reset: by label (an Xbox pad's A is A)")) H->reset_pad(false);
+    if (ImGui::Button("Reset: Xbox layout")) H->reset_pad(false);
     ImGui::SameLine();
-    if (ImGui::Button("Reset: by position (A on the right)")) H->reset_pad(true);
+    if (ImGui::Button("Reset: Nintendo layout")) H->reset_pad(true);
     if (!ImGui::BeginTable("##pad", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -539,15 +536,15 @@ static void page_gamepad() {
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(H->pad_name(H->pad(a)));
         ImGui::TableNextColumn();
-        bind_buttons(CAP_PAD, a, "press a button on the gamepad", clear_pad);
+        bind_buttons(CAP_PAD, a, "Press a button", clear_pad);
     }
     ImGui::EndTable();
 }
 
 static void page_hotkeys() {
-    if (ImGui::Button("Reset to the defaults")) H->reset_hotkeys();
+    if (ImGui::Button("Reset")) H->reset_hotkeys();
     ImGui::SameLine();
-    ImGui::TextDisabled("Esc always frees the mouse; Alt+Enter is always fullscreen.");
+    ImGui::TextDisabled("Fixed: Esc, Alt+Enter");
     if (!ImGui::BeginTable("##hotkeys", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -566,7 +563,7 @@ static void page_hotkeys() {
             for (int a = 0; a < H->action_count; a++)
                 if (H->key(a) == k) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "also %s", H->action_label(a)); break; }
         ImGui::TableNextColumn();
-        bind_buttons(CAP_HOTKEY, i, "press a key", clear_hotkey);
+        bind_buttons(CAP_HOTKEY, i, "Press a key", clear_hotkey);
     }
     ImGui::EndTable();
 }
@@ -608,8 +605,7 @@ static void window_mods() {
     if (ImGui::Begin("Mods", &open)) {
         const ModFile *f;
         uint32_t n = H->mods_files(&f);
-        ImGui::TextWrapped("Mods are DLLs in the mods folder next to the game: put one there to install it, delete it to "
-                           "uninstall. Turning one off here keeps the file and applies at the next start.");
+        ImGui::TextDisabled("DLLs in the mods folder. Changes apply at the next start.");
         if (!n) ImGui::TextDisabled("No mods installed.");
         else if (ImGui::BeginTable("##mods", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed);
@@ -687,7 +683,7 @@ static void room_modal() {
     if (pend.leave) ImGui::TextUnformatted("Leave the room?");
     else ImGui::Text("Join \"%s\"?", pend.name);
     if (H->in_session())
-        ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "You are in a local session (Union Circle, a raid, ...): it ends.");
+        ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "This ends your current session.");
     if (!pend.leave && pend.need_pw) {
         ImGui::SetNextItemWidth(260);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
@@ -710,7 +706,7 @@ static void room_status_line() {
     if (s == UI_ROOM_JOINED) ImGui::Text("In room: %s", m);
     else if (s == UI_ROOM_JOINING) ImGui::Text("Joining %s ...", m);
     else if (s == UI_ROOM_FAILED) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s", m);
-    else ImGui::TextDisabled("Not in a room (local play is offline).");
+    else ImGui::TextDisabled("Not in a room");
 }
 
 static bool host_port(const char *in, char *host, size_t n, uint16_t *port) {
@@ -747,12 +743,12 @@ static void window_rooms() {
         int s = H->room_state();
         if (s == UI_ROOM_JOINED) { ImGui::SameLine(); if (ImGui::SmallButton("Leave")) want_leave(); }
         if (H->in_session())
-            ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "In a local session: switching rooms ends it.");
+            ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "Switching ends your session.");
         ImGui::SetNextItemWidth(200);
         ImGui::InputText("Nickname", nick_buf, sizeof nick_buf);
         ImGui::SameLine();
         if (ImGui::Button("Save")) snprintf(nick_msg, sizeof nick_msg, "%s", H->set_nickname(nick_buf) ?
-            "Saved (used from the next join)." : "4 to 20 letters, digits, spaces, . _ or -");
+            "Saved" : "4-20 letters or digits");
         if (*nick_msg) { ImGui::SameLine(); ImGui::TextDisabled("%s", nick_msg); }
 
         ImGui::SeparatorText("Public rooms");
@@ -761,7 +757,7 @@ static void window_rooms() {
         int n = H->lobby(g_rooms, 256, &loading, err, sizeof err);
         if (ImGui::Button(loading ? "Loading..." : "Refresh") && !loading) H->lobby_refresh();
         ImGui::SameLine();
-        ImGui::Checkbox("Only this game's rooms", &game_only);
+        ImGui::Checkbox("This game only", &game_only);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(200);
         ImGui::InputTextWithHint("##search", "search", search_buf, sizeof search_buf);
@@ -807,10 +803,10 @@ static void window_rooms() {
         }
         ImGui::SeparatorText("Direct connect");
         ImGui::SetNextItemWidth(260);
-        ImGui::InputTextWithHint("##direct", "host or host:port (24872)", direct_buf, sizeof direct_buf);
+        ImGui::InputTextWithHint("##direct", "host[:port]", direct_buf, sizeof direct_buf);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(160);
-        ImGui::InputTextWithHint("##dpw", "password (if any)", direct_pw, sizeof direct_pw, ImGuiInputTextFlags_Password);
+        ImGui::InputTextWithHint("##dpw", "password", direct_pw, sizeof direct_pw, ImGuiInputTextFlags_Password);
         ImGui::SameLine();
         char host[128];
         uint16_t port;
@@ -843,7 +839,7 @@ static void menu_bar() {
     if (ImGui::BeginMenu("Mods")) {
         const ModWindow *w;
         uint32_t n = H->mods_windows(&w);
-        if (!n) ImGui::MenuItem("(no mod windows)", nullptr, false, false);
+        if (!n) ImGui::MenuItem("(none)", nullptr, false, false);
         for (uint32_t i = 0; i < n; i++) {
             int k = H->hotkey_key(w[i].hotkey);
             if (ImGui::MenuItem(w[i].title, k ? key_name(k) : nullptr, w[i].is_open())) H->mods_window_toggle(i);
@@ -860,10 +856,10 @@ static void menu_bar() {
         else ImGui::MenuItem("Not in a room", nullptr, false, false);
         ImGui::Separator();
         if (ImGui::MenuItem("Rooms...")) rooms_open = true;
-        if (ImGui::MenuItem("Leave the room", nullptr, false, s == UI_ROOM_JOINED)) want_leave();
+        if (ImGui::MenuItem("Leave room", nullptr, false, s == UI_ROOM_JOINED)) want_leave();
         ImGui::EndMenu();
     }
-    const char *hint = "Esc frees the mouse  |  click the game to play";
+    const char *hint = "Esc: free the mouse";
     float wdt = ImGui::CalcTextSize(hint).x + ImGui::GetStyle().ItemSpacing.x * 2;
     if (ImGui::GetContentRegionAvail().x > wdt) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - wdt);

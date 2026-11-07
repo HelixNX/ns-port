@@ -43,9 +43,9 @@ static const char *const act_id[ACT_COUNT] = {
     "a", "b", "x", "y", "l", "r", "zl", "zr", "plus", "minus", "lstick", "rstick", "dleft", "dup", "dright", "ddown",
     "ls_left", "ls_up", "ls_right", "ls_down", "rs_left", "rs_up", "rs_right", "rs_down"};
 static const char *const act_label[ACT_COUNT] = {
-    "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+ (Plus)", "- (Minus)", "Left stick click", "Right stick click",
-    "D-pad left", "D-pad up", "D-pad right", "D-pad down", "Left stick left", "Left stick up", "Left stick right",
-    "Left stick down", "Right stick left", "Right stick up", "Right stick right", "Right stick down"};
+    "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+", "-", "L stick click", "R stick click",
+    "D-pad left", "D-pad up", "D-pad right", "D-pad down", "L stick left", "L stick up", "L stick right",
+    "L stick down", "R stick left", "R stick up", "R stick right", "R stick down"};
 static const SDL_Scancode key_def[ACT_COUNT] = {
     SDL_SCANCODE_Z, SDL_SCANCODE_X, SDL_SCANCODE_C, SDL_SCANCODE_V, SDL_SCANCODE_Q, SDL_SCANCODE_R, SDL_SCANCODE_1,
     SDL_SCANCODE_3, SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
@@ -85,19 +85,19 @@ void input_set_pad(int a, int b) {
 const char *input_pad_name(int b) {
     switch (b) {
     case PAD_NONE: return "(none)";
-    case PAD_LEFT_TRIGGER: return "Left trigger";
-    case PAD_RIGHT_TRIGGER: return "Right trigger";
-    case SDL_GAMEPAD_BUTTON_SOUTH: return "Bottom face button";
-    case SDL_GAMEPAD_BUTTON_EAST: return "Right face button";
-    case SDL_GAMEPAD_BUTTON_WEST: return "Left face button";
-    case SDL_GAMEPAD_BUTTON_NORTH: return "Top face button";
-    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "Left shoulder";
-    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "Right shoulder";
-    case SDL_GAMEPAD_BUTTON_START: return "Start / Menu";
-    case SDL_GAMEPAD_BUTTON_BACK: return "Back / View";
+    case PAD_LEFT_TRIGGER: return "L trigger";
+    case PAD_RIGHT_TRIGGER: return "R trigger";
+    case SDL_GAMEPAD_BUTTON_SOUTH: return "Bottom";
+    case SDL_GAMEPAD_BUTTON_EAST: return "Right";
+    case SDL_GAMEPAD_BUTTON_WEST: return "Left";
+    case SDL_GAMEPAD_BUTTON_NORTH: return "Top";
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "L shoulder";
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "R shoulder";
+    case SDL_GAMEPAD_BUTTON_START: return "Start";
+    case SDL_GAMEPAD_BUTTON_BACK: return "Back";
     case SDL_GAMEPAD_BUTTON_GUIDE: return "Guide";
-    case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "Left stick click";
-    case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "Right stick click";
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "L stick click";
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "R stick click";
     case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return "D-pad left";
     case SDL_GAMEPAD_BUTTON_DPAD_UP: return "D-pad up";
     case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return "D-pad right";
