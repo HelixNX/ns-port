@@ -1345,5 +1345,46 @@ Routes (the user's choices so far):
    event lists (EncounterDist9 / EncounterMight9), already in the NuGet cache svedit uses. Then either serve
    `build/bcat/delivery/raid/*_3_0_0` from bcat.c (the game parses and saves them itself; most faithful) or write the
    blocks from the F6 mod / svedit, and point dens at content 2 / 3.
+   **2026-11-07: his save arrived** (`build/saves/friend-2026-11-07/main`; PKHeX reads it as SAV9SV). Raid blocks
+   non-zero (enemy 12,432 / 30,000 bytes, fixed rewards 6,741, lottery 13,301, priority 32 / 88, identifier set;
+   dumped to `build/bcat/friend/`). `svedit copy <main> <from main> "^KBCAT|^KOutbreakBC"` copies the 5 KBCATRaid*,
+   the KBCATOutbreak* (zones x3, poke data, enabled) and the 336 KOutbreakBC* (active BCAT outbreaks) blocks; on a
+   scratch copy of ours: 173 changed, 170 already equal, reloads. Dens still need a day reroll (or F6) to pick an
+   event raid. Written into `build/save` 2026-11-07 (backup `build/saves/save-backup-2026-11-07-preevent`).
+   User: no difference in game yet (the game loaded the written save; the blocks are still there). Expected: dens
+   only take delivered raids at the new-day reroll, which has not happened. His KBCATRaidIdentifier is 20230728
+   (0x0134B248; also inside the priority table), so the delivery he got is dated 2023-07-28; his BCAT outbreak
+   NumActive are 0 (zones and poke data are filled). Parked by the user ("something for later"). To force it later
+   (the user: "we might have to force a reload"): start with `NX_TIME` set a day ahead (time.c shifts the guest
+   clock; does the new-day handler 01ea82c0 run on load?), or post RaidGemForceLottery ourselves (01ea821c on M+8).
 Not wanted: fetching from Nintendo's servers. Downloading community archives of past event files: ask first.
 Multiplayer: joiners should get the boss from the host (unconfirmed), so only the host needs the event.
+
+## Raid crystals rebuilt on demand (2026-11-07; built, NOT yet tried in game)
+
+User report: seeds written with F6 showed only after a restart (since at least 2026-11-06; not from the mod
+split). The game's refresh path, found with Ghidra (7 s a batch on build/analysis/ghidra; the IDA database for main
+is not on this machine, idalib without analysis gives JUMPOUTs):
+- Event names `RaidGemForceLottery` / `RaidGemForceReflection` are posted by `01ea821c(target, name)` (FNV-1a 64 of
+  the name as a value under key 0xdcbfd50a277e546d, through 015745bc). Lottery (the new-day reroll) from 01d93564
+  (a day counter M+0x16a8 against another object's +0xe300) and 01ea82c0 (new-day reset, M+0x2c set); Reflection
+  from the manager's per-frame update 2933374(M, dt) when M+0x1662 is set, and from 29337b4 (registers an area's
+  spawn points: area key into M+0x740/748/750 = group 1-3, entries with standard / black / event flags).
+- Manager layout and the rebuild recipe (entry+0x98 = 0, crystal+0xd1 = 1, M+0x1662 = 1; the same in 29341d8,
+  29343a0, 01ea82c0): see the header of `violetrecomp/raidgem.c`. M+0x2d holds 300 x 6-byte per-den entries
+  {i32 -1, u8 0} reset only by the new-day handler: suspected cache of the den's raid (why writes needed a restart);
+  unconfirmed, logged by raidgem.c (`raidgem:` lines in run.log: the first 16 entries and the first crystal entries).
+- Hook: patches.txt `main+2933398 after raidgem_update`; export `violet_raid_refresh(1 rebuild | 2 also reset the
+  per-den state)`; F6 calls 1 after every write and has "Rebuild crystals" / "Rebuild + reset den state" buttons.
+- Lift: `py -3.12 ../../nxrecomp/tools/lifter/a64lift.py lift ../build/lifted` from violetrecomp (2 min; plain
+  `python` here is 3.13 without capstone). build.bat does not lift.
+- Next: the user writes a seed into a visible den; does the crystal change (Tera colour, then the battle) with a
+  plain rebuild, or only with the reset? Read the raidgem lines to name the M+0x2d fields.
+- **User result (2026-11-07): both buttons make the crystals disappear.** The map updates, but the crystals never
+  come back (not after moving around either). So the recipe tears them down without the respawn: the rebuild
+  recipe is incomplete or in the wrong order (a step from 29341d8 / 29343a0 / 01ea82c0 missing, or Reflection
+  needs the area re-registered through 29337b4). Read the `raidgem:` lines of that run before changing it.
+  That run's log (build/run.log, 2026-11-07 17:2x): `groups 0 0 0 0`, den state all `-1:0000`, 119 entries all
+  `placed 1, crystal 0`: no crystal objects and no area keys at the time of the refresh, so marking `+0x98 = 0`
+  un-places entries that have no crystal to rebuild. Suspect: entries must be re-placed by the spawn path
+  (29337b4) or the Lottery, not by the flag alone. Parked with the event raids (user: later).

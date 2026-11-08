@@ -78,7 +78,11 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 1. Try the F8 changes above; confirm the wild spec on a caught mon (overworld shiny vs battle shiny).
 2. Spawn-pool rules: wrap the encounter table's filter / per-entry rules (version, time, flags, weights; F8 weights
    are the first step), spawn density parameters. NOTES.md, "Planned next" item 3.
-3. **In progress: event raids** (past, custom, and a friend's homebrewed Switch save). Start from NOTES.md, the last section,
+3. **Raid crystals not refreshing after F6 writes**: rebuild hook built 2026-11-07; user-tried: rebuild and
+   reset both make the crystals vanish (map updates, they never come back). NOTES.md, "Raid crystals rebuilt on demand".
+   Event data from a friend's save (delivery 2023-07-28) is in `build\save` (svedit `copy`); no change in game until
+   a day reroll. Parked (the user: later); forcing the reroll is the next step.
+   **In progress: event raids** (past, custom, and a friend's homebrewed Switch save). Start from NOTES.md, the section
    "Event raids from online" (delivery file names, save blocks, both routes, what is waiting).
 4. The two F12 captures of 2026-11-06 (missing letters, rain).
 5. Performance: NOTES.md, "Next (written 2026-10-22 ...)".
