@@ -30,6 +30,7 @@ typedef struct AudioOut {
 
 static AudioOut *outs;
 static SRWLOCK outs_lock = SRWLOCK_INIT;
+static bool no_audio;                /* NX_NOAUDIO: read once in audout_register */
 
 static u64 qpc(void) { LARGE_INTEGER n; QueryPerformanceCounter(&n); return (u64)n.QuadPart; }
 static u64 qpf(void) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (u64)f.QuadPart; }
@@ -218,7 +219,7 @@ static void open_out(IpcReq *r, const IpcBuf *name_out) {
     a->state = 1;
     a->volume = 1.0f;
     a->event = event_create();
-    if (!getenv("NX_NOAUDIO") && SDL_WasInit(SDL_INIT_AUDIO)) {
+    if (!no_audio && SDL_WasInit(SDL_INIT_AUDIO)) {
         SDL_AudioSpec spec = {SDL_AUDIO_S16, (int)a->channels, (int)a->rate};
         a->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (!a->stream) hlog(0, "audout: no output stream: %s", SDL_GetError());
@@ -249,6 +250,7 @@ static const Iface iface_audout = {"audout:u", (const IpcCmd[]){
 static SvcObj *open_audout(const char *name) { return svcobj_new(&iface_audout, NULL, name); }
 
 void audout_register(void) {
+    no_audio = getenv("NX_NOAUDIO") != NULL;
     service_register("audout:u", open_audout);
     _beginthreadex(NULL, 0, release_thread, NULL, 0, NULL);
 }

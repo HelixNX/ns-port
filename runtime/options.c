@@ -158,7 +158,13 @@ void options_init(void) {
     }
     if (f) { fclose(f); hlog(1, "options: %s", path); }
     const char *v;
-    if ((v = options_get("framerate", NULL)) && !getenv("NX_FRAMERATE") && !getenv("NX_NOPACE")) nx_framerate_set(atoi(v));
+    if ((v = options_get("framerate", NULL)) && !getenv("NX_FRAMERATE") && !getenv("NX_NOPACE")) {
+        s32 r = atoi(v);
+#ifdef NX_PACKAGE                       /* players get 30 or 60 only (the menu's choices); anything else is 30 */
+        if (r != 60) r = FRAMERATE_GAME;
+#endif
+        nx_framerate_set(r);
+    }
     if ((v = options_get("fps_counter", NULL)) && !getenv("NX_FPS")) overlay_set(atoi(v) != 0);
     if ((v = options_get("render_scale", NULL))) gpu_render_scale_set((u32)atoi(v));
     const char *rs = getenv("NX_RES_SCALE");

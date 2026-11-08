@@ -334,6 +334,8 @@ static u64 guest_pc_of(DWORD64 rip) {
  * GPU writes (imported guest memory) are not seen */
 static u64 watch_lo, watch_hi, watch_a, watch_n;
 static volatile long watch_hits;
+static USHORT watch_depth = 24;     /* NX_WATCH_DEPTH, NX_WATCH_PAGE: read in diag_init */
+static bool watch_page;
 
 static unsigned __stdcall watch_arm(void *p) {
     Sleep((DWORD)(uintptr_t)p);
@@ -350,7 +352,7 @@ static void watch_stack(void) {
     si->SizeOfStruct = sizeof(SYMBOL_INFO);
     si->MaxNameLen = 255;
     void *frames[24];
-    USHORT nf = RtlCaptureStackBackTrace(3, getenv("NX_WATCH_DEPTH") ? (USHORT)atoi(getenv("NX_WATCH_DEPTH")) : 24, frames, NULL);
+    USHORT nf = RtlCaptureStackBackTrace(3, watch_depth, frames, NULL);
     for (USHORT i = 0; i < nf; i++) {
         DWORD64 d = 0;
         if (SymFromAddr(GetCurrentProcess(), (DWORD64)frames[i], &d, si))
@@ -377,7 +379,7 @@ static LONG watch_fault(EXCEPTION_POINTERS *ep) {
             hlog(0, "watch: write to %llx (was %llx at %llx) at %s", a, v, a & ~7ull, who);
             watch_stack();
         }
-    } else if (getenv("NX_WATCH_PAGE")) {
+    } else if (watch_page) {
         static u64 seen[512];
         static int nseen;
         bool known = false;
@@ -747,6 +749,10 @@ void diag_init(void) {
     AddVectoredExceptionHandler(1, crash_handler);
     const char *w = getenv("NX_WATCH_MEM");
     if (w) {
+        const char *d = getenv("NX_WATCH_DEPTH");
+        if (d) watch_depth = (USHORT)atoi(d);
+        if (watch_depth > 24) watch_depth = 24;  /* frames[24] */
+        watch_page = getenv("NX_WATCH_PAGE") != NULL;
         char *end;
         u64 a = strtoull(w, &end, 16), n = *end == ':' ? strtoull(end + 1, &end, 16) : 8;
         u32 ms = *end == '@' ? (u32)strtoul(end + 1, NULL, 10) : 0;

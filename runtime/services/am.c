@@ -235,10 +235,12 @@ static DWORD WINAPI kbd_thread(void *p) {
     return 0;
 }
 
+static const char *player_name;      /* NX_PLAYER_NAME (unattended runs): read once in am_register */
+
 static void la_start(SvcObj *o, IpcReq *r) {
     LibApplet *a = o->data;
     a->started = true;
-    const char *name = getenv("NX_PLAYER_NAME");
+    const char *name = player_name;
     if (a->id == 0x11 && !(name && *name)) {
         hlog(1, "am: keyboard (mode %u, type %u, up to %u characters): \"%ls\"", a->mode, a->kbd_type, a->kbd_max,
              a->kbd_prompt);
@@ -440,6 +442,7 @@ static const Iface iface_oe = {"appletOE", (const IpcCmd[]){
 static SvcObj *open_oe(const char *name) { return svcobj_new(&iface_oe, NULL, name); }
 
 void am_register(void) {
+    player_name = getenv("NX_PLAYER_NAME");
     msg_event = event_create();
     launchable_event = event_create();
     suspended_tick_event = event_create();
