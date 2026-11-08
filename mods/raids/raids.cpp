@@ -17,8 +17,9 @@
  * nature. The Tera type comes from another fresh generator (NextInt(18), or NextInt(2) between the species' two
  * types). The tables come from the game's files (raiddata.py -> <build>\mods\raids.dat).
  *
- * The finder searches seeds for a species (and shiny / Tera type) and writes them into dens. The world's crystals
- * show a den's new raid once the area reloads. The item giver and the mon spawner are mods of their own
+ * The finder searches seeds for a species (and shiny / Tera type) and writes them into dens. After a write the
+ * world's crystals are rebuilt through the exe's export violet_raid_refresh (raidgem.c: the game's own per-crystal
+ * refresh, for every crystal; without it a written seed showed only after a restart). The item giver and the mon spawner are mods of their own
  * (mods/items, mods/mons). */
 #include "filtercombo.h"
 #include "modkit.h"
@@ -426,6 +427,20 @@ static Den g_dens[100];
 static bool g_have_dens;
 static std::string g_status;
 
+/* raidgem.c in the exe: 1 rebuild the crystals, 2 also reset the game's per-den state; returns the manager (0: none
+ * seen yet), or -1 when the exe has no such export */
+static long long refresh_crystals(int what) {
+    typedef unsigned long long (*Refresh)(int);
+    static Refresh f = (Refresh)(void *)GetProcAddress(GetModuleHandleW(nullptr), "violet_raid_refresh");
+    return f ? (long long)f(what) : -1;
+}
+
+static const char *refresh_note(long long r) {
+    return r < 0 ? " This build can't rebuild the crystals: restart the game to see them."
+           : r == 0 ? " No crystals loaded yet: they show when the area loads."
+                    : " The crystals rebuild now.";
+}
+
 static void stats_line(const Result &r) {
     const Raid &e = *r.raid;
     ImGui::Text("%s%s  Lv.%u  %d stars  Tera %s", name_of(D.species, e.dev), r.shiny ? "  (shiny)" : "",
@@ -462,6 +477,12 @@ static void ui() {
     g_have_dens = read_dens(g_region, g_dens);
     u32 nd = region_dens[g_region];
     if (!g_have_dens) ImGui::TextDisabled("No %s dens found: scan again after loading.", region_names[g_region]);
+    if (ImGui::Button("Rebuild crystals")) g_status = std::string("Rebuild asked.") + refresh_note(refresh_crystals(1));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rebuilds the raid crystals in the world from the dens as they are now (no reroll).");
+    ImGui::SameLine();
+    if (ImGui::Button("Rebuild + reset den state")) g_status = std::string("Rebuild and reset asked.") + refresh_note(refresh_crystals(2));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Also clears the game's per-den state, which a new day clears (testing: use if a plain rebuild "
+                          "doesn't show the new raid).");
 
     if (g_have_dens && ImGui::BeginTable("dens", 8, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
                                                    ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
@@ -514,8 +535,8 @@ static void ui() {
         if (ImGui::Button("Write seed")) {
             u32 s = (u32)strtoul(g_seed_text, NULL, 16);
             int n = write_den(g_region, (u32)g_sel, s, (u32)content, g_enable);
-            char m[96];
-            snprintf(m, sizeof m, "den %d: seed %08X written (%d copies)", g_sel, s, n);
+            char m[192];
+            snprintf(m, sizeof m, "den %d: seed %08X written (%d copies).%s", g_sel, s, n, refresh_note(refresh_crystals(1)));
             g_status = m;
         }
     }
@@ -601,9 +622,9 @@ static void ui() {
                         copies += write_den(g_region, i, g_found_seeds[i], content, g_enable);
                         dens++;
                     }
-                char m[128];
-                snprintf(m, sizeof m, "%d den(s) written (%d block copies). Fly somewhere or reload the area to see them.",
-                         dens, copies);
+                char m[192];
+                snprintf(m, sizeof m, "%d den(s) written (%d block copies).%s", dens, copies,
+                         refresh_note(refresh_crystals(1)));
                 g_status = m;
                 g_found_seeds.clear();
             }

@@ -6,6 +6,8 @@
 //   dotnet run -- items <save>\main <out>          write items.txt for the item mod: "id \t pocket \t name"
 //   dotnet run -- find <save>\main <regex>         list PKHeX's block names matching regex, their keys and state
 //   dotnet run -- dump <save>\main <dir> <key>...   blocks' raw data to <dir>\<key>.bin
+//   dotnet run -- copy <save>\main <other>\main <regex>  blocks named like regex from another save (event data:
+//                                                  "^KBCAT|^KOutbreakBC": delivered raids / outbreaks, active BCAT outbreaks)
 //   dotnet run -- addmon <save>\main <species> <level> <nature> <ability 0-2> <nickname> <m1,m2,m3,m4> <hp/atk/def/spa/spd/spe EVs>
 //                                                  a made-up mon (full IVs, the save's trainer), party or first free box slot
 //
@@ -242,6 +244,38 @@ switch (args[0])
             File.WriteAllBytes(Path.Combine(args[2], $"{key:X8}.bin"), b.Data.ToArray());
             Console.WriteLine($"{key:X8} {b.Type} {b.Data.Length} bytes, {b.Data.ToArray().Count(x => x != 0)} nonzero");
         }
+        return 0;
+    }
+    case "copy":
+    {
+        // copy <main> <from main> <regex>: blocks whose PKHeX name matches, from another save into this one (data, or
+        // the type for booleans). Event data: "^KBCAT|^KOutbreakBC" (delivered raids and outbreaks, active BCAT outbreaks)
+        var src = (SAV9SV)SaveUtil.GetSaveFile(args[2])!;
+        var re = new Regex(args[3], RegexOptions.IgnoreCase);
+        int n = 0, same = 0;
+        foreach (var f in typeof(SaveBlockAccessor9SV).GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+        {
+            if (!f.IsLiteral || !re.IsMatch(f.Name)) continue;
+            var key = Convert.ToUInt32(f.GetRawConstantValue());
+            if (!src.Accessor.TryGetBlock(key, out var sb) || !sav.Accessor.TryGetBlock(key, out var db))
+            { Console.WriteLine($"{f.Name} {key:X8}: missing in {(src.Accessor.TryGetBlock(key, out _) ? "this save" : "the source")}, skipped"); continue; }
+            bool isBool(SCTypeCode t) => t is SCTypeCode.Bool1 or SCTypeCode.Bool2 or SCTypeCode.Bool3;
+            if (isBool(sb!.Type) && isBool(db!.Type))
+            {
+                if (sb.Type == db.Type) { same++; continue; }
+                Console.WriteLine($"{f.Name} {key:X8}: {db.Type} -> {sb.Type}");
+                db.ChangeBooleanType(sb.Type); n++; continue;
+            }
+            if (sb.Type != db!.Type || sb.Data.Length != db.Data.Length)
+            { Console.WriteLine($"{f.Name} {key:X8}: {sb.Type}/{sb.Data.Length} vs {db.Type}/{db.Data.Length}, skipped"); continue; }
+            if (sb.Data.ToArray().SequenceEqual(db.Data.ToArray())) { same++; continue; }
+            db.ChangeData(sb.Data.ToArray());
+            Console.WriteLine($"{f.Name} {key:X8}: {db.Type} {db.Data.Length} bytes copied");
+            n++;
+        }
+        File.WriteAllBytes(path, sav.Write().ToArray());
+        SaveUtil.GetSaveFile(path);
+        Console.WriteLine($"{n} blocks changed, {same} already the same; written and reloaded");
         return 0;
     }
     case "find":

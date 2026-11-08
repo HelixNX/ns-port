@@ -28,3 +28,6 @@ main+debff8  was aa1303e0 after wild_created         # mov x0, x19
 #
 # Dev toggle "wild Pokemon don't start battles" (wild.c, the raids mod's F8): the AI's set-encounter-enabled call.
 main+1d0e5e4 was 2a0103f3 after encount_enable       # mov w19, w1: the enable bit
+#
+# Tera raid crystals rebuilt on demand (raidgem.c, the raids mod's F6): the crystal manager's per-frame update.
+main+2933398 was aa0003f3 after raidgem_update       # mov x19, x0: the manager

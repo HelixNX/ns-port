@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.24)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "Release (default) or Debug")
 project(violetrecomp C CXX)          # C++: the mods (ImGui)
 include("${CMAKE_SOURCE_DIR}/../../nxrecomp/nxrecomp.cmake")
-nx_game(GAME_JSON "${CMAKE_SOURCE_DIR}/game.json" SOURCES "${CMAKE_SOURCE_DIR}/fps.c" "${CMAKE_SOURCE_DIR}/gfx.c" "${CMAKE_SOURCE_DIR}/lua.c" "${CMAKE_SOURCE_DIR}/wild.c" NETPLAY)
+nx_game(GAME_JSON "${CMAKE_SOURCE_DIR}/game.json" SOURCES "${CMAKE_SOURCE_DIR}/fps.c" "${CMAKE_SOURCE_DIR}/gfx.c" "${CMAKE_SOURCE_DIR}/lua.c" "${CMAKE_SOURCE_DIR}/wild.c" "${CMAKE_SOURCE_DIR}/raidgem.c" NETPLAY)
 # mods (nxrecomp/runtime/nxmod.h), each optional, loaded from <build>/cmake/mods; their windows are in the menu's Mods
 # list. Data in <build>/mods: raids.dat (mods/raids/raiddata.py), items.txt and mons_*.txt (tools/svedit)
 nx_mod(violet_raids SOURCES "${CMAKE_SOURCE_DIR}/mods/raids/raids.cpp")           # Tera raids (F6)
