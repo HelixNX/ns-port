@@ -86,6 +86,8 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
    "Event raids from online" (delivery file names, save blocks, both routes, what is waiting).
 4. The two F12 captures of 2026-11-06 (missing letters, rain).
 5. Performance: NOTES.md, "Next (written 2026-10-22 ...)".
+6. Older GPUs (a tester's RX 580 lacks `EXT_vertex_input_dynamic_state` and `KHR_index_type_uint8`, and GCN has no
+   32-wide waves): the plan is in `nxrecomp/docs/GPUS.md`, not started (the user: a friend may take it).
 
 ## ROMs
 
