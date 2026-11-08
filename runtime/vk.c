@@ -277,21 +277,32 @@ static VkPhysicalDevice pick_device(void) {
     if (n > 8) n = 8;
     vkEnumeratePhysicalDevices(vk.instance, &n, devs);
     VkPhysicalDevice best = NULL;
+    char why[1024] = "";                                  /* each unusable GPU and what it lacks, for the message */
+    size_t wl = 0;
     for (u32 i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(devs[i], &p);
         u32 ne = 0;
         vkEnumerateDeviceExtensionProperties(devs[i], NULL, &ne, NULL);
-        VkExtensionProperties *e = malloc(ne * sizeof *e);
+        VkExtensionProperties *e = malloc((ne ? ne : 1) * sizeof *e);
         vkEnumerateDeviceExtensionProperties(devs[i], NULL, &ne, e);
-        bool ok = p.apiVersion >= VK_API_VERSION_1_3;
-        for (size_t k = 0; k < sizeof device_exts / sizeof *device_exts; k++) ok = ok && has_ext(e, ne, device_exts[k]);
+        char miss[768] = "";
+        size_t ml = 0;
+        if (p.apiVersion < VK_API_VERSION_1_3)
+            ml += snprintf(miss + ml, sizeof miss - ml, " Vulkan 1.3 (has %u.%u)", VK_API_VERSION_MAJOR(p.apiVersion),
+                           VK_API_VERSION_MINOR(p.apiVersion));
+        for (size_t k = 0; k < sizeof device_exts / sizeof *device_exts; k++)
+            if (!has_ext(e, ne, device_exts[k]) && ml < sizeof miss)
+                ml += snprintf(miss + ml, sizeof miss - ml, " %s", device_exts[k] + 3);    /* without "VK_" */
         free(e);
-        hlog(1, "vk: %s (Vulkan %u.%u)%s", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
-             VK_API_VERSION_MINOR(p.apiVersion), ok ? "" : ": missing features");
+        bool ok = !miss[0];
+        hlog(1, "vk: %s (Vulkan %u.%u, driver %x)%s%s", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
+             VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion, ok ? "" : ": missing", miss);
+        if (!ok && wl < sizeof why) wl += snprintf(why + wl, sizeof why - wl, "\n\n%s lacks:%s", p.deviceName, miss);
         if (ok && (!best || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) best = devs[i];
     }
-    if (!best) fatal("No graphics card with Vulkan 1.3 and the extensions the game needs was found.\n\nUpdate your graphics driver; older GPUs are not supported.");
+    if (!best) fatal("No graphics card with Vulkan 1.3 and the extensions the game needs was found.%s\n\nUpdate your "
+                     "graphics driver; older GPUs may not be supported.", n ? why : "\n\n(Vulkan lists no GPUs.)");
     return best;
 }
 
