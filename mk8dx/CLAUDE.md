@@ -119,7 +119,7 @@ MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 ### Netplay (2026-10-31: local play over community rooms)
 
 - The user's call: multiplayer through the community room servers Eden/yuzu/Citra use (a bridge for LDN), MK8
-  only (`nx_game(... NETPLAY)` in `mk8recomp/CMakeLists.txt`; Violet does not build it). Our own code, compatible
+  only (`nx_game(... NETPLAY)` in `mk8recomp/game.cmake`; Violet does not build it). Our own code, compatible
   on the wire with Eden so both meet in the same rooms; Eden's sources (`../deps/suyu`: `src/network`,
   `src/core/hle/service/ldn`, `src/core/internal_network/socket_proxy.cpp`) were read for the protocol only.
 - Libraries (the user approved both downloads): `../deps/enet` (lsalzman/enet v1.3.18, the rooms' transport) and
@@ -316,7 +316,7 @@ MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 | `build/lifted/`, `build/cmake/`, `build/a64test/` | lifted C, the CMake/Ninja build, differential-test work files |
 | `build/image/`, `build/save/`, `build/sysdata/`, `build/run.log` | relocated module images, save data, system data archives (from `../firmware/22.5.0/`), the last run's log |
 | `build/shaders/`, `build/frames/` | dumped Maxwell shaders (+ `glsl/`, `spv/` translations); frame and render target dumps |
-| `mk8recomp/` | MK8's part of the source: `game.json` (modules and bases, title, paths), `CMakeLists.txt` (calls `nx_game` from `../../nxrecomp/nxrecomp.cmake`), `build.bat`, `run.ps1`, `gputest.ps1`. Everything else (runtime, lifter, shader tools) is in the shared `../nxrecomp` (see `../CLAUDE.md`); its tools find `game.json` from the current directory, so run them from `mk8recomp` |
+| `mk8recomp/` | MK8's part of the source: `game.json` (modules and bases, title, paths), `game.cmake` (calls `nx_game`; included by the root `CMakeLists.txt` with `NX_GAME=mk8`), `build.bat` (calls the root `build.bat mk8`), `run.ps1`, `gputest.ps1`. Everything else (runtime, lifter, shader tools) is in the shared `../nxrecomp` (see `../CLAUDE.md`); its tools find `game.json` from the current directory, so run them from `mk8recomp` |
 
 3.0.5 main: text 0xb510c8 (11.3 MB), ro 0x654c68, data 0x16abe0, bss 0x50cd0. 1.0.0 and 3.0.1 are 32-bit (A32); the shelved 1.0.0 work (dump, A32 lifter, plan) was deleted on 2026-10-17
 (still in git history before that date).
@@ -328,7 +328,7 @@ MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 - Lifter (from `mk8recomp`, `$L` = `../../nxrecomp/tools/lifter`): `python $L/a64lift.py cover` (coverage, 40 s),
   `python $L/a64lift.py lift ../build/lifted`, `python $L/a64image.py ../build/image`, `python $L/a64test.py --per 8 --states 4 [--pairs] [--filter REGEX]` (5 min; failures go to
   `build/a64test/failures.txt` with their states). Rerun the tests after any change to a64insn/a64simd/a64rt.
-- Build: `mk8recomp\build.bat` (vcvars + CMake + Ninja + clang-cl; configures `build/cmake` on first use). Keep it
+- Build: `mk8recomp\build.bat` = `..\build.bat mk8` (vcvars + CMake + Ninja + clang-cl; configures `build/cmake` from the root `CMakeLists.txt` on first use). Keep it
   Release: CMake's default Debug flags for clang-cl (`/Zi /RTC1`) made one file take 6 min and the library 3.5x
   larger. A file compiles in 15-30 s; `LIFT_JOBS` (8) limits parallel compiles to fit 16 GB.
 

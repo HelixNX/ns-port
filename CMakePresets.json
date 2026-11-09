@@ -1,0 +1,33 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{NX_CC}",
+        "CMAKE_CXX_COMPILER": "$env{NX_CC}"
+      }
+    },
+    {
+      "name": "violet",
+      "displayName": "Pokemon Violet",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/pokemon-violet/build/cmake",
+      "cacheVariables": { "NX_GAME": "violet" }
+    },
+    {
+      "name": "mk8",
+      "displayName": "Mario Kart 8 Deluxe",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/mk8dx/build/cmake",
+      "cacheVariables": { "NX_GAME": "mk8" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "violet", "configurePreset": "violet" },
+    { "name": "mk8", "configurePreset": "mk8" }
+  ]
+}

@@ -15,7 +15,7 @@ From the workspace root (`..\start.ps1` wraps the scripts in `violetrecomp\`, wh
 | Do | Command |
 |---|---|
 | Play (builds first; runs until the game is closed; log `build\run.log`) | `.\start.ps1 violet` (`-NoBuild` to skip the build, `-Log 2`, `-Timeout <s>` for unattended runs) |
-| Build only (first time configures `build\cmake`, ~25 min from scratch; keep it Release) | `.\start.ps1 build violet` = `violetrecomp\build.bat` |
+| Build only (first time configures `build\cmake`, ~25 min from scratch; keep it Release) | `.\start.ps1 build violet` = `violetrecomp\build.bat` = `..\build.bat violet` (root CMakeLists.txt, preset `violet`) |
 | Host a room for local play (UDP 24872) | `.\start.ps1 room` (`-Name`, `-Password`); join it in the game's menu, Multiplayer > Rooms |
 | Join a room directly | `.\start.ps1 violet -Room 127.0.0.1:24872 -Nick Host` (the game starts offline otherwise; the old start-up browser: `NX_ROOM_BROWSER=1`) |
 | A real Switch in the room | `.\start.ps1 beacon` (ESP32-S3 on USB; see `../ldn-beacon/CLAUDE.md`) |
@@ -106,7 +106,7 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 | `dump/elf/` | ELF copies of the modules; IDA databases `*.i64` |
 | `dump/romfs/` | merged RomFS (base 1.0.0 + update 4.0.0), 9.24 GB |
 | `dump/aoc/<data id>/` | DLC data (RomFS of the DLC NSP's PublicData NCA, via its ticket) |
-| `violetrecomp/` | our source (git): `game.json`, `CMakeLists.txt`, `build.bat`, `run.ps1`, `bench.ps1`, host code (`fps.c`, `gfx.c`, `lua.c`, `wild.c`), `patches.txt`, `mods/raids/` (F6-F8), `tools/` (svedit, luabc.py, xref.py, bfbs.py, img.py) |
+| `violetrecomp/` | our source: `game.json`, `game.cmake` (included by the root `CMakeLists.txt`), `build.bat`, `run.ps1`, `bench.ps1`, host code (`fps.c`, `gfx.c`, `lua.c`, `wild.c`), `patches.txt`, `mods/raids/` (F6-F8), `tools/` (svedit, luabc.py, xref.py, bfbs.py, img.py) |
 | `mods-ref/` | others' mods for 4.0.0 (reference only) and their download zip |
 | `build/cmake/` | the build: `violetrecomp.exe`, `mods/` |
 | `build/analysis/` | `<module>_seeds.json`, `<module>_ida.json` (IDA exports), logs |

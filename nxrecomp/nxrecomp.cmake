@@ -1,4 +1,4 @@
-# nxrecomp: the shared part of a game's build. A game's CMakeLists.txt includes this file and calls
+# nxrecomp: the shared part of a game's build. The root CMakeLists.txt includes it; a game's game.cmake calls
 #   nx_game(GAME_JSON <path to game.json> [SOURCES <game-specific .c files>])
 # which builds <name>.exe (game.json "name") from the shared runtime, the game's sources and the lifted code in
 # LIFTED_DIR (written by tools/lifter/a64lift.py), and nx_mod(<name> SOURCES ...) for mods (DLLs, runtime/nxmod.h).

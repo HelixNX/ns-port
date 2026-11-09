@@ -1,9 +1,12 @@
-# Whitelist: this repo holds only the workspace docs and empty placeholder folders.
+# Whitelist: this repo holds the source, the build entry, the docs and empty placeholder folders.
 # Game data (ROMs, dumps, extracts, builds), keys, firmware, deps and tools never get committed.
 /*
 !/.gitignore
 !/README.md
 !/start.ps1
+!/build.bat
+!/CMakeLists.txt
+!/CMakePresets.json
 !/CLAUDE.md
 !/.mcp.json
 

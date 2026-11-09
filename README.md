@@ -56,7 +56,7 @@ ns-port/
 │   ├── rom/                 your NSPs: base, update 4.0.0 (v786432), DLC
 │   ├── dump/                made by setup: exefs/, elf/, romfs/, aoc/
 │   ├── build/               made by setup: analysis/, lifted/, cmake/, the .exe
-│   └── violetrecomp/        game source: game.json, CMakeLists.txt, build.bat, run.ps1
+│   └── violetrecomp/        game source: game.json, game.cmake, build.bat, run.ps1
 ├── mk8dx/
 │   ├── rom/                 game.nsp (base 1.0.0), mk8u_v1376256.nsp (update 3.0.5)
 │   ├── extract_v21/, dump_v21/, build/   made by setup
@@ -118,7 +118,8 @@ Run in PowerShell from `pokemon-violet/`, with `$n = '..\.tools\nstool.exe'` and
    (with idalib's Python and `IDADIR` set).
 4. **Lift** (`$L = '..\..\nxrecomp\tools\lifter'`): `python $L\a64lift.py cover` (should report 100%), then
    `python $L\a64lift.py lift ..\build\lifted` and `python $L\a64image.py ..\build\image`.
-5. **Build:** `.\build.bat` (configures `build\cmake` on first use; about 25 min from scratch). Keep it Release.
+5. **Build:** `.\build.bat` here, or `.\build.bat violet` at the root (both configure `build\cmake` on first use, from
+   the root `CMakeLists.txt`; about 25 min from scratch). Keep it Release.
 6. **Run:** `.\run.ps1 -Timeout 300` (logs to `build\run.log`). New shaders are dumped as the game reaches them;
    translate them with `python ..\..\nxrecomp\tools\shader\translate.py --spv` and run again.
 

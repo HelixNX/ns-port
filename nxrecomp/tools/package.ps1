@@ -53,7 +53,7 @@ if (-not $ShaderPack -and (-not $env:VULKAN_SDK -or -not (Test-Path "$env:VULKAN
     throw 'no %VULKAN_SDK%\Bin\glslangValidator.exe'
 }
 
-$netplay = (Get-Content "$d\CMakeLists.txt" -Raw) -match 'nx_game\([^)]*\bNETPLAY\b'      # local play: the room server too
+$netplay = (Get-Content "$d\game.cmake" -Raw) -match 'nx_game\([^)]*\bNETPLAY\b'      # local play: the room server too
 New-Item -ItemType Directory -Force $Out, "$Out\game", "$Out\game\firmware" | Out-Null
 Copy-Item $exe.FullName, "$pkg\*.dll" $Out -Force
 # the Visual C++ runtime next to the exe (app-local, as Microsoft allows), so players need no redistributable;
@@ -93,7 +93,7 @@ if ($netplay) { Copy-Item $vcrt "$Out\room" -Force }
 if (Test-Path "$Out\mods") { Remove-Item -Recurse -Force -Confirm:$false "$Out\mods" }
 if ($Mods.Count) {
     if ($Mods -contains 'all') {
-        $Mods = @(Get-Content "$d\CMakeLists.txt" | Select-String -Pattern '^\s*nx_mod\((\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+        $Mods = @(Get-Content "$d\game.cmake" | Select-String -Pattern '^\s*nx_mod\((\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
     }
     New-Item -ItemType Directory -Force "$Out\mods" | Out-Null
     foreach ($m in $Mods) {
