@@ -9,7 +9,7 @@ SDK running over an emulated kernel and services, and NVN replayed into Vulkan.
 | `pkmn-violet/` | Pokémon Violet 4.0.0 + DLC (source in `violetrecomp/`) | [HelixNX/pkmn-violet](https://github.com/HelixNX/pkmn-violet) |
 | `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (source in `mk8recomp/`) | [HelixNX/mk8dx](https://github.com/HelixNX/mk8dx) |
 | `room/` | the multiplayer room server (the protocol Citra, yuzu and Eden rooms speak); Windows or Linux | local repo |
-| `ldn-beacon/` | a real Switch's local play bridged into a room, with an ESP32-S3 on USB as the radio | local repo |
+| `ldn-beacon/` | a real Switch's local play bridged into a room, with an ESP32-S3 on USB as the radio | [HelixNX/ldn-beacon](https://github.com/HelixNX/ldn-beacon) |
 
 ## Start here
 
