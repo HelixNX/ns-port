@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $ws = $PSScriptRoot
 
 $games = @{
-    violet = @{ repo = "$ws\pokemon-violet\violetrecomp"; id = '01008F6008C5E000'; title = 'Pokemon Violet' }
+    violet = @{ repo = "$ws\pkmn-violet\violetrecomp"; id = '01008F6008C5E000'; title = 'Pokemon Violet' }
     mk8    = @{ repo = "$ws\mk8dx\mk8recomp";             id = '0100152000022000'; title = 'Mario Kart 8 Deluxe' }
 }
 

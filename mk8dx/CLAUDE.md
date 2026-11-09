@@ -5,7 +5,7 @@ a native Windows x64 program. **Our own implementation**: `../ref/ssbu-recomp` a
 for behaviour only; don't copy their code (the user's call: a better design of our own beats a port of SSBU's).
 
 Workspace rules, toolchain and shared tools are in `../CLAUDE.md`. Paths below are relative to `mk8dx/`, except
-`runtime/...` and `tools/...`, which since 2026-10-17 (V0 of `../pokemon-violet`) are in the shared `../nxrecomp`.
+`runtime/...` and `tools/...`, which since 2026-10-17 (V0 of `../pkmn-violet`) are in the shared `../nxrecomp`.
 Debug environment variables are `NX_*` (formerly `MK8_*`).
 Game-derived data stays in `rom/`, `dump_v21/`, `extract_v21/` and `build/`.
 

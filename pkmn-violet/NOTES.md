@@ -1,4 +1,4 @@
-# pokemon-violet: notes and history
+# pkmn-violet: notes and history
 
 Everything learnt so far, by topic and by session, moved here unchanged from `CLAUDE.md` on 2026-11-07 (that file
 now holds how to start things, the current state and what is open). Newest sessions are not always last: grep
@@ -1099,7 +1099,7 @@ In order:
     keeps the speed's divisor at 30 fps. The instructions are patched through `violetrecomp/patches.txt` (lifter
     feature: "if" alternates switched at run time, "call"/"after" host hooks); re-lift main after changing it.
   - Found with Fl4sh's Violet 4.0.0 "60 FPS" and "Dynamic FPS (ASM)" pchtxt patches (gamebanana) as a map, in
-    `pokemon-violet/mods-ref/` (text only, not in git; the zips are at the workspace root). pchtxt addresses equal
+    `pkmn-violet/mods-ref/` (text only, not in git; the zips are at the workspace root). pchtxt addresses equal
     our main.elf addresses (no 0x100 shift); their build id is ours (709BFD66...). Not ported yet from the
     dynamic patch: its scaling of a movement value at `cce37c` (stutter when walking). Its NOP at `1526d64` is
     housekeeping for its code cave: that `stp` stores the address of the game's function at `1760ec8` (a callback),

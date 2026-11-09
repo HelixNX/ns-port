@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.24)
 # (must come before project(), which otherwise picks Debug for clang-cl)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "Release (default) or Debug")
 
-set(NX_GAME_violet "pokemon-violet/violetrecomp")
+set(NX_GAME_violet "pkmn-violet/violetrecomp")
 set(NX_GAME_mk8 "mk8dx/mk8recomp")
 set(NX_GAMES violet mk8)
 set(NX_GAME "" CACHE STRING "the game this build tree builds: ${NX_GAMES}")

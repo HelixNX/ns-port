@@ -6,7 +6,7 @@ SDK running over an emulated kernel and services, and NVN replayed into Vulkan.
 | Project | Game | Repo |
 |---|---|---|
 | `nxrecomp/` | shared runtime (kernel, SVCs, IPC, services, NVN on Vulkan, audio, input) and tools (lifter, shader translator, IDA export) | [s1099/nxrecomp](https://github.com/s1099/nxrecomp) |
-| `pokemon-violet/violetrecomp/` | Pokémon Violet 4.0.0 + DLC | [s1099/violetrecomp](https://github.com/s1099/violetrecomp) |
+| `pkmn-violet/violetrecomp/` | Pokémon Violet 4.0.0 + DLC | [s1099/violetrecomp](https://github.com/s1099/violetrecomp) |
 | `mk8dx/mk8recomp/` | Mario Kart 8 Deluxe 3.0.5 | [s1099/mk8recomp](https://github.com/s1099/mk8recomp) |
 | `room/` | the multiplayer room server (the protocol Citra, yuzu and Eden rooms speak); Windows or Linux | local repo |
 | `ldn-beacon/` | a real Switch's local play bridged into a room, with an ESP32-S3 on USB as the radio | local repo |
@@ -52,7 +52,7 @@ ns-port/
 ├── deps/                    third-party libraries (see Prerequisites)
 ├── .tools/                  nstool.exe; ida-mcp (optional, headless IDA)
 ├── nxrecomp/                shared code
-├── pokemon-violet/
+├── pkmn-violet/
 │   ├── rom/                 your NSPs: base, update 4.0.0 (v786432), DLC
 │   ├── dump/                made by setup: exefs/, elf/, romfs/, aoc/
 │   ├── build/               made by setup: analysis/, lifted/, cmake/, the .exe
@@ -99,7 +99,7 @@ Nothing in the build has machine-specific paths: if something isn't found, the b
 
 ## Setup (Pokémon Violet)
 
-Run in PowerShell from `pokemon-violet/`, with `$n = '..\.tools\nstool.exe'` and
+Run in PowerShell from `pkmn-violet/`, with `$n = '..\.tools\nstool.exe'` and
 `$env:USERPROFILE = '<ns-port>\keys'` (nstool's key lookup).
 
 1. **Unpack and dump.**
@@ -108,7 +108,7 @@ Run in PowerShell from `pokemon-violet/`, with `$n = '..\.tools\nstool.exe'` and
    & $n --tik extract\upd\<ticket>.tik -x /0 dump\exefs extract\upd\<update program NCA>
    & $n --tik extract\upd\<ticket>.tik --basenca extract\base\<base program NCA> -x /1 dump\romfs extract\upd\<update program NCA>
    ```
-   The program NCA is the largest one. `pokemon-violet/CLAUDE.md` ("ROMs", "Commands") lists the NCA ids. For the DLC,
+   The program NCA is the largest one. `pkmn-violet/CLAUDE.md` ("ROMs", "Commands") lists the NCA ids. For the DLC,
    extract its PublicData RomFS to `dump\aoc\01008f6008c5f001`. You can delete `extract\` afterwards.
 2. **ELF copies.** From `violetrecomp/`, for each of `main`, `sdk`, `subsdk0`:
    `python ..\..\nxrecomp\tools\nso2elf.py ..\dump\exefs\<m> ..\dump\elf\<m>.elf`

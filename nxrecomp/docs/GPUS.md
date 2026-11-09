@@ -9,7 +9,7 @@ what makes it draw right.
 
 ## Before starting
 
-- Build and run: `pokemon-violet/CLAUDE.md`, "Start here" (`.\start.ps1 violet` builds and plays;
+- Build and run: `pkmn-violet/CLAUDE.md`, "Start here" (`.\start.ps1 violet` builds and plays;
   `.\start.ps1 package violet <dir>` makes a player folder). Toolchain: the root `CLAUDE.md`.
 - New `NX_*` switches are read once at start (an init function or a static on first use), never per draw or frame.
 - Run with `NX_VK_VALIDATION=1` (needs the Vulkan SDK's layers) and keep it free of errors: graphics must not rely

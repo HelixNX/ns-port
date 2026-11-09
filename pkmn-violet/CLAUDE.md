@@ -1,9 +1,9 @@
-# pokemon-violet: Pokémon Violet recompilation
+# pkmn-violet: Pokémon Violet recompilation
 
 Static recompilation of the user's own Pokémon Violet **4.0.0** (title 01008F6008C5E000, with the Teal Mask /
 Indigo Disk DLC) to a native Windows x64 program, on the shared `../nxrecomp` (lifter, runtime, NVN on Vulkan).
 
-Workspace rules, toolchain and shared tools are in `../CLAUDE.md`. Paths below are relative to `pokemon-violet/`.
+Workspace rules, toolchain and shared tools are in `../CLAUDE.md`. Paths below are relative to `pkmn-violet/`.
 Game-derived data stays in `rom/`, `extract/`, `dump/`, `build/` and `mods-ref/`. **History, findings, addresses
 and every experiment so far are in `NOTES.md`** (moved there unchanged on 2026-11-07): grep it before proposing a
 tool or an experiment, and add new sessions' findings there; keep this file to how-to, state and what is open.
@@ -118,7 +118,7 @@ edits: `violetrecomp\tools\svedit` (.NET 9 + PKHeX.Core; back up `build\save` fi
 
 ## Commands
 
-- `extract/` (the NSPs unpacked, 11.9 GB) was deleted on 2026-10-17 after `dump/` was made. Extract again (PowerShell, from `pokemon-violet/`: `$env:USERPROFILE="$PWD\..\keys"`, `$n` = `..\.tools\nstool.exe`):
+- `extract/` (the NSPs unpacked, 11.9 GB) was deleted on 2026-10-17 after `dump/` was made. Extract again (PowerShell, from `pkmn-violet/`: `$env:USERPROFILE="$PWD\..\keys"`, `$n` = `..\.tools\nstool.exe`):
   `& $n -x extract\base rom\<base>.nsp; & $n -x extract\upd rom\<update>.nsp` (40 s), then ExeFS `& $n --tik extract\upd\01008f6008c5e800…11.tik -x /0 dump\exefs
   extract\upd\d24a763a8882575f1c252dce37021db5.nca`, RomFS the same with `--basenca
   extract\base\ef6d3388d34a30dda23208f98780c610.nca -x /1 dump\romfs`.

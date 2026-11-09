@@ -5,7 +5,7 @@ rem build tree is <project>\build\cmake) the first time, then builds. Third-part
 setlocal
 set GAME=%~1
 if "%GAME%"=="" (echo usage: build.bat violet^|mk8 [ninja targets / options] & exit /b 1)
-if /i "%GAME%"=="violet" (set BIN=%~dp0pokemon-violet\build\cmake) else if /i "%GAME%"=="mk8" (set BIN=%~dp0mk8dx\build\cmake) else (echo unknown game: %GAME% & exit /b 1)
+if /i "%GAME%"=="violet" (set BIN=%~dp0pkmn-violet\build\cmake) else if /i "%GAME%"=="mk8" (set BIN=%~dp0mk8dx\build\cmake) else (echo unknown game: %GAME% & exit /b 1)
 rem the rest of the arguments go to cmake --build (%* keeps the game name, so collect them)
 set ARGS=
 :args

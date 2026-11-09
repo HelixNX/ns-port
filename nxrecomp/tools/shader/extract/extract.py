@@ -4,7 +4,7 @@ Writes <build>/shaders_all/<hash>.bin in the runtime's dump format (nvn.c shader
 size, stage; GLSLC control section; code), the hash being nvn.c's (FNV-1a 64 of the code up to the control
 section's end), so the runtime finds each translation as if it had dumped the shader itself.
 
-Sources (see pokemon-violet/CLAUDE.md, "Shaders in the game files"):
+Sources (see pkmn-violet/CLAUDE.md, "Shaders in the game files"):
   - <dump>/romfs/arc/data.trpfs: "ONEPACK\\0", u64 offset of a FlatBuffers table {pack hashes, pack offsets};
     each pack a FlatBuffer {file hashes, files {.., compression, decompressed size, data}}, Oodle Kraken
     decoded by oozbatch.exe (build.bat: ooz, GPLv3, run as a separate process);

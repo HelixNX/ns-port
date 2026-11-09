@@ -15,7 +15,7 @@
       "name": "violet",
       "displayName": "Pokemon Violet",
       "inherits": "base",
-      "binaryDir": "${sourceDir}/pokemon-violet/build/cmake",
+      "binaryDir": "${sourceDir}/pkmn-violet/build/cmake",
       "cacheVariables": { "NX_GAME": "violet" }
     },
     {

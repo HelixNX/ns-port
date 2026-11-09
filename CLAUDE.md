@@ -7,7 +7,7 @@ root.
 | Project | What |
 |---|---|
 | `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (AArch64 lifter, SDK over emulated kernel/services, NVN on Vulkan). See `mk8dx/CLAUDE.md` |
-| `pokemon-violet/` | Pokémon Violet 4.0.0 + DLC (V4 graphics in progress: first-boot screens and the opening cutscene render). See `pokemon-violet/CLAUDE.md` |
+| `pkmn-violet/` | Pokémon Violet 4.0.0 + DLC (V4 graphics in progress: first-boot screens and the opening cutscene render). See `pkmn-violet/CLAUDE.md` |
 | `ldn-beacon/` | a real Switch's local play bridged into our (Eden-compatible) rooms; runs on Windows or Linux, with an ESP32-S3 on USB as the antenna (its firmware in `ldn-beacon/s3/`, ESP-IDF 5.5.6 from Espressif's EIM, installed outside the workspace) or, on Linux, the built-in Wi-Fi card; own git repo, local only for now, builds on its own. See `ldn-beacon/CLAUDE.md` |
 | `room/` | the multiplayer room server (Citra / yuzu / Eden protocol) the games, Eden and the beacon meet in; one C file, ENet + zstd, Windows or Linux; own git repo (local; moved out of `nxrecomp/tools/room` on 2026-11-07, its history stays there). See `room/README.md` |
 
@@ -16,7 +16,7 @@ first), `room` hosts a room, `beacon` bridges a real Switch, `build <project>`, 
 project's own scripts, which still work on their own.
 
 Notes: each project's `CLAUDE.md` is kept short (start here, state, what is open); its `NOTES.md` holds the history,
-findings and runs (pokemon-violet, ldn-beacon; mk8dx's notes are reference and stay in its CLAUDE.md). Grep both
+findings and runs (pkmn-violet, ldn-beacon; mk8dx's notes are reference and stay in its CLAUDE.md). Grep both
 before proposing a tool or an experiment; add new findings to NOTES.md and update the state / open lists.
 
 Current focus (the user's call, 2026-10-18): **Pokémon Violet only**. Changes to the shared `nxrecomp/` need no MK8
@@ -31,7 +31,7 @@ behaviour only: our own implementation, never copied code.
 
 | Path | What |
 |---|---|
-| `/` | workspace repo `s1099/ns-port` (private): README, `start.ps1`, the build entry (`CMakeLists.txt`, `CMakePresets.json`, `build.bat`), CLAUDE.md / NOTES.md files, placeholder folders; and the source: `nxrecomp/`, `mk8dx/mk8recomp/`, `pokemon-violet/violetrecomp/` (submodules until 2026-11-10, now merged in with their full history; the old GitHub repos `s1099/nxrecomp`, `mk8recomp`, `violetrecomp` are no longer updated, and their old `.git` folders, with a stash in nxrecomp's, are kept in `.git/old-submodules/`); `ldn-beacon/` and `room/` are local repos of their own, not tracked here. Its `.gitignore` is a whitelist: game data, keys, firmware, deps and tools stay out. A public release would be fresh repos (a snapshot, no history), under an organisation: open questions in README.md, "Going public" |
+| `/` | workspace repo `s1099/ns-port` (private): README, `start.ps1`, the build entry (`CMakeLists.txt`, `CMakePresets.json`, `build.bat`), CLAUDE.md / NOTES.md files, placeholder folders; and the source: `nxrecomp/`, `mk8dx/mk8recomp/`, `pkmn-violet/violetrecomp/` (submodules until 2026-11-10, now merged in with their full history; the old GitHub repos `s1099/nxrecomp`, `mk8recomp`, `violetrecomp` are no longer updated, and their old `.git` folders, with a stash in nxrecomp's, are kept in `.git/old-submodules/`); `ldn-beacon/` and `room/` are local repos of their own, not tracked here. Its `.gitignore` is a whitelist: game data, keys, firmware, deps and tools stay out. A public release would be fresh repos (a snapshot, no history), under an organisation: open questions in README.md, "Going public" |
 | `<project>/` | one game: `rom/` (the user's NSPs), extracted/dumped data, `build/`, and the source repo |
 | `nxrecomp/` | shared source (split from MK8's on 2026-10-17, history kept): `runtime/` (kernel, SVCs, IPC and services, NVN on Vulkan, audio, input), `tools/` (lifter, image builder, shader translator, IDA export, `package.ps1`, which builds `../room` into packages), `nxrecomp.cmake` (`nx_game`). A game's repo holds `game.json` (name, title, title id, modules with fixed bases, dump/analysis/build paths; see `tools/gamecfg.py`), an optional `overrides.txt` and a `game.cmake` calling `nx_game`; run the tools from inside the game's repo |
 | `keys/` | `prod.keys`, `title.keys`; `.switch/` holds copies for nstool (see Tool notes) |
