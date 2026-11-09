@@ -179,17 +179,27 @@ static void send_dgram(Sock *s, const u8 ip[4], u16 port, const void *data, u32 
              port, s->port, p.protocol, size);
 }
 
+/* milliseconds from QPC, for timeouts. GetTickCount moves in 15.6 ms steps: a 1-2 ms poll or receive timeout saw no
+ * time pass and waited again, up to ~16 ms (as kernel.c's wait deadlines did) */
+static DWORD tick_ms(void) {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (DWORD)(c.QuadPart / f.QuadPart * 1000 + c.QuadPart % f.QuadPart * 1000 / f.QuadPart);
+}
+
 /* waits (lock held, exclusive) until fd has a datagram; false with an errno */
 static bool wait_data(s32 fd, u32 flags, s32 *err) {
     Sock *s = get(fd);
-    DWORD start = GetTickCount();
+    DWORD start = tick_ms();
     for (;;) {
         if (!s || s->closed) { *err = E_BADF; return false; }
         if (s->head) return true;
         if (s->nonblock || flags & MSG_DONTWAIT_) { *err = E_AGAIN; return false; }
         DWORD wait = 100;
         if (s->rcvtimeo_ms) {
-            DWORD el = GetTickCount() - start;
+            DWORD el = tick_ms() - start;
             if (el >= s->rcvtimeo_ms) { *err = E_AGAIN; return false; }
             if (s->rcvtimeo_ms - el < wait) wait = s->rcvtimeo_ms - el;
         }
@@ -488,7 +498,7 @@ static void bsd_poll(SvcObj *o, IpcReq *r) {
     if (nfds < 0 || !in || in->size < (u64)nfds * 8) { reply(r, -1, E_INVAL); return; }
     u8 *fds = malloc(nfds ? nfds * 8 : 8);
     memcpy(fds, (const void *)(uintptr_t)in->addr, nfds * 8);
-    DWORD start = GetTickCount();
+    DWORD start = tick_ms();
     s32 ready;
     AcquireSRWLockExclusive(&lock);
     for (;;) {
@@ -513,7 +523,7 @@ static void bsd_poll(SvcObj *o, IpcReq *r) {
         if (ready || timeout == 0) break;
         DWORD wait = 100;
         if (timeout > 0) {
-            DWORD el = GetTickCount() - start;
+            DWORD el = tick_ms() - start;
             if (el >= (DWORD)timeout) break;
             if ((DWORD)timeout - el < wait) wait = (DWORD)timeout - el;
         }

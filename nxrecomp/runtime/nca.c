@@ -154,7 +154,15 @@ static void ctr_xor(BCRYPT_KEY_HANDLE key, const u8 hi8[8], u64 abs, u8 *buf, u6
         }
         aes_ecb(key, true, ctr, ks, n);
         u64 m = size - done < n ? size - done : n;
-        for (u64 i = 0; i < m; i++) buf[done + i] ^= ks[i];
+        u64 i = 0;
+        for (; i + 8 <= m; i += 8) {            /* 8 bytes a step: -O1 does not vectorise the byte loop */
+            u64 a, b;
+            memcpy(&a, buf + done + i, 8);
+            memcpy(&b, ks + i, 8);
+            a ^= b;
+            memcpy(buf + done + i, &a, 8);
+        }
+        for (; i < m; i++) buf[done + i] ^= ks[i];
         done += m;
     }
 }

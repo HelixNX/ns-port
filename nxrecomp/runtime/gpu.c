@@ -4569,7 +4569,7 @@ static void draw_one(u32 op, const void *payload) {
              st.viewport[0][2], st.viewport[0][3], st.depth_range[0][0], st.depth_range[0][1], st.scissor[0][0],
              st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], st.ds.flags, st.ds.depth_func, st.poly.cull, st.poly.front_face, (u32)st.depth_clamp);
         TP("\n");
-        char b[512];
+        char b[512] = "";               /* (printed even when no attribute is set) */
         int o = 0;
         for (u32 i = 0; i < st.nattribs && o < 400; i++)
             if (VA_FORMAT(st.attribs[i]))

@@ -134,7 +134,7 @@ static void npad_update(void) {
      * SixAxisSensorState: s64 delta time (ns), s64 sampling, float accel[3] (g), gyro[3], rotation[3],
      * direction[3][3] (orientation), u32 attributes (1: connected), u32 reserved */
     u8 sx[0x60] = {0};
-    s64 dt = 16000000;
+    s64 dt = 4000000;
     float accel[3] = {0, 0, -1}, dir[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     u32 sattr = 1;
     memcpy(sx, &dt, 8);
@@ -149,7 +149,7 @@ static void npad_update(void) {
 static unsigned __stdcall input_thread(void *p) {
     for (;;) {
         npad_update();
-        Sleep(16);
+        Sleep(4);       /* hid's own period (250 Hz): at 16 ms a frame's read was up to a frame old, and drifted */
     }
     return 0;
 }

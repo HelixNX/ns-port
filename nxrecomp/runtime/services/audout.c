@@ -47,8 +47,9 @@ static void update(AudioOut *a) {
     a->played = t < a->pushed ? t : a->pushed;
     int done = 0;
     while (done < a->npending && a->pending[done].end <= a->played) done++;
+    if (done > MAX_PENDING - a->nreleased) done = MAX_PENDING - a->nreleased;   /* the rest later: no tag is dropped */
     if (!done) return;
-    for (int i = 0; i < done && a->nreleased < MAX_PENDING; i++) a->released[a->nreleased++] = a->pending[i].tag;
+    for (int i = 0; i < done; i++) a->released[a->nreleased++] = a->pending[i].tag;
     memmove(a->pending, a->pending + done, (size_t)(a->npending - done) * sizeof a->pending[0]);
     a->npending -= done;
     event_signal(a->event);
@@ -57,7 +58,7 @@ static void update(AudioOut *a) {
 static unsigned __stdcall release_thread(void *p) {
     (void)p;
     for (;;) {
-        Sleep(2);
+        Sleep(outs ? 2 : 100);          /* no output open (games on audren only): nothing to release */
         AcquireSRWLockShared(&outs_lock);
         for (AudioOut *a = outs; a; a = a->next) {
             AcquireSRWLockExclusive(&a->lock);

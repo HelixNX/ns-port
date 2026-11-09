@@ -817,9 +817,10 @@ void thread_sleep(s64 ns) {
      * the spin costs host time only */
     static __declspec(thread) HANDLE timer;
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER q0, q1, f;
+    static LARGE_INTEGER f;             /* fixed at boot: asked once */
+    LARGE_INTEGER q0, q1;
     QueryPerformanceCounter(&q0);
-    QueryPerformanceFrequency(&f);
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
     u64 deadline = (u64)q0.QuadPart + (u64)((double)ns * (double)f.QuadPart / 1e9);
     if (ns > SLEEP_SPIN_NS) {
         LARGE_INTEGER due;
