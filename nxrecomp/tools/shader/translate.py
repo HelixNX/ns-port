@@ -1,0 +1,2285 @@
+"""Maxwell shader -> GLSL 4.60 for Vulkan (our own translator; see CLAUDE.md, decision 4).
+
+Usage: python translate.py [--check | --spv] [--only=<hash>,...] [shader dir] [out dir]
+    default: ../../../build/shaders -> ../../../build/shaders/glsl (<hash>.vert / .frag / .comp)
+    --check  also compiles every output with glslang (deps/glslang/bin/glslang.exe) and reports failures
+    --spv    the same, keeping the SPIR-V in <shader dir>/spv/<hash>.spv (what the runtime loads)
+    --only   just these shaders, or @file for a list of them (the runtime translates shaders it has no SPIR-V
+             for this way while the game runs)
+
+Model:
+  - Registers are `uint rN` (bit patterns; floats through F()/U()), predicates `bool pN`, condition codes cc_z/s/c/o.
+  - Control flow: GLSLC code here has no loops (every backward branch is the trailing `BRA self`), so the CFG is a
+    DAG in address order. Each basic block runs under a `reached` flag that its predecessors set; SSY/SYNC are
+    resolved statically (the reconvergence stack is the same on every path into a block).
+  - Constant buffers c[i] are uniform blocks at set 0, binding stage_base + i, where i follows NVN's layout:
+    c[0] driver data (storage buffer table at 0x110, 16 bytes per slot), c[1] GLSLC's embedded constants,
+    c[2] texture handles (bound slot k at 0x20 + 8k), c[3 + b] the game's uniform buffer binding b.
+    The executor (runtime/gpu.c) fills c[0] and c[2] itself.
+  - Textures are bindless: the 32-bit NVN handle (texture id | sampler id << 20) indexes the texture pool's
+    descriptor arrays (set 1, one per view type: TEX_BINDING, runtime/gpu.c TB_*) and the sampler pool's (set 2).
+  - Global memory (LDG/STG) uses 64-bit device addresses, which c[0] holds instead of guest addresses.
+  - Transform feedback (the GLSLC layout in the control section): each captured varying is copied at exit into an
+    output of its own with xfb_buffer / xfb_offset / xfb_stride, at the locations from 31 down.
+  - Vertex attributes are vec4 inputs at location = attribute index; the runtime may define A<k>_INT / A<k>_UINT
+    for integer formats (see the attribute macros in the preamble).
+"""
+import os
+import struct
+import subprocess
+import sys
+
+from maxwell import Shader, opcode, bits
+
+RZ = 255
+PT = 7
+STAGE_EXT = {'vertex': 'vert', 'fragment': 'frag', 'compute': 'comp', 'geometry': 'geom',
+             'tess_control': 'tesc', 'tess_eval': 'tese'}
+STAGE_BASE = {'vertex': 0, 'fragment': 16, 'compute': 0, 'geometry': 32, 'tess_control': 48, 'tess_eval': 64}
+# set 1 binding of each texture array (a view's type must match the shader's image dimension): runtime/gpu.c TB_*
+TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5, 't1da': 6, 'ut2d': 7, 'ut2da': 8}
+# Integer textures (runtime/gpu.c HANDLE_INT): the runtime sets bit 19 of a handle whose texture holds integers
+# (UINT/SINT, stencil) and puts its integer view in ut2d / ut2da at the same index; fetches and gathers of 2D and 2D
+# array textures read through it when the bit is set (a float read of an integer view is undefined)
+INT_FLAG = '((%s >> 19) & 1u) != 0u'
+# Render scale (runtime/gpu.c HANDLE_SCALED, rs_scale): bit 18 of a handle marks a texture or image made N times the
+# game's size, N in pc.scale bits 0-7; the pass's targets' scale is in bits 8-15. gl_FragCoord is divided by the
+# targets' scale, integer coordinates of scaled textures and images are multiplied by N (plus the pixel's place in
+# its N x N block in fragment shaders), sizes divided by it; stores into scaled images outside fragment shaders
+# fill the whole block. Sampling with normalized coordinates needs nothing.
+PC_DECL = 'layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; uint scale; } pc;'
+
+
+class Unsupported(Exception):
+    pass
+
+
+def sext(v, n):
+    return v - (1 << n) if v >> (n - 1) & 1 else v
+
+
+def flit(u):
+    """an exact float literal from its bits"""
+    u &= 0xffffffff
+    f = struct.unpack('<f', struct.pack('<I', u))[0]
+    if f == f and abs(f) != float('inf') and struct.unpack('<I', struct.pack('<f', float(repr(f))))[0] == u and \
+            (f == 0 or 1e-30 < abs(f) < 1e30) and not (u == 0x80000000):
+        s = repr(f)
+        if 'e' not in s and '.' not in s:
+            s += '.0'
+        return s
+    return 'uintBitsToFloat(0x%08xu)' % u
+
+
+class Translator:
+    def __init__(self, sh):
+        self.sh = sh
+        self.stage = sh.stage
+        self.lines = []
+        self.regs = set()
+        self.cbufs = set()
+        self.in_attrs = {}          # generic input index -> interpolation ('smooth', 'flat', 'noperspective')
+        self.out_attrs = set()
+        self.uses = set()           # features: 'global', 'lmem', 'fragdepth', 'vertexid', ...
+        self.indent = 1
+        self.lmem_words = 0
+        # texture / image handles read from c[2] at a fixed offset are the same for the whole draw, so their
+        # descriptor indices go without nonuniformEXT (which can cost a loop per access, AMD); handles from
+        # registers keep it (TMML.B sets this while it is emitted; surface() checks its own handle)
+        self.nonuniform = False
+        self.xfb = self.xfb_layout()
+        sph = sh.sph
+        if sph:
+            self.sph_words = struct.unpack('<20I', sph)
+        if self.stage == 'fragment':
+            self.omap_target, self.omap_flags = struct.unpack_from('<II', sph, 0x48)
+
+    # ------------------------------------------------------------------ emit helpers
+    def emit(self, s):
+        self.lines.append('    ' * self.indent + s)
+
+    def R(self, r):
+        """register as uint"""
+        if r == RZ:
+            return '0u'
+        self.regs.add(r)
+        return 'r%d' % r
+
+    def Rf(self, r):
+        if r == RZ:
+            return '0.0'
+        self.regs.add(r)
+        return 'F(r%d)' % r
+
+    def set_r(self, r, expr):
+        if r != RZ:
+            self.regs.add(r)
+            self.emit('r%d = %s;' % (r, expr))
+
+    def set_rf(self, r, expr):
+        if r != RZ:
+            self.regs.add(r)
+            self.emit('r%d = U(%s);' % (r, expr))
+
+    def P(self, p, neg=False):
+        if p == PT:
+            return 'false' if neg else 'true'
+        return ('!p%d' % p) if neg else ('p%d' % p)
+
+    def set_p(self, p, expr):
+        if p != PT:
+            self.emit('p%d = %s;' % (p, expr))
+
+    def ix(self, e):
+        """a descriptor array index"""
+        return ('nonuniformEXT(%s)' if self.nonuniform else '(%s)') % e
+
+    def cbuf(self, idx, off):
+        """32-bit word of c[idx] at byte offset off (constant)"""
+        if idx == 0 and self.stage == 'vertex' and off in (0x640, 0x644):
+            # NVN's driver data: the draw's base vertex and base instance, which indirect draws take from GPU memory
+            # (GPU-culled objects have large base instances: read as 0, trees and rocks near the camera vanished)
+            return 'uint(gl_BaseVertex)' if off == 0x640 else 'uint(gl_BaseInstance)'
+        if off & 3:
+            raise Unsupported('unaligned cbuf offset')
+        if idx == 1 and 0 <= off and off + 4 <= len(self.sh.consts):
+            # c[1] holds the shader's own embedded constants (runtime/gpu.c binds them from the shader): literals
+            return '0x%08xu' % struct.unpack_from('<I', self.sh.consts, off)[0]
+        self.cbufs.add(idx)
+        return 'cb%d.d[%d][%d]' % (idx, off >> 4, (off >> 2) & 3)
+
+    def cbuf_dyn(self, idx, expr):
+        """32-bit word of c[idx] at a byte offset computed at run time"""
+        self.cbufs.add(idx)
+        self.uses.add('cbdyn%d' % idx)
+        return 'cbr%d(%s)' % (idx, expr)
+
+    # operand B by instruction form ('R' gpr20, 'C' cbuf, 'I' imm20, '32I' imm32)
+    def op_b_u(self, w, form):
+        if form == 'R':
+            return self.R(bits(w, 20, 8))
+        if form == 'C':
+            return self.cbuf(bits(w, 34, 5), bits(w, 20, 14) * 4)
+        if form == 'I':
+            v = bits(w, 20, 19) | bits(w, 56, 1) << 19
+            return '0x%08xu' % (sext(v, 20) & 0xffffffff)
+        if form == '32I':
+            return '0x%08xu' % bits(w, 20, 32)
+        raise Unsupported(form)
+
+    def op_b_f(self, w, form):
+        if form == 'R':
+            return self.Rf(bits(w, 20, 8))
+        if form == 'C':
+            v = self.cbuf(bits(w, 34, 5), bits(w, 20, 14) * 4)
+            return flit(int(v[2:-1], 16)) if v.startswith('0x') else 'F(%s)' % v
+        if form == 'I':
+            return flit(bits(w, 20, 19) << 12 | bits(w, 56, 1) << 31)
+        if form == '32I':
+            return flit(bits(w, 20, 32))
+        raise Unsupported(form)
+
+    @staticmethod
+    def fmod(x, neg, ab):
+        if ab:
+            x = 'abs(%s)' % x
+        if neg:
+            x = '(-%s)' % x
+        return x
+
+    @staticmethod
+    def sat(x, s):
+        """.SAT: NaN gives 0 on the hardware (GLSL's clamp leaves it undefined); sat() is in the preamble"""
+        return 'sat(%s)' % x if s else x
+
+    # ------------------------------------------------------------------ comparisons
+    @staticmethod
+    def fcmp(op, a, b):
+        """FPCompareOp; the unordered forms are true when either side is NaN"""
+        n = '(isnan(%s) || isnan(%s))' % (a, b)
+        return {
+            0: 'false', 1: '(%s < %s)' % (a, b), 2: '(%s == %s)' % (a, b), 3: '(%s <= %s)' % (a, b),
+            4: '(%s > %s)' % (a, b), 5: '(%s < %s || %s > %s)' % (a, b, a, b), 6: '(%s >= %s)' % (a, b),
+            7: '!%s' % n, 8: n, 9: '!(%s >= %s)' % (a, b), 10: '!(%s < %s || %s > %s)' % (a, b, a, b),
+            11: '!(%s > %s)' % (a, b), 12: '!(%s <= %s)' % (a, b), 13: '(%s != %s)' % (a, b),
+            14: '!(%s < %s)' % (a, b), 15: 'true',
+        }[op]
+
+    @staticmethod
+    def icmp(op, a, b, signed):
+        if op in (0, 7):
+            return 'false' if op == 0 else 'true'
+        if signed:
+            a, b = 'int(%s)' % a, 'int(%s)' % b
+        return '(%s %s %s)' % (a, {1: '<', 2: '==', 3: '<=', 4: '>', 5: '!=', 6: '>='}[op], b)
+
+    @staticmethod
+    def bop(op, a, b):
+        if op == 0:
+            return '(%s && %s)' % (a, b)
+        if op == 1:
+            return '(%s || %s)' % (a, b)
+        if op == 2:
+            return '(%s != %s)' % (a, b)
+        raise Unsupported('bop %d' % op)
+
+    def flow(self, test):
+        """condition-code test (FlowTest)"""
+        t = {0: 'false', 15: 'true', 13: '!cc_z', 5: '!cc_z', 2: 'cc_z', 10: 'cc_z',
+             1: '(cc_s != cc_o)', 6: '(cc_s == cc_o)', 4: '(!cc_z && cc_s == cc_o)', 3: '(cc_z || cc_s != cc_o)'}
+        if test not in t:
+            raise Unsupported('flow test %d' % test)
+        if test not in (0, 15):
+            self.uses.add('cc')
+        return t[test]
+
+    # ------------------------------------------------------------------ attributes
+    def attr_in(self, off):
+        """input attribute word (vertex inputs, or fragment inputs for IPA)"""
+        if 0x80 <= off < 0x280:
+            k, c = (off - 0x80) >> 4, (off >> 2) & 3
+            if self.stage == 'vertex':
+                self.in_attrs.setdefault(k, 'smooth')
+                return 'ia(in_a%d[%d], %du)' % (k, c, k), True
+            self.in_attrs.setdefault(k, self.interp_of(k, c))
+            return 'U(in_a%d[%d])' % (k, c), True
+        if self.stage == 'fragment':
+            if off in (0x70, 0x74):
+                self.uses.add('rscale')
+            m = {0x70: 'U(gl_FragCoord.x / rs_rt())', 0x74: 'U(gl_FragCoord.y / rs_rt())', 0x78: 'U(gl_FragCoord.z)',
+                 0x7c: 'U(gl_FragCoord.w)', 0x3fc: '(gl_FrontFacing ? 0xffffffffu : 0u)',
+                 0x2e0: 'U(gl_PointCoord.x)', 0x2e4: 'U(gl_PointCoord.y)', 0x64: 'uint(gl_Layer)'}
+            if off in m:
+                return m[off], False
+        if self.stage == 'vertex':
+            # Maxwell's vertex and instance ids leave out the draw's base vertex / base instance (shaders add them
+            # from c0, see cbuf); Vulkan's indices include them
+            if off == 0x2fc:
+                return 'uint(gl_VertexIndex - gl_BaseVertex)', False
+            if off == 0x2f8:
+                return 'uint(gl_InstanceIndex - gl_BaseInstance)', False
+        raise Unsupported('input attribute %#x' % off)
+
+    def interp_of(self, k, c):
+        mode = self.sh.sph[0x18 + k] >> (2 * c) & 3
+        return {0: 'smooth', 1: 'flat', 2: 'smooth', 3: 'noperspective'}[mode]
+
+    def attr_out(self, off, val):
+        if 0x80 <= off < 0x280:
+            k, c = (off - 0x80) >> 4, (off >> 2) & 3
+            self.out_attrs.add(k)
+            self.emit('out_a%d[%d] = F(%s);' % (k, c, val))
+            return
+        m = {0x70: 'gl_Position.x', 0x74: 'gl_Position.y', 0x78: 'gl_Position.z', 0x7c: 'gl_Position.w',
+             0x6c: 'gl_PointSize'}
+        if off in m:
+            self.emit('%s = F(%s);' % (m[off], val))
+            return
+        if 0x2c0 <= off < 0x2e0:
+            self.uses.add('clip')
+            self.emit('gl_ClipDistance[%d] = F(%s);' % ((off - 0x2c0) >> 2, val))
+            return
+        if off in (0x64, 0x68) and self.stage == 'vertex':
+            self.uses.add('layer')
+        if off == 0x64:
+            self.emit('gl_Layer = int(%s);' % val)
+            return
+        if off == 0x68:
+            self.emit('gl_ViewportIndex = int(%s);' % val)
+            return
+        raise Unsupported('output attribute %#x' % off)
+
+    # ------------------------------------------------------------------ textures
+    def tex_handle(self, cbuf_offset):
+        return self.cbuf(2, cbuf_offset * 4)
+
+    def sample(self, kind, handle, coords, lod=None, bias=None, dref=None, offset=None, gather=None, query=False):
+        """GLSL sampling expression; kind: 1D 2D 3D CUBE 2DARRAY CUBEARRAY 1DARRAY. Returns vec4 (or float for dref)"""
+        arr = {'1D': 't1d', '2D': 't2d', '3D': 't3d', 'CUBE': 'tcube', '2DARRAY': 't2da', 'CUBEARRAY': 'tcubea',
+               '1DARRAY': 't1da'}[kind]
+        styp = {'1D': 'sampler1D', '2D': 'sampler2D', '3D': 'sampler3D', 'CUBE': 'samplerCube',
+                '2DARRAY': 'sampler2DArray', 'CUBEARRAY': 'samplerCubeArray', '1DARRAY': 'sampler1DArray'}[kind]
+        if dref is not None:
+            styp += 'Shadow'
+        self.uses.add('tex_' + arr)
+        s = '%s(%s[%s], smp[%s])' % (styp, arr, self.ix('%s & 0xffffu' % handle), self.ix('min(%s >> 20, 4095u)' % handle))
+        if query:
+            return 'textureQueryLod(%s, %s)' % (s, coords)
+        if gather is not None:
+            if dref is not None:
+                return 'textureGather(%s, %s, %s)' % (s, coords, dref)
+            if offset:
+                e = 'textureGatherOffset(%s, %s, %s, %d)' % (s, coords, offset, gather)
+            else:
+                e = 'textureGather(%s, %s, %d)' % (s, coords, gather)
+            if kind in ('2D', '2DARRAY'):       # integer textures: the raw bits through the integer view
+                self.uses.add('tex_u' + arr)
+                us = 'u%s(u%s[%s], smp[%s])' % (styp, arr, self.ix('%s & 0xffffu' % handle),
+                                                self.ix('min(%s >> 20, 4095u)' % handle))
+                ue = ('textureGatherOffset(%s, %s, %s, %d)' % (us, coords, offset, gather) if offset else
+                      'textureGather(%s, %s, %d)' % (us, coords, gather))
+                e = '(%s ? uintBitsToFloat(%s) : %s)' % (INT_FLAG % handle, ue, e)
+            return e
+        if offset and gather is None:
+            # GLSL wants constant offsets outside gathers: shift the coordinates by whole texels instead
+            lv = 'int(%s)' % lod if lod is not None else '0'
+            if kind in ('2D', '2DARRAY'):
+                self.uses.add('rscale')
+                offset = '(vec2(%s) * float(tsc(%s)))' % (offset, handle)
+            if kind == '2D':
+                coords = '(%s + %s / vec2(textureSize(%s, %s)))' % (coords, offset, s, lv)
+            elif kind == '2DARRAY':
+                coords = 'vec3(%s.xy + %s / vec2(textureSize(%s, %s).xy), %s.z)' % (coords, offset, s, lv, coords)
+            elif kind == '3D':
+                coords = '(%s + vec3(%s) / vec3(textureSize(%s, %s)))' % (coords, offset, s, lv)
+            else:
+                raise Unsupported('texel offset on %s' % kind)
+            offset = None
+        if dref is not None:
+            # shadow: coordinates carry the reference; cube arrays take it separately
+            if kind == 'CUBEARRAY':
+                return 'texture(%s, %s, %s)' % (s, coords, dref)
+            n = {'1D': 2, '2D': 3, 'CUBE': 4, '2DARRAY': 4, '1DARRAY': 3}[kind]
+            c = 'vec%d(%s, %s)' % (n, coords, dref)
+            if lod is not None:
+                if kind in ('CUBE', '2DARRAY'):
+                    return 'textureGrad(%s, %s, vec%d(0.0), vec%d(0.0))' % (s, c, 3 if kind == 'CUBE' else 2,
+                                                                         3 if kind == 'CUBE' else 2)
+                return 'textureLod(%s, %s, %s)' % (s, c, lod)
+            return 'texture(%s, %s)' % (s, c)
+        if lod is not None:
+            if offset:
+                return 'textureLodOffset(%s, %s, %s, %s)' % (s, coords, lod, offset)
+            return 'textureLod(%s, %s, %s)' % (s, coords, lod)
+        if bias is not None:
+            if offset:
+                return 'textureOffset(%s, %s, %s, %s)' % (s, coords, offset, bias)
+            return 'texture(%s, %s, %s)' % (s, coords, bias)
+        if offset:
+            return 'textureOffset(%s, %s, %s)' % (s, coords, offset)
+        return 'texture(%s, %s)' % (s, coords)
+
+    def tex_coords(self, ttype, reg):
+        """TEX/TLD4/TMML coordinate registers by TextureType"""
+        f = lambda i: self.Rf(reg + i if reg != RZ else RZ)
+        arr = lambda: 'float(%s & 0xffffu)' % self.R(reg)
+        if ttype == 0:
+            return '1D', f(0), reg + 1
+        if ttype == 1:
+            return '1DARRAY', 'vec2(%s, %s)' % (f(1), arr()), reg + 2
+        if ttype == 2:
+            return '2D', 'vec2(%s, %s)' % (f(0), f(1)), reg + 2
+        if ttype == 3:
+            return '2DARRAY', 'vec3(%s, %s, %s)' % (f(1), f(2), arr()), reg + 3
+        if ttype == 4:
+            return '3D', 'vec3(%s, %s, %s)' % (f(0), f(1), f(2)), reg + 3
+        if ttype == 6:
+            return 'CUBE', 'vec3(%s, %s, %s)' % (f(0), f(1), f(2)), reg + 3
+        if ttype == 7:
+            return 'CUBEARRAY', 'vec4(%s, %s, %s, %s)' % (f(1), f(2), f(3), arr()), reg + 4
+        raise Unsupported('texture type %d' % ttype)
+
+    def tex_offsets(self, kind, reg, bitsz=4, step=4):
+        n = {'1D': 1, '1DARRAY': 1, '2D': 2, '2DARRAY': 2, '3D': 3, 'CUBE': 0, 'CUBEARRAY': 0}[kind]
+        if not n:
+            raise Unsupported('cube offsets')
+        parts = ['bitfieldExtract(int(%s), %d, %d)' % (self.R(reg), i * step, bitsz) for i in range(n)]
+        return parts[0] if n == 1 else 'ivec%d(%s)' % (n, ', '.join(parts))
+
+    # ------------------------------------------------------------------ instructions
+    def insn(self, pc, w):
+        o = opcode(w)
+        base, _, form = o.partition('_')
+        if o in ('MOV32I',):
+            base, form = 'MOV', '32I'
+        if o.endswith('32I') and o not in ('MOV32I',):
+            base, form = o[:-3], '32I'
+        f = getattr(self, 'op_' + base, None)
+        if f is None:
+            raise Unsupported(o)
+        f(w, form, pc)
+
+    # --- floating point
+    def op_FADD(self, w, form, pc):
+        d, a = bits(w, 0, 8), bits(w, 8, 8)
+        if form == '32I':
+            sat, na, aa, nb, ab = False, bits(w, 56, 1), bits(w, 54, 1), bits(w, 53, 1), bits(w, 57, 1)
+            if bits(w, 52, 1):
+                raise Unsupported('FADD32I.CC')
+        else:
+            sat, na, aa, nb, ab = bits(w, 50, 1), bits(w, 48, 1), bits(w, 46, 1), bits(w, 45, 1), bits(w, 49, 1)
+            if bits(w, 47, 1):
+                raise Unsupported('FADD.CC')
+        x = '%s + %s' % (self.fmod(self.Rf(a), na, aa), self.fmod(self.op_b_f(w, form), nb, ab))
+        self.set_rf(d, self.sat('(%s)' % x, sat))
+
+    def fmul_expr(self, a, b, fmz):
+        if fmz == 2:
+            self.uses.add('fmz')
+            return 'fmz(%s, %s)' % (a, b)
+        return '%s * %s' % (a, b)
+
+    def op_FMUL(self, w, form, pc):
+        d, a = bits(w, 0, 8), bits(w, 8, 8)
+        if form == '32I':
+            fmz, sat, nb, scale = bits(w, 53, 2), bits(w, 55, 1), 0, 0
+            if bits(w, 52, 1):
+                raise Unsupported('FMUL32I.CC')
+        else:
+            fmz, sat, nb, scale = bits(w, 44, 2), bits(w, 50, 1), bits(w, 48, 1), bits(w, 41, 3)
+            if bits(w, 47, 1):
+                raise Unsupported('FMUL.CC')
+            if bits(w, 39, 2) == 3:
+                # .RZ (round toward zero): GLSLC's integer division takes its first quotient this way, and rounding
+                # to nearest can make it one too high, which the correction step after it cannot undo
+                if fmz == 2:
+                    raise Unsupported('FMUL.RZ.FMZ')
+                self.uses.add('rz')
+                x = 'fmul_rz(%s, %s)' % (self.Rf(a), self.fmod(self.op_b_f(w, form), nb, 0))
+                if scale:
+                    x = '(%s) * %s' % (x, {1: '0.5', 2: '0.25', 3: '0.125', 4: '8.0', 5: '4.0', 6: '2.0'}[scale])
+                self.set_rf(d, self.sat('(%s)' % x, sat))
+                return
+        x = self.fmul_expr(self.Rf(a), self.fmod(self.op_b_f(w, form), nb, 0), fmz)
+        if scale:
+            x = '(%s) * %s' % (x, {1: '0.5', 2: '0.25', 3: '0.125', 4: '8.0', 5: '4.0', 6: '2.0'}[scale])
+        self.set_rf(d, self.sat('(%s)' % x, sat))
+
+    def op_FFMA(self, w, form, pc):
+        d, a = bits(w, 0, 8), bits(w, 8, 8)
+        if form == '32I':
+            b, c = self.op_b_f(w, '32I'), self.Rf(bits(w, 0, 8))
+            na, nb, nc, sat, fmz = bits(w, 56, 1), 0, bits(w, 57, 1), bits(w, 55, 1), bits(w, 53, 2)
+        else:
+            if form == 'R':
+                b, c = self.Rf(bits(w, 20, 8)), self.Rf(bits(w, 39, 8))
+            elif form == 'RC':
+                b, c = self.Rf(bits(w, 39, 8)), self.op_b_f(w, 'C')
+            elif form == 'CR':
+                b, c = self.op_b_f(w, 'C'), self.Rf(bits(w, 39, 8))
+            else:
+                b, c = self.op_b_f(w, 'I'), self.Rf(bits(w, 39, 8))
+            na, nb, nc, sat, fmz = 0, bits(w, 48, 1), bits(w, 49, 1), bits(w, 50, 1), bits(w, 53, 2)
+        if bits(w, 47, 1) and form != '32I' or form == '32I' and bits(w, 52, 1):
+            raise Unsupported('FFMA.CC')
+        av, bv, cv = self.fmod(self.Rf(a), na, 0), self.fmod(b, nb, 0), self.fmod(c, nc, 0)
+        if fmz == 2:
+            self.uses.add('fmz')
+            x = 'ffmz(%s, %s, %s)' % (av, bv, cv)
+        else:
+            x = 'fma(%s, %s, %s)' % (av, bv, cv)
+        self.set_rf(d, self.sat(x, sat))
+
+    def op_MUFU(self, w, form, pc):
+        d, a, op = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 4)
+        x = self.fmod(self.Rf(a), bits(w, 48, 1), bits(w, 46, 1))
+        e = {0: 'cos(%s)', 1: 'sin(%s)', 2: 'exp2(%s)', 3: 'log2(%s)', 4: '(1.0 / %s)', 5: 'inversesqrt(%s)',
+             8: 'sqrt(%s)'}.get(op)
+        if e is None:
+            raise Unsupported('MUFU %d' % op)
+        self.set_rf(d, self.sat(e % x, bits(w, 50, 1)))
+
+    def op_RRO(self, w, form, pc):
+        # range reduction for MUFU.SIN/COS/EX2: MUFU takes plain values here, so RRO only applies modifiers
+        d = bits(w, 0, 8)
+        self.set_rf(d, self.fmod(self.op_b_f(w, form), bits(w, 45, 1), bits(w, 49, 1)))
+
+    def op_FMNMX(self, w, form, pc):
+        d, a = bits(w, 0, 8), bits(w, 8, 8)
+        av = self.fmod(self.Rf(a), bits(w, 48, 1), bits(w, 46, 1))
+        bv = self.fmod(self.op_b_f(w, form), bits(w, 45, 1), bits(w, 49, 1))
+        p = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        if bits(w, 47, 1):
+            raise Unsupported('FMNMX.CC')
+        # the hardware returns the operand that is not NaN (GLSL's min / max leave it undefined): nmin / nmax
+        if p == 'true':
+            self.set_rf(d, 'nmin(%s, %s)' % (av, bv))
+        elif p == 'false':
+            self.set_rf(d, 'nmax(%s, %s)' % (av, bv))
+        else:
+            self.set_rf(d, '(%s ? nmin(%s, %s) : nmax(%s, %s))' % (p, av, bv, av, bv))
+
+    def op_FSETP(self, w, form, pc):
+        av = self.fmod(self.Rf(bits(w, 8, 8)), bits(w, 43, 1), bits(w, 7, 1))
+        bv = self.fmod(self.op_b_f(w, form), bits(w, 6, 1), bits(w, 44, 1))
+        self.emit('{ float a_ = %s, b_ = %s;' % (av, bv))
+        self.indent += 1
+        cmp = self.fcmp(bits(w, 48, 4), 'a_', 'b_')
+        bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        bo = bits(w, 45, 2)
+        self.emit('bool c_ = %s;' % cmp)
+        self.set_p(bits(w, 3, 3), self.bop(bo, 'c_', bp))
+        self.set_p(bits(w, 0, 3), self.bop(bo, '!c_', bp))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_FSET(self, w, form, pc):
+        av = self.fmod(self.Rf(bits(w, 8, 8)), bits(w, 43, 1), bits(w, 54, 1))
+        bv = self.fmod(self.op_b_f(w, form), bits(w, 53, 1), bits(w, 44, 1))
+        cmp = self.fcmp(bits(w, 48, 4), 'a_', 'b_')
+        bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        t = '0x3f800000u' if bits(w, 52, 1) else '0xffffffffu'
+        self.emit('{ float a_ = %s, b_ = %s; uint v_ = %s ? %s : 0u;' % (av, bv, self.bop(bits(w, 45, 2), cmp, bp), t))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'v_')
+        if bits(w, 47, 1):
+            self.uses.add('cc')
+            self.emit('cc_z = v_ == 0u; cc_s = (v_ >> 31) != 0u; cc_c = false; cc_o = false;')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_FCMP(self, w, form, pc):
+        """Rd = (Rc cmp 0) ? Ra : Rb, as bit patterns"""
+        if form == 'R':
+            b, c = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            b, c = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            b, c = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            b, c = '0x%08xu' % (bits(w, 20, 19) << 12 | bits(w, 56, 1) << 31), self.R(bits(w, 39, 8))
+        self.emit('{ float c_ = F(%s), z_ = 0.0;' % c)
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), '%s ? %s : %s' % (self.fcmp(bits(w, 48, 4), 'c_', 'z_'), self.R(bits(w, 8, 8)), b))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_FSWZADD(self, w, form, pc):
+        """per quad lane, from two bits of the swizzle: a + b, b - a, a - b or b (hand-written derivatives)"""
+        if bits(w, 47, 1):
+            raise Unsupported('FSWZADD.CC')
+        self.uses.add('subgroup')
+        self.emit('{ float a_ = %s, b_ = %s; uint m_ = (%du >> ((gl_SubgroupInvocationID & 3u) * 2u)) & 3u;'
+                  % (self.Rf(bits(w, 8, 8)), self.Rf(bits(w, 20, 8)), bits(w, 28, 8)))
+        self.indent += 1
+        self.set_rf(bits(w, 0, 8), 'm_ == 0u ? a_ + b_ : m_ == 1u ? b_ - a_ : m_ == 2u ? a_ - b_ : b_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_SHFL(self, w, form, pc):
+        """warp shuffle; c = clamp | segment mask << 8. The quad butterflies (derivatives) become quad swaps"""
+        d, a, mode = bits(w, 0, 8), self.R(bits(w, 8, 8)), bits(w, 30, 2)
+        bimm, cimm = bits(w, 28, 1), bits(w, 29, 1)
+        b = '%du' % bits(w, 20, 5) if bimm else self.R(bits(w, 20, 8))
+        c = '%du' % bits(w, 34, 13) if cimm else self.R(bits(w, 39, 8))
+        dp = bits(w, 48, 3)
+        self.uses.add('subgroup')
+        if mode == 3 and bimm and cimm and bits(w, 34, 13) == 0x1c03 and bits(w, 20, 5) in (1, 2):
+            self.uses.add('quad')
+            self.set_r(d, 'subgroupQuadSwap%s(%s)' % ('Horizontal' if bits(w, 20, 5) == 1 else 'Vertical', a))
+            self.set_p(dp, 'true')
+            return
+        self.uses.add('shuffle')
+        src = {0: '(b_ & ~sm_) | mn_', 1: 'l_ - b_', 2: 'l_ + b_', 3: 'l_ ^ b_'}[mode]
+        ok = 'int(s_) >= int(mn_)' if mode == 1 else 's_ <= mx_'
+        self.emit('{ uint l_ = gl_SubgroupInvocationID, b_ = %s, c_ = %s; uint sm_ = (c_ >> 8) & 31u; uint mn_ = l_ & sm_;'
+                  % (b, c))
+        self.indent += 1
+        self.emit('uint mx_ = mn_ | (c_ & 31u & ~sm_); uint s_ = %s; bool ok_ = %s;' % (src, ok))
+        self.emit('uint v_ = subgroupShuffle(%s, ok_ ? s_ : l_);' % a)
+        self.set_r(d, 'v_')
+        self.set_p(dp, 'ok_')
+        self.indent -= 1
+        self.emit('}')
+
+    # --- half precision pairs (computed in fp32, rounded to fp16 when packed)
+    def half_operand(self, x, swz, neg, ab):
+        v = {0: 'unpackHalf2x16(%s)', 1: 'vec2(F(%s))', 2: 'unpackHalf2x16(%s).xx', 3: 'unpackHalf2x16(%s).yy'}[swz] % x
+        return self.fmod(v, neg, ab)
+
+    def half_operand_b(self, w, form):
+        if form == 'R':
+            return self.half_operand(self.R(bits(w, 20, 8)), bits(w, 28, 2), bits(w, 31, 1), bits(w, 30, 1))
+        if form == 'I':
+            imm = bits(w, 20, 9) << 6 | bits(w, 29, 1) << 15 | bits(w, 30, 9) << 22 | bits(w, 56, 1) << 31
+            return 'unpackHalf2x16(0x%08xu)' % imm
+        raise Unsupported('half operand form %s' % form)
+
+    def op_HADD2(self, w, form, pc):
+        d = bits(w, 0, 8)
+        sat = bits(w, 32, 1) if form == 'R' else bits(w, 52, 1)
+        a = self.half_operand(self.R(bits(w, 8, 8)), bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1))
+        self.emit('{ vec2 v_ = %s;' % self.sat('(%s + %s)' % (a, self.half_operand_b(w, form)), sat))
+        self.indent += 1
+        merge = bits(w, 49, 2)
+        if merge == 0:
+            self.set_r(d, 'packHalf2x16(v_)')
+        elif merge == 1:
+            self.set_rf(d, 'v_.x')
+        elif merge == 2:
+            self.set_r(d, '(%s & 0xffff0000u) | (packHalf2x16(v_) & 0xffffu)' % self.R(d))
+        else:
+            self.set_r(d, '(%s & 0xffffu) | (packHalf2x16(v_) & 0xffff0000u)' % self.R(d))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_HSETP2(self, w, form, pc):
+        a = self.half_operand(self.R(bits(w, 8, 8)), bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1))
+        self.emit('{ vec2 a_ = %s, b_ = %s;' % (a, self.half_operand_b(w, form)))
+        self.indent += 1
+        op, bp, bo = bits(w, 35, 4), self.P(bits(w, 39, 3), bits(w, 42, 1)), bits(w, 45, 2)
+        self.emit('bool c0_ = %s, c1_ = %s;' % (self.fcmp(op, 'a_.x', 'b_.x'), self.fcmp(op, 'a_.y', 'b_.y')))
+        if bits(w, 49, 1):      # H_AND: one result for both halves
+            self.set_p(bits(w, 3, 3), self.bop(bo, '(c0_ && c1_)', bp))
+            self.set_p(bits(w, 0, 3), self.bop(bo, '!(c0_ && c1_)', bp))
+        else:
+            self.set_p(bits(w, 3, 3), self.bop(bo, 'c0_', bp))
+            self.set_p(bits(w, 0, 3), self.bop(bo, 'c1_', bp))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_F2F(self, w, form, pc):
+        d = bits(w, 0, 8)
+        dst, src = bits(w, 8, 2), bits(w, 10, 2)
+        neg, ab, sat = bits(w, 45, 1), bits(w, 49, 1), bits(w, 50, 1)
+        if src == 1:
+            x = 'unpackHalf2x16(%s)[%d]' % (self.op_b_u(w, form), bits(w, 41, 1))
+        elif src == 2:
+            x = self.op_b_f(w, form)
+        else:
+            raise Unsupported('F2F from f64')
+        x = self.fmod(x, neg, ab)
+        if dst == 2 and src == 2:
+            rop = bits(w, 39, 4)
+            x = {8: 'roundEven(%s)', 9: 'floor(%s)', 10: 'ceil(%s)', 11: 'trunc(%s)'}.get(rop, '%s') % x
+        x = self.sat(x, sat)
+        if dst == 2:
+            self.set_rf(d, x)
+        elif dst == 1:
+            self.set_r(d, 'packHalf2x16(vec2(%s, 0.0))' % x)
+        else:
+            raise Unsupported('F2F to f64')
+
+    def op_F2I(self, w, form, pc):
+        d = bits(w, 0, 8)
+        dst, src, signed, rnd = bits(w, 8, 2), bits(w, 10, 2), bits(w, 12, 1), bits(w, 39, 2)
+        if src == 1:
+            x = 'unpackHalf2x16(%s)[%d]' % (self.op_b_u(w, form), bits(w, 41, 1))
+        elif src == 2:
+            x = self.op_b_f(w, form)
+        else:
+            raise Unsupported('F2I from f64')
+        x = self.fmod(x, bits(w, 49, 1), bits(w, 45, 1))
+        x = {0: 'roundEven(%s)', 1: 'floor(%s)', 2: 'ceil(%s)', 3: 'trunc(%s)'}[rnd] % x
+        if dst == 3:
+            raise Unsupported('F2I to 64-bit')
+        if signed:
+            lo, hi = (-32768.0, 32767.0) if dst == 1 else (-2147483648.0, 2147483520.0)
+            e = 'uint(int(clamp(%s, %s, %s)))' % (x, lo, hi)
+        else:
+            hi = 65535.0 if dst == 1 else 4294967040.0
+            e = 'uint(clamp(%s, 0.0, %s))' % (x, hi)
+        # NaN converts to 0x80000000 for 32-bit results (signed or not), else 0
+        self.emit('{ float x_ = %s; uint v_ = isnan(x_) ? %s : %s;' % (x, '0x80000000u' if dst == 2 else '0u',
+                                                                       e.replace(x, 'x_')))
+        self.indent += 1
+        if signed and dst == 2:
+            # values above 2^31 - 128 clamp to INT_MAX
+            self.emit('if (x_ >= 2147483648.0) v_ = 0x7fffffffu;')
+        if not signed and dst == 2:
+            self.emit('if (x_ >= 4294967296.0) v_ = 0xffffffffu;')
+        self.set_r(d, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_I2F(self, w, form, pc):
+        d = bits(w, 0, 8)
+        ff, ifmt, signed, sel = bits(w, 8, 2), bits(w, 10, 2), bits(w, 13, 1), bits(w, 41, 2)
+        if ifmt == 3:
+            raise Unsupported('I2F from 64-bit')
+        src = self.op_b_u(w, form)
+        width = {0: 8, 1: 16, 2: 32}[ifmt]
+        if width < 32:
+            v = 'bitfieldExtract(%s(%s), %d, %d)' % ('int' if signed else 'uint', src, sel * 8, width)
+        else:
+            v = 'int(%s)' % src if signed else src
+        if bits(w, 49, 1):
+            v = 'abs(%s)' % v if signed else v
+        if bits(w, 45, 1):
+            v = '(-%s)' % (v if signed else 'int(%s)' % v)
+            signed = True
+        x = 'float(%s)' % v
+        if width == 32 and bits(w, 39, 2) == 3:
+            # .RZ: values above 2^24 truncate instead of rounding to nearest (GLSLC's integer division)
+            self.uses.add('rz')
+            x = 'i2f_rz(%s)' % v
+        if ff == 2:
+            self.set_rf(d, x)
+        elif ff == 1:
+            self.set_r(d, 'packHalf2x16(vec2(%s, 0.0))' % x)
+        else:
+            raise Unsupported('I2F to f64')
+
+    def op_I2I(self, w, form, pc):
+        d = bits(w, 0, 8)
+        dfmt, dsg, sfmt, ssg, sel = bits(w, 8, 2), bits(w, 12, 1), bits(w, 10, 2), bits(w, 13, 1), bits(w, 41, 3)
+        neg, ab, sat = bits(w, 45, 1), bits(w, 49, 1), bits(w, 50, 1)
+        src = self.op_b_u(w, form)
+        sw = {0: 8, 1: 16, 2: 32}[sfmt]
+        if sw < 32:
+            v = 'bitfieldExtract(int(%s), %d, %d)' % (src, sel * 8, sw) if ssg else \
+                'int(bitfieldExtract(%s, %d, %d))' % (src, sel * 8, sw)
+        else:
+            v = 'int(%s)' % src
+        if ab:
+            v = 'abs(%s)' % v
+        if neg:
+            v = '(-%s)' % v
+        dw = {0: 8, 1: 16, 2: 32}[dfmt]
+        if sat:
+            if dsg:
+                lo, hi = -(1 << (dw - 1)), (1 << (dw - 1)) - 1
+            else:
+                lo, hi = 0, (1 << dw) - 1 if dw < 32 else 0x7fffffff
+            if not ssg and sw == 32 and not dsg:
+                v = 'uint(%s)' % src
+                self.i2i_set(w, d, v if dw == 32 else 'min(%s, %du)' % (v, (1 << dw) - 1))
+                return
+            v = 'clamp(%s, %d, %d)' % (v, lo, hi)
+        if dw < 32:
+            self.i2i_set(w, d, 'uint(bitfieldExtract(%s, 0, %d))' % (v, dw) if dsg else
+                         'bitfieldExtract(uint(%s), 0, %d)' % (v, dw))
+        else:
+            self.i2i_set(w, d, 'uint(%s)' % v)
+
+    def i2i_set(self, w, d, e):
+        """I2I's result; .CC (bit 47) sets zero and sign from it (the game tests Rx != 0 with I2I RZ.CC, Rx and
+        CSETP.NE), carry and overflow clear"""
+        if not bits(w, 47, 1):
+            self.set_r(d, e)
+            return
+        self.uses.add('cc')
+        self.emit('{ uint v_ = %s;' % e)
+        self.indent += 1
+        self.set_r(d, 'v_')
+        self.emit('cc_z = v_ == 0u; cc_s = (v_ >> 31) != 0u; cc_c = false; cc_o = false;')
+        self.indent -= 1
+        self.emit('}')
+
+    # --- integer
+    def cc_add(self, a, b, res, x=False):
+        self.uses.add('cc')
+        self.emit('cc_z = %s == 0u; cc_s = (%s >> 31) != 0u; cc_c = %s < %s%s; cc_o = ((~(%s ^ %s) & (%s ^ %s)) >> 31) != 0u;'
+                  % (res, res, res, a, ' || (cc_c && %s == %s)' % (res, a) if x else '', a, b, a, res))
+
+    def op_IADD(self, w, form, pc):
+        d, a = bits(w, 0, 8), bits(w, 8, 8)
+        if form == '32I':
+            x, cc, sat, na, nb = bits(w, 53, 1), bits(w, 52, 1), bits(w, 54, 1), bits(w, 56, 1), 0
+            po = bits(w, 55, 2) == 3
+        else:
+            x, cc, sat, na, nb = bits(w, 43, 1), bits(w, 47, 1), bits(w, 50, 1), bits(w, 49, 1), bits(w, 48, 1)
+            po = bits(w, 48, 2) == 3
+        if po:
+            na = nb = 0
+        if sat:
+            raise Unsupported('IADD.SAT')
+        av = self.R(a)
+        bv = self.op_b_u(w, form)
+        if na:
+            av = '(-%s)' % av if av != '0u' else '0u'
+        if nb:
+            bv = '(-%s)' % bv
+        self.emit('{ uint a_ = %s, b_ = %s; uint v_ = a_ + b_%s%s;' % (av, bv, ' + (cc_c ? 1u : 0u)' if x else '',
+                                                                   ' + 1u' if po else ''))
+        if x:
+            self.uses.add('cc')
+        self.indent += 1
+        if cc:
+            self.cc_add('a_', 'b_', 'v_', x)
+        self.set_r(d, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_IADD3(self, w, form, pc):
+        d = bits(w, 0, 8)
+        if bits(w, 47, 1) or bits(w, 48, 1):
+            raise Unsupported('IADD3.CC/X')
+        a, c = self.R(bits(w, 8, 8)), self.R(bits(w, 39, 8))
+        b = self.op_b_u(w, form)
+        if form == 'R':
+            def half(v, h):
+                return {0: v, 1: '(%s & 0xffffu)' % v, 2: '(%s >> 16)' % v}[h]
+            a, b, c = half(a, bits(w, 35, 2)), half(b, bits(w, 33, 2)), half(c, bits(w, 31, 2))
+        neg = lambda v, n: '(-%s)' % v if n else v
+        a, b, c = neg(a, bits(w, 51, 1)), neg(b, bits(w, 50, 1)), neg(c, bits(w, 49, 1))
+        if form == 'R' and bits(w, 37, 2) == 1:
+            # .RS shifts the 33-bit sum a + b: its carry is bit 16 of the result (GLSLC's XMAD high multiply)
+            self.emit('{ uint a_ = %s, s_ = a_ + %s;' % (a, b))
+            self.indent += 1
+            self.set_r(d, '(s_ >> 16) + (s_ < a_ ? 0x10000u : 0u) + %s' % c)
+            self.indent -= 1
+            self.emit('}')
+        elif form == 'R' and bits(w, 37, 2):
+            self.set_r(d, '((%s + %s) << 16) + %s' % (a, b, c))
+        else:
+            self.set_r(d, '%s + %s + %s' % (a, b, c))
+
+    def op_ISCADD(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        if form == '32I':
+            scale, na, nb, cc = bits(w, 53, 5), 0, 0, bits(w, 52, 1)
+        else:
+            scale, na, nb, cc = bits(w, 39, 5), bits(w, 49, 1), bits(w, 48, 1), bits(w, 47, 1)
+        b = self.op_b_u(w, form)
+        if na:
+            a = '(-%s)' % a
+        if nb:
+            b = '(-%s)' % b
+        if not cc:
+            self.set_r(d, '(%s << %d) + %s' % (a, scale, b))
+            return
+        # .CC: the low half of a 64-bit address (an IADD.X follows)
+        self.emit('{ uint a_ = %s << %d, b_ = %s; uint v_ = a_ + b_;' % (a, scale, b))
+        self.indent += 1
+        self.cc_add('a_', 'b_', 'v_')
+        self.set_r(d, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_XMAD(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        asg, bsg, ha = bits(w, 48, 1), bits(w, 49, 1), bits(w, 53, 1)
+        if bits(w, 47, 1):
+            raise Unsupported('XMAD.CC')
+        if form == 'R':
+            b, c = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+            mode, hb, psl, mrg, x = bits(w, 50, 3), bits(w, 35, 1), bits(w, 36, 1), bits(w, 37, 1), bits(w, 38, 1)
+        elif form == 'RC':
+            b, c = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+            mode, hb, psl, mrg, x = bits(w, 50, 2), bits(w, 52, 1), 0, 0, bits(w, 54, 1)
+        elif form == 'CR':
+            b, c = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+            mode, hb, psl, mrg, x = bits(w, 50, 2), bits(w, 52, 1), bits(w, 55, 1), bits(w, 56, 1), bits(w, 54, 1)
+        else:
+            b, c = '%du' % bits(w, 20, 16), self.R(bits(w, 39, 8))
+            mode, hb, psl, mrg, x = bits(w, 50, 3), 0, bits(w, 36, 1), bits(w, 37, 1), bits(w, 38, 1)
+        if x:
+            raise Unsupported('XMAD.X')
+
+        def half(v, h, sg):
+            if sg:
+                return 'uint(bitfieldExtract(int(%s), %d, 16))' % (v, 16 * h)
+            return '(%s >> 16)' % v if h else '(%s & 0xffffu)' % v
+        self.emit('{ uint b_ = %s, c_ = %s;' % (b, c))
+        self.indent += 1
+        prod = '(%s * %s)' % (half(a, ha, asg), half('b_', hb, bsg))
+        if psl:
+            prod = '(%s << 16)' % prod
+        cv = {0: 'c_', 1: '(c_ & 0xffffu)', 2: '(c_ >> 16)', 4: '((b_ << 16) + c_)'}.get(mode)
+        if cv is None:
+            raise Unsupported('XMAD mode %d' % mode)
+        r = '%s + %s' % (prod, cv)
+        if mrg:
+            r = 'bitfieldInsert(%s, b_ & 0xffffu, 16, 16)' % r
+        self.set_r(d, r)
+        self.indent -= 1
+        self.emit('}')
+
+    def op_IMNMX(self, w, form, pc):
+        if bits(w, 43, 2) or bits(w, 47, 1):
+            raise Unsupported('IMNMX.XLO/XHI/CC')
+        a, b = self.R(bits(w, 8, 8)), self.op_b_u(w, form)
+        if bits(w, 48, 1):
+            a, b = 'int(%s)' % a, 'int(%s)' % b
+        p = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        mn, mx = 'min(%s, %s)' % (a, b), 'max(%s, %s)' % (a, b)
+        e = mn if p == 'true' else mx if p == 'false' else '(%s ? %s : %s)' % (p, mn, mx)
+        self.set_r(bits(w, 0, 8), 'uint(%s)' % e if bits(w, 48, 1) else e)
+
+    def op_LEA(self, w, form, pc):
+        """LO: Rd = B + (Ra << scale); HI: Rd = B + the high word of (Rc:Ra << scale) (the upper half of a 64-bit
+        scaled index). Negation as given; no carry chains (X, CC, the carry predicate)"""
+        part, _, f = form.partition('_')
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        if bits(w, 47, 1) or bits(w, 48, 3) != PT:
+            raise Unsupported('LEA.CC/carry predicate')
+        if part == 'LO':
+            scale, neg, x = bits(w, 39, 5), bits(w, 45, 1), bits(w, 46, 1)
+            b = self.op_b_u(w, f)
+            if x:
+                raise Unsupported('LEA.LO.X')
+            off = '(0u - %s)' % a if neg else a
+            self.set_r(d, '%s + (%s << %du)' % (b, off, scale))
+            return
+        if f == 'R':
+            scale, neg, x, b = bits(w, 28, 5), bits(w, 37, 1), bits(w, 38, 1), self.R(bits(w, 20, 8))
+        else:
+            scale, neg, x, b = bits(w, 51, 5), bits(w, 56, 1), bits(w, 57, 1), self.op_b_u(w, 'C')
+        if x:
+            raise Unsupported('LEA.HI.X')
+        self.uses.add('global')     # 64-bit integer types
+        v = 'packUint2x32(uvec2(%s, %s))' % (a, self.R(bits(w, 39, 8)))
+        if neg:
+            v = '(0ul - %s)' % v
+        self.set_r(d, '%s + uint(%s >> %du)' % (b, v, 32 - scale))
+
+    def op_BFI(self, w, form, pc):
+        """Rd = Rc (base) with Ra inserted at the offset / count packed in operand B"""
+        if bits(w, 47, 1):
+            raise Unsupported('BFI.CC')
+        if form == 'R':
+            packed, base = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            packed, base = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            packed, base = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            packed, base = self.op_b_u(w, 'I'), self.R(bits(w, 39, 8))
+        self.emit('{ uint p_ = %s, c_ = %s; uint o_ = min(p_ & 0xffu, 32u), n_ = min((p_ >> 8) & 0xffu, 32u - o_);'
+                  % (packed, base))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'n_ == 0u ? c_ : bitfieldInsert(c_, %s, int(o_), int(n_))' % self.R(bits(w, 8, 8)))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_ICMP(self, w, form, pc):
+        """Rd = (Rc cmp 0) ? Ra : Rb"""
+        if form == 'R':
+            b, c = self.R(bits(w, 20, 8)), self.R(bits(w, 39, 8))
+        elif form == 'RC':
+            b, c = self.R(bits(w, 39, 8)), self.op_b_u(w, 'C')
+        elif form == 'CR':
+            b, c = self.op_b_u(w, 'C'), self.R(bits(w, 39, 8))
+        else:
+            b, c = self.op_b_u(w, 'I'), self.R(bits(w, 39, 8))
+        cmp = self.icmp(bits(w, 49, 3), c, '0u', bits(w, 48, 1))
+        self.set_r(bits(w, 0, 8), '(%s ? %s : %s)' % (cmp.replace('int(0u)', '0'), self.R(bits(w, 8, 8)), b))
+
+    def op_R2P(self, w, form, pc):
+        """predicates P0-P6 from the bits of one byte of Ra, where the mask (operand B) has ones"""
+        if bits(w, 40, 1):
+            raise Unsupported('R2P.CC')
+        if form != 'I':
+            raise Unsupported('R2P with a register mask')
+        mask, sh = bits(w, 20, 7), bits(w, 41, 2) * 8
+        self.emit('{ uint v_ = %s;' % self.R(bits(w, 8, 8)))
+        self.indent += 1
+        for p in range(7):
+            if mask >> p & 1:
+                self.set_p(p, '((v_ >> %du) & 1u) != 0u' % (sh + p))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_POPC(self, w, form, pc):
+        b = self.op_b_u(w, form)
+        self.set_r(bits(w, 0, 8), 'uint(bitCount(%s))' % ('~%s' % b if bits(w, 40, 1) else b))
+
+    def op_FLO(self, w, form, pc):
+        """find leading one: its bit index (with .SH the count of leading zeros), 0xffffffff if there is none"""
+        if bits(w, 47, 1):
+            raise Unsupported('FLO.CC')
+        b = self.op_b_u(w, form)
+        if bits(w, 40, 1):
+            b = '~%s' % b
+        self.emit('{ int m_ = findMSB(%s);' % ('int(%s)' % b if bits(w, 48, 1) else b))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'm_ < 0 ? 0xffffffffu : %s' % ('uint(31 - m_)' if bits(w, 41, 1) else 'uint(m_)'))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_ISETP(self, w, form, pc):
+        if bits(w, 43, 1):
+            raise Unsupported('ISETP.X')
+        a, b = self.R(bits(w, 8, 8)), self.op_b_u(w, form)
+        cmp = self.icmp(bits(w, 49, 3), a, b, bits(w, 48, 1))
+        bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        bo = bits(w, 45, 2)
+        self.emit('{ bool c_ = %s;' % cmp)
+        self.indent += 1
+        self.set_p(bits(w, 3, 3), self.bop(bo, 'c_', bp))
+        self.set_p(bits(w, 0, 3), self.bop(bo, '!c_', bp))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_ISET(self, w, form, pc):
+        if bits(w, 43, 1):
+            raise Unsupported('ISET.X')
+        a, b = self.R(bits(w, 8, 8)), self.op_b_u(w, form)
+        cmp = self.icmp(bits(w, 49, 3), a, b, bits(w, 48, 1))
+        bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        t = '0x3f800000u' if bits(w, 44, 1) else '0xffffffffu'
+        v = '(%s ? %s : 0u)' % (self.bop(bits(w, 45, 2), cmp, bp), t)
+        if not bits(w, 47, 1):
+            self.set_r(bits(w, 0, 8), v)
+            return
+        self.uses.add('cc')
+        self.emit('{ uint v_ = %s;' % v)
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'v_')
+        self.emit('cc_z = v_ == 0u; cc_s = (v_ >> 31) != 0u; cc_c = false; cc_o = false;')
+        self.indent -= 1
+        self.emit('}')
+
+    def logic(self, a, b, op):
+        if op == 3:
+            return b
+        return '(%s %s %s)' % (a, {0: '&', 1: '|', 2: '^'}[op], b)
+
+    def pred_op(self, popd, dp, res):
+        if dp == PT:
+            return
+        e = {0: 'false', 1: 'true', 2: '(%s == 0u)' % res, 3: '(%s != 0u)' % res}[popd]
+        self.set_p(dp, e)
+
+    def op_LOP(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        b = self.op_b_u(w, form)
+        if form == '32I':
+            op, ia, ib, x, cc = bits(w, 53, 2), bits(w, 55, 1), bits(w, 56, 1), bits(w, 57, 1), bits(w, 52, 1)
+            popd, dp = 0, PT
+        else:
+            op, ia, ib, x, cc = bits(w, 41, 2), bits(w, 39, 1), bits(w, 40, 1), bits(w, 43, 1), bits(w, 47, 1)
+            popd, dp = bits(w, 44, 2), bits(w, 48, 3)
+        if x or cc:
+            raise Unsupported('LOP.X/CC')
+        if ia:
+            a = '(~%s)' % a
+        if ib:
+            b = '(~%s)' % b
+        self.emit('{ uint v_ = %s;' % self.logic(a, b, op))
+        self.indent += 1
+        self.set_r(d, 'v_')
+        self.pred_op(popd, dp, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_LOP3(self, w, form, pc):
+        d, a, c = bits(w, 0, 8), self.R(bits(w, 8, 8)), self.R(bits(w, 39, 8))
+        b = self.op_b_u(w, form)
+        if form == 'R':
+            lut, popd, dp = bits(w, 28, 8), bits(w, 36, 2), bits(w, 48, 3)
+            if bits(w, 38, 1) or bits(w, 47, 1):
+                raise Unsupported('LOP3.X/CC')
+        else:
+            lut, popd, dp = bits(w, 48, 8), 0, PT
+            if bits(w, 47, 1):
+                raise Unsupported('LOP3.CC')
+        terms = []
+        for i in range(8):
+            if lut >> i & 1:
+                terms.append('(%s%s & %s%s & %s%s)' % ('' if i & 4 else '~', 'a_', '' if i & 2 else '~', 'b_',
+                                                      '' if i & 1 else '~', 'c_'))
+        e = ' | '.join(terms) if terms else '0u'
+        self.emit('{ uint a_ = %s, b_ = %s, c_ = %s; uint v_ = %s;' % (a, b, c, e))
+        self.indent += 1
+        self.set_r(d, 'v_')
+        self.pred_op(popd, dp, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_SHL(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        b = self.op_b_u(w, form)
+        if bits(w, 43, 1) or bits(w, 47, 1):
+            raise Unsupported('SHL.X/CC')
+        if bits(w, 39, 1):
+            self.set_r(d, '%s << (%s & 31u)' % (a, b))
+        else:
+            self.set_r(d, '(%s >= 32u ? 0u : %s << %s)' % (b, a, b))
+
+    def op_SHR(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        b = self.op_b_u(w, form)
+        if bits(w, 43, 1) or bits(w, 47, 1) or bits(w, 40, 1):
+            raise Unsupported('SHR.X/CC/BREV')
+        wrap, sg = bits(w, 39, 1), bits(w, 48, 1)
+        if wrap:
+            sh = '(%s & 31u)' % b
+            self.set_r(d, 'uint(int(%s) >> %s)' % (a, sh) if sg else '%s >> %s' % (a, sh))
+        elif sg:
+            self.set_r(d, 'uint(int(%s) >> min(%s, 31u))' % (a, b))
+        else:
+            self.set_r(d, '(%s >= 32u ? 0u : %s >> %s)' % (b, a, b))
+
+    def op_BFE(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        b = self.op_b_u(w, form)
+        if bits(w, 40, 1) or bits(w, 47, 1):
+            raise Unsupported('BFE.BREV/CC')
+        sg = bits(w, 48, 1)
+        self.emit('{ uint o_ = %s & 0xffu, n_ = (%s >> 8) & 0xffu; o_ = min(o_, 32u); n_ = min(n_, 32u - o_);' % (b, b))
+        self.indent += 1
+        if sg:
+            self.set_r(d, 'n_ == 0u ? 0u : uint(bitfieldExtract(int(%s), int(o_), int(n_)))' % a)
+        else:
+            self.set_r(d, 'n_ == 0u ? 0u : bitfieldExtract(%s, int(o_), int(n_))' % a)
+        self.indent -= 1
+        self.emit('}')
+
+    def op_MOV(self, w, form, pc):
+        self.set_r(bits(w, 0, 8), self.op_b_u(w, form))
+
+    def op_SEL(self, w, form, pc):
+        d, a = bits(w, 0, 8), self.R(bits(w, 8, 8))
+        b = self.op_b_u(w, form)
+        p = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        self.set_r(d, '(%s ? %s : %s)' % (p, a, b))
+
+    def op_PSETP(self, w, form, pc):
+        pa = self.P(bits(w, 12, 3), bits(w, 15, 1))
+        pb = self.P(bits(w, 29, 3), bits(w, 32, 1))
+        pc_ = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        self.emit('{ bool c_ = %s;' % self.bop(bits(w, 24, 2), pa, pb))
+        self.indent += 1
+        self.set_p(bits(w, 3, 3), self.bop(bits(w, 45, 2), 'c_', pc_))
+        self.set_p(bits(w, 0, 3), self.bop(bits(w, 45, 2), '!c_', pc_))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_PSET(self, w, form, pc):
+        pa = self.P(bits(w, 12, 3), bits(w, 15, 1))
+        pb = self.P(bits(w, 29, 3), bits(w, 32, 1))
+        pc_ = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        if bits(w, 47, 1):
+            raise Unsupported('PSET.CC')
+        t = '0x3f800000u' if bits(w, 44, 1) else '0xffffffffu'
+        r = self.bop(bits(w, 45, 2), self.bop(bits(w, 24, 2), pa, pb), pc_)
+        self.set_r(bits(w, 0, 8), '(%s ? %s : 0u)' % (r, t))
+
+    def op_CSETP(self, w, form, pc):
+        t = self.flow(bits(w, 8, 5))
+        bp = self.P(bits(w, 39, 3), bits(w, 42, 1))
+        self.emit('{ bool c_ = %s;' % t)
+        self.indent += 1
+        self.set_p(bits(w, 3, 3), self.bop(bits(w, 45, 2), 'c_', bp))
+        self.set_p(bits(w, 0, 3), self.bop(bits(w, 45, 2), '!c_', bp))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_NOP(self, w, form, pc):
+        pass
+
+    def op_DEPBAR(self, w, form, pc):
+        pass
+
+    def op_S2R(self, w, form, pc):
+        sr = bits(w, 20, 8)
+        e = {33: 'gl_LocalInvocationID.x', 34: 'gl_LocalInvocationID.y', 35: 'gl_LocalInvocationID.z',
+             37: 'gl_WorkGroupID.x', 38: 'gl_WorkGroupID.y', 39: 'gl_WorkGroupID.z', 0: 'gl_SubgroupInvocationID',
+             32: '(gl_LocalInvocationID.x | gl_LocalInvocationID.y << 16 | gl_LocalInvocationID.z << 26)',
+             18: '0x3f800000u',     # Y direction +1.0: render targets hold rows as on the console
+             57: 'gl_SubgroupLtMask.x'}.get(sr)
+        if e is None:
+            raise Unsupported('S2R %d' % sr)
+        if sr in (0, 57):
+            self.uses.add('subgroup')
+            if sr == 57:
+                self.uses.add('ballot')
+        self.set_r(bits(w, 0, 8), e)
+
+    # --- memory
+    def op_LDC(self, w, form, pc):
+        d, a, off, idx = bits(w, 0, 8), bits(w, 8, 8), sext(bits(w, 20, 16), 16), bits(w, 36, 5)
+        mode, size = bits(w, 44, 2), bits(w, 48, 3)
+        if mode != 0:
+            raise Unsupported('LDC mode %d' % mode)
+        if a == RZ:
+            if size == 4:
+                self.set_r(d, self.cbuf(idx, off))
+            elif size == 5:
+                self.set_r(d, self.cbuf(idx, off))
+                self.set_r(d + 1, self.cbuf(idx, off + 4))
+            else:
+                raise Unsupported('LDC size %d' % size)
+            return
+        addr = '(%s + %du)' % (self.R(a), off & 0xffffffff) if off else self.R(a)
+        self.emit('{ uint ad_ = %s;' % addr)
+        self.indent += 1
+        if size == 4:
+            self.set_r(d, self.cbuf_dyn(idx, 'ad_'))
+        elif size == 5:
+            v0, v1 = self.cbuf_dyn(idx, 'ad_'), self.cbuf_dyn(idx, 'ad_ + 4u')
+            self.emit('uint v0_ = %s, v1_ = %s;' % (v0, v1))
+            self.set_r(d, 'v0_')
+            self.set_r(d + 1, 'v1_')
+        else:
+            raise Unsupported('LDC size %d' % size)
+        self.indent -= 1
+        self.emit('}')
+
+    def global_addr(self, w):
+        a, off, e = bits(w, 8, 8), sext(bits(w, 20, 24), 24), bits(w, 45, 1)
+        self.uses.add('global')
+        if e:
+            base = 'packUint2x32(uvec2(%s, %s))' % (self.R(a), self.R(a + 1 if a != RZ else RZ))
+        else:
+            base = 'uint64_t(%s)' % self.R(a)
+        return '(%s + %d)' % (base, off) if off else base
+
+    def op_LDG(self, w, form, pc):
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        n = {4: 1, 5: 2, 6: 4, 7: 4}.get(size)     # 7: 128 bits, not assumed 16-byte aligned
+        if n is None:
+            raise Unsupported('LDG size %d' % size)
+        self.emit('{ uint64_t ga_ = %s;' % self.global_addr(w))
+        self.indent += 1
+        for i in range(n):
+            self.set_r(d + i, 'GMem(ga_ + %d).v' % (4 * i))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_STG(self, w, form, pc):
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        n = {4: 1, 5: 2, 6: 4}.get(size)
+        if n is None:
+            raise Unsupported('STG size %d' % size)
+        self.emit('{ uint64_t ga_ = %s;' % self.global_addr(w))
+        self.indent += 1
+        for i in range(n):
+            self.emit('GMem(ga_ + %d).v = %s;' % (4 * i, self.R(d + i if d != RZ else RZ)))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_ATOM(self, w, form, pc):
+        """global atomic with a result: op at 52, size at 49 (U32, S32), address Ra(.E: pair) + imm20 at 28"""
+        op, size = bits(w, 52, 4), bits(w, 49, 3)
+        f = {0: 'atomicAdd', 1: 'atomicMin', 2: 'atomicMax', 5: 'atomicAnd', 6: 'atomicOr', 7: 'atomicXor',
+             8: 'atomicExchange'}.get(op)
+        if f is None or size > 1:
+            raise Unsupported('ATOM op %d size %d' % (op, size))
+        a, off = bits(w, 8, 8), sext(bits(w, 28, 20), 20)
+        self.uses.add('global')
+        if bits(w, 48, 1):
+            base = 'packUint2x32(uvec2(%s, %s))' % (self.R(a), self.R(a + 1 if a != RZ else RZ))
+        else:
+            base = 'uint64_t(%s)' % self.R(a)
+        addr = '(%s + %d)' % (base, off) if off else base
+        b = self.R(bits(w, 20, 8))
+        if size:
+            self.uses.add('global_i')
+            self.set_r(bits(w, 0, 8), 'uint(%s(GMemI(%s).v, int(%s)))' % (f, addr, b))
+        else:
+            self.set_r(bits(w, 0, 8), '%s(GMem(%s).v, %s)' % (f, addr, b))
+
+    def local_addr(self, w):
+        a, off = bits(w, 8, 8), sext(bits(w, 20, 24), 24)
+        self.uses.add('lmem')
+        if a == RZ:
+            return '%du' % (off & 0xffffffff)
+        return '(%s + %du)' % (self.R(a), off & 0xffffffff)
+
+    def op_LDL(self, w, form, pc):
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        n = {4: 1, 5: 2, 6: 4}.get(size)
+        if n is None:
+            raise Unsupported('LDL size %d' % size)
+        self.emit('{ uint la_ = %s >> 2;' % self.local_addr(w))
+        self.indent += 1
+        for i in range(n):
+            self.set_r(d + i, 'lmem[(la_ + %du) & LMEM_MASK]' % i)
+        self.indent -= 1
+        self.emit('}')
+
+    def op_STL(self, w, form, pc):
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        n = {4: 1, 5: 2, 6: 4}.get(size)
+        if n is None:
+            raise Unsupported('STL size %d' % size)
+        self.emit('{ uint la_ = %s >> 2;' % self.local_addr(w))
+        self.indent += 1
+        for i in range(n):
+            self.emit('lmem[(la_ + %du) & LMEM_MASK] = %s;' % (i, self.R(d + i if d != RZ else RZ)))
+        self.indent -= 1
+        self.emit('}')
+
+    # --- shared memory (compute): `shared uint smem[]`, sized from GLSLC's control word at 0x754
+    def shared_addr(self, w):
+        a, off = bits(w, 8, 8), bits(w, 20, 24)
+        size = struct.unpack_from('<I', self.sh.control, 0x754)[0] if len(self.sh.control) >= 0x758 else 0
+        if self.stage != 'compute' or not size:
+            raise Unsupported('shared memory without a size')
+        self.uses.add('smem')
+        if a == RZ:
+            return '%du' % off
+        return '(%s + %du)' % (self.R(a), sext(off, 24) & 0xffffffff)
+
+    def op_LDS(self, w, form, pc):
+        """bit 44 (.U) can be ignored; out-of-range reads give 0"""
+        d, size = bits(w, 0, 8), bits(w, 48, 3)
+        self.emit('{ uint sa_ = %s;' % self.shared_addr(w))
+        self.indent += 1
+        word = lambda i: 'smem_ld((sa_ >> 2) + %du)' % i
+        if size in (0, 1, 2, 3):
+            n = 8 if size < 2 else 16
+            sh = '((sa_ & 3u) * 8u)' if n == 8 else '((sa_ & 2u) * 8u)'
+            v = 'bitfieldExtract(%s(%s), int(%s), %d)' % ('int' if size & 1 else '', word(0), sh, n)
+            self.set_r(d, 'uint(%s)' % v if size & 1 else v)
+        else:
+            n = {4: 1, 5: 2, 6: 4}.get(size)
+            if n is None:
+                raise Unsupported('LDS size %d' % size)
+            for i in range(n):
+                self.set_r(d + i, word(i))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_STS(self, w, form, pc):
+        """out-of-range writes are dropped"""
+        s, size = bits(w, 0, 8), bits(w, 48, 3)
+        self.emit('{ uint sa_ = %s;' % self.shared_addr(w))
+        self.indent += 1
+        if size in (0, 1, 2, 3):
+            n = 8 if size < 2 else 16
+            sh = '((sa_ & 3u) * 8u)' if n == 8 else '((sa_ & 2u) * 8u)'
+            self.emit('smem_st(sa_ >> 2, bitfieldInsert(smem_ld(sa_ >> 2), %s, int(%s), %d));' % (self.R(s), sh, n))
+        else:
+            n = {4: 1, 5: 2, 6: 4}.get(size)
+            if n is None:
+                raise Unsupported('STS size %d' % size)
+            for i in range(n):
+                self.emit('smem_st((sa_ >> 2) + %du, %s);' % (i, self.R(s + i if s != RZ else RZ)))
+        self.indent -= 1
+        self.emit('}')
+
+    # --- attributes
+    def op_ALD(self, w, form, pc):
+        d, idx, off, size = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 10), bits(w, 47, 2)
+        if idx != RZ or bits(w, 32, 1) or bits(w, 31, 1):
+            raise Unsupported('ALD indexed/output/patch')
+        for i in range(size + 1):
+            e, _ = self.attr_in(off + 4 * i)
+            self.set_r(d + i, e)
+
+    def op_AST(self, w, form, pc):
+        s, idx, off, size = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 10), bits(w, 47, 2)
+        if idx != RZ or bits(w, 31, 1):
+            raise Unsupported('AST indexed/patch')
+        for i in range(size + 1):
+            self.attr_out(off + 4 * i, self.R(s + i if s != RZ else RZ))
+
+    def op_IPA(self, w, form, pc):
+        d, attr, mode, sat = bits(w, 0, 8), bits(w, 30, 8) * 4, bits(w, 54, 2), bits(w, 51, 1)
+        if bits(w, 38, 1):
+            raise Unsupported('IPA indexed')
+        e, generic = self.attr_in(attr)
+        # The interpolator gives a perspective attribute as attribute / w (linear in screen space): IPA.PASS returns
+        # that, IPA.MULTIPLY that times its multiplier register. GLSL inputs are already perspective-correct, so
+        # attribute / w is the input times gl_FragCoord.w. The multiplier is usually w (RCP of IPA a[0x7c]), but not
+        # always: soft particles pass 1 / (their own w attribute / w) to divide by it, for screen coordinates and
+        # depth (dropping it put the item ball light pillars' depth fade at the wrong place: the pillar showed only
+        # from some angles)
+        persp = generic and self.in_attrs.get((attr - 0x80) >> 4) == 'smooth'
+        if mode == 0 and persp:
+            e = 'U(F(%s) * gl_FragCoord.w)' % e
+        elif mode == 1:
+            mul = bits(w, 20, 8)
+            e = 'U(F(%s)%s * F(%s))' % (e, ' * gl_FragCoord.w' if persp else '', self.R(mul))
+        if sat:
+            e = 'U(sat(F(%s)))' % e
+        self.set_r(d, e)
+
+    # --- textures
+    def store_mask(self, dest, mask, val, shadow=False):
+        r = dest
+        for c in range(4):
+            if mask >> c & 1:
+                if shadow:
+                    self.set_rf(r, 'v_' if c < 3 else '1.0')
+                else:
+                    self.set_rf(r, 'v_[%d]' % c)
+                r += 1
+
+    def op_TEXS(self, w, form, pc):
+        da, a, b, db = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8), bits(w, 28, 8)
+        h, sw, enc, f32 = self.tex_handle(bits(w, 36, 13)), bits(w, 50, 3), bits(w, 53, 4), bits(w, 59, 1)
+        fa = lambda i: self.Rf(a + i if a != RZ else RZ)
+        fb = lambda i: self.Rf(b + i if b != RZ else RZ)
+        arr = lambda: 'float(%s & 0xffffu)' % self.R(a)
+        dref = None
+        if enc == 0:
+            e = self.sample('1D', 'h_', fa(0), lod='0.0')
+        elif enc == 1:
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fb(0)))
+        elif enc == 2:
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fb(0)), lod='0.0')
+        elif enc == 3:
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fa(1)), lod=fb(0))
+        elif enc == 4:
+            dref = True
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fa(1)), dref=fb(0))
+        elif enc == 5:
+            dref = True
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fa(1)), dref=fb(1), lod=fb(0))
+        elif enc == 6:
+            dref = True
+            e = self.sample('2D', 'h_', 'vec2(%s, %s)' % (fa(0), fa(1)), dref=fb(0), lod='0.0')
+        elif enc == 7:
+            e = self.sample('2DARRAY', 'h_', 'vec3(%s, %s, %s)' % (fa(1), fb(0), arr()))
+        elif enc == 8:
+            e = self.sample('2DARRAY', 'h_', 'vec3(%s, %s, %s)' % (fa(1), fb(0), arr()), lod='0.0')
+        elif enc == 9:
+            dref = True
+            e = self.sample('2DARRAY', 'h_', 'vec3(%s, %s, %s)' % (fa(1), fb(0), arr()), dref=fb(1), lod='0.0')
+        elif enc == 10:
+            e = self.sample('3D', 'h_', 'vec3(%s, %s, %s)' % (fa(0), fa(1), fb(0)))
+        elif enc == 11:
+            e = self.sample('3D', 'h_', 'vec3(%s, %s, %s)' % (fa(0), fa(1), fb(0)), lod='0.0')
+        elif enc == 12:
+            e = self.sample('CUBE', 'h_', 'vec3(%s, %s, %s)' % (fa(0), fa(1), fb(0)))
+        elif enc == 13:
+            e = self.sample('CUBE', 'h_', 'vec3(%s, %s, %s)' % (fa(0), fa(1), fb(0)), lod=fb(1))
+        else:
+            raise Unsupported('TEXS encoding %d' % enc)
+        self.scalar_tex_store(w, h, e, dref)
+
+    def scalar_tex_store(self, w, h, e, dref):
+        """TEXS / TLDS results: the swizzle picks components into Rd0 (Rd0+1) and Rd1 (Rd1+1), or packs halves"""
+        da, db, sw, f32 = bits(w, 0, 8), bits(w, 28, 8), bits(w, 50, 3), bits(w, 59, 1)
+        masks = [1, 2, 4, 8, 3, 9, 10, 12] if db == RZ else [7, 11, 13, 14, 15]
+        if sw >= len(masks):
+            raise Unsupported('TEXS swizzle')
+        mask = masks[sw]
+        self.emit('{ uint h_ = %s; %s v_ = %s;' % (h, 'float' if dref else 'vec4', e))
+        self.indent += 1
+        comps = [c for c in range(4) if mask >> c & 1]
+        val = lambda c: ('v_' if c < 3 else '1.0') if dref else 'v_[%d]' % c
+        if f32:
+            for i, c in enumerate(comps):
+                if i < 2 and da != RZ:
+                    self.set_rf(da + i, val(c))
+                elif i >= 2 and db != RZ:
+                    self.set_rf(db + i - 2, val(c))
+        else:
+            vals = [val(c) for c in comps]
+            pack = lambda x, y: 'packHalf2x16(vec2(%s, %s))' % (x, y)
+            if len(vals) >= 1:
+                self.set_r(da, pack(vals[0], vals[1] if len(vals) > 1 else '0.0'))
+            if len(vals) >= 3:
+                self.set_r(db, pack(vals[2], vals[3] if len(vals) > 3 else '0.0'))
+        self.indent -= 1
+        self.emit('}')
+
+    def fetch(self, kind, handle, coords, lod, offset=None):
+        """texelFetch of a texture pool entry (samplerless); offsets just move the integer coordinates"""
+        arr = {'1D': 't1d', '2D': 't2d', '3D': 't3d', '2DARRAY': 't2da', '1DARRAY': 't1da'}[kind]
+        self.uses.add('tex_' + arr)
+        if offset:
+            coords = '(%s + %s)' % (coords, offset)
+        if kind in ('2D', '2DARRAY'):
+            self.uses.add('rscale')
+            coords = '%s(%s, %s)' % ('rs_c2' if kind == '2D' else 'rs_c3', handle, coords)
+        e = 'texelFetch(%s[%s], %s, %s)' % (arr, self.ix('%s & 0xffffu' % handle), coords, lod)
+        if kind in ('2D', '2DARRAY'):           # integer textures: the raw bits through the integer view
+            self.uses.add('tex_u' + arr)
+            e = '(%s ? uintBitsToFloat(texelFetch(u%s[%s], %s, %s)) : %s)' % (
+                INT_FLAG % handle, arr, self.ix('%s & 0xffffu' % handle), coords, lod, e)
+        return e
+
+    def op_TLDS(self, w, form, pc):
+        a, b, enc = bits(w, 8, 8), bits(w, 20, 8), bits(w, 53, 4)
+        ia = lambda i: 'int(%s)' % self.R(a + i if a != RZ else RZ)
+        ib = lambda i: 'int(%s)' % self.R(b + i if b != RZ else RZ)
+        if enc == 0:        # 1D.LZ
+            e = self.fetch('1D', 'h_', ia(0), '0')
+        elif enc == 1:      # 1D.LL
+            e = self.fetch('1D', 'h_', ia(0), ib(0))
+        elif enc == 2:      # 2D.LZ
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ib(0)), '0')
+        elif enc == 4:      # 2D.LZ.AOFFI
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), '0', self.tex_offsets('2D', b))
+        elif enc == 5:      # 2D.LL
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0))
+        elif enc == 7:      # 3D.LZ
+            e = self.fetch('3D', 'h_', 'ivec3(%s, %s, %s)' % (ia(0), ia(1), ib(0)), '0')
+        elif enc == 8:      # 2D ARRAY.LZ: the layer in Ra (16 bits), x and y in Rb, Rb+1 (Violet's terrain material map:
+            #                 it clamps both to the size first; reading x from Ra+1 as TEXS does transposed the map)
+            e = self.fetch('2DARRAY', 'h_', 'ivec3(%s, %s, int(%s & 0xffffu))' % (ib(0), ib(1), self.R(a)), '0')
+        elif enc == 12:     # 2D.LL.AOFFI
+            e = self.fetch('2D', 'h_', 'ivec2(%s, %s)' % (ia(0), ia(1)), ib(0),
+                           self.tex_offsets('2D', b + 1 if b != RZ else RZ))
+        else:
+            raise Unsupported('TLDS encoding %d' % enc)
+        self.scalar_tex_store(w, self.tex_handle(bits(w, 36, 13)), e, None)
+
+    def op_TEX(self, w, form, pc):
+        if form == 'B':
+            raise Unsupported('TEX.B')
+        d, cr, mr = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8)
+        ttype, mask, dc = bits(w, 28, 3), bits(w, 31, 4), bits(w, 50, 1)
+        aoffi, blod, lc = bits(w, 54, 1), bits(w, 55, 3), bits(w, 58, 1)
+        if lc or bits(w, 51, 3) != PT:
+            raise Unsupported('TEX.LC/sparse')
+        kind, coords, _ = self.tex_coords(ttype, cr)
+        meta = mr
+        lod = bias = None
+        if blod in (2, 3, 6, 7):
+            v = self.Rf(meta)
+            meta += 1
+            if blod in (2, 6):
+                bias = v
+            else:
+                lod = v
+        elif blod == 1:
+            lod = '0.0'
+        off = None
+        if aoffi:
+            off = self.tex_offsets(kind, meta)
+            meta += 1
+        dref = None
+        if dc:
+            dref = self.Rf(meta)
+            meta += 1
+        e = self.sample(kind, 'h_', coords, lod=lod, bias=bias, dref=dref, offset=off)
+        self.emit('{ uint h_ = %s; %s v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), 'float' if dc else 'vec4', e))
+        self.indent += 1
+        self.store_mask(d, mask, 'v_', shadow=bool(dc))
+        self.indent -= 1
+        self.emit('}')
+
+    def op_TLD4(self, w, form, pc):
+        if form == 'B':
+            raise Unsupported('TLD4.B')
+        d, cr, mr = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8)
+        ttype, mask, dc, comp, ot = bits(w, 28, 3), bits(w, 31, 4), bits(w, 50, 1), bits(w, 56, 2), bits(w, 54, 2)
+        if bits(w, 51, 3) != PT or ot > 1:
+            raise Unsupported('TLD4 sparse/PTP')
+        kind, coords, _ = self.tex_coords(ttype, cr)
+        meta = mr
+        off = None
+        if ot == 1:
+            off = self.tex_offsets(kind, meta, 6, 8)
+            meta += 1
+        dref = None
+        if dc:
+            dref = self.Rf(meta)
+            meta += 1
+        e = self.sample(kind, 'h_', coords, dref=dref, offset=off, gather=comp)
+        self.emit('{ uint h_ = %s; vec4 v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), e))
+        self.indent += 1
+        self.store_mask(d, mask, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    def op_TLD4S(self, w, form, pc):
+        da, a, b, db = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8), bits(w, 28, 8)
+        dc, aoffi, comp, f16 = bits(w, 50, 1), bits(w, 51, 1), bits(w, 52, 2), bits(w, 55, 1)
+        # coordinates in Ra, Rb; with an offset or a reference in Ra, Ra+1 and those in Rb (Rb+1)
+        if aoffi or dc:
+            coords = 'vec2(%s, %s)' % (self.Rf(a), self.Rf(a + 1 if a != RZ else RZ))
+        else:
+            coords = 'vec2(%s, %s)' % (self.Rf(a), self.Rf(b))
+        off = dref = None
+        if aoffi:
+            off = 'ivec2(bitfieldExtract(int(%s), 0, 6), bitfieldExtract(int(%s), 8, 6))' % (self.R(b), self.R(b))
+            if dc:
+                dref = self.Rf(b + 1 if b != RZ else RZ)
+        elif dc:
+            dref = self.Rf(b)
+        e = self.sample('2D', 'h_', coords, dref=dref, offset=off, gather=comp)
+        self.emit('{ uint h_ = %s; vec4 v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), e))
+        self.indent += 1
+        if f16:
+            self.set_r(da, 'packHalf2x16(v_.xy)')
+            self.set_r(db, 'packHalf2x16(v_.zw)')
+        else:
+            for i, r in enumerate([da, da + 1, db, db + 1]):
+                if (i < 2 and da != RZ) or (i >= 2 and db != RZ):
+                    self.set_rf(r, 'v_[%d]' % i)
+        self.indent -= 1
+        self.emit('}')
+
+    def op_TMML(self, w, form, pc):
+        d, cr, mr = bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8)
+        ttype, mask = bits(w, 28, 3), bits(w, 31, 4)
+        kind, coords, _ = self.tex_coords(ttype, cr)
+        f = lambda i: self.Rf(cr + i if cr != RZ else RZ)
+        if kind == '2DARRAY':
+            coords = 'vec2(%s, %s)' % (f(1), f(2))
+        elif kind == 'CUBEARRAY':
+            coords = 'vec3(%s, %s, %s)' % (f(1), f(2), f(3))
+        elif kind == '1DARRAY':
+            coords = f(1)
+        if form == 'B':
+            h = self.R(mr)
+        else:
+            h = self.tex_handle(bits(w, 36, 13))
+        self.nonuniform = form == 'B'
+        e = self.sample(kind, 'h_', coords, query=True)
+        self.nonuniform = False
+        self.emit('{ uint h_ = %s; vec2 v_ = %s;' % (h, e))
+        self.indent += 1
+        r = d
+        for c in range(4):
+            if mask >> c & 1:
+                if c < 2:
+                    # 8.8 fixed point; textureQueryLod's .y is negative under magnification, and the game converts
+                    # the result as unsigned (I2F.U32), so it is taken as clamped at 0
+                    self.set_r(r, 'uint(max(v_[%d] * 256.0, 0.0))' % c)
+                else:
+                    self.set_r(r, '0u')
+                r += 1
+        self.indent -= 1
+        self.emit('}')
+
+    def op_TXQ(self, w, form, pc):
+        """texture size; the instruction has no texture type, so the texture is taken as 2D"""
+        d, sr, mode, mask = bits(w, 0, 8), bits(w, 8, 8), bits(w, 22, 3), bits(w, 31, 4)
+        if mode != 1:
+            raise Unsupported('TXQ mode %d' % mode)
+        if form == 'B':
+            h, lod = self.R(sr), self.R(sr + 1 if sr != RZ else RZ)
+            self.uses.add('txq_nu')     # a handle from a register: txq() indexes with nonuniformEXT
+        else:
+            h, lod = self.tex_handle(bits(w, 36, 13)), self.R(sr)
+        # each view type has its own array (runtime/gpu.c TB_*): every 2D image has a 2D array view, a 3D image only
+        # a 3D one; the 1x1 black texture where the entry has no view of that type
+        self.uses.update(('tex_t2da', 'tex_t3d', 'tex_ut2da', 'txq', 'rscale'))
+        self.emit('{ uint h_ = %s; uvec4 v_ = txq(h_, int(%s));' % (h, lod))
+        self.indent += 1
+        r = d
+        for c in range(4):
+            if mask >> c & 1:
+                self.set_r(r, 'v_[%d]' % c)
+                r += 1
+        self.indent -= 1
+        self.emit('}')
+
+    # --- storage images (NVN images: the handle, an image id in the texture pool, is read from c[2] at 0x120 + 8k)
+    SURF = {0: ('1D', 1), 2: ('1DARRAY', 1), 3: ('2D', 2), 4: ('2DARRAY', 2), 5: ('3D', 3)}
+
+    def surface(self, w, kind, store=False):
+        """image array element and integer coordinates; kind: 'f' formatted float, 'a' r32ui (atomics), 'ai' r32i"""
+        st = bits(w, 33, 3)
+        if st not in self.SURF:
+            raise Unsupported('surface type %d' % st)
+        dim, n = self.SURF[st]
+        if bits(w, 49, 2):
+            raise Unsupported('surface clamp %d' % bits(w, 49, 2))
+        c = bits(w, 8, 8)
+        r = lambda i: 'int(%s)' % self.R(c + i if c != RZ else RZ)
+        coords = [r(i) for i in range(n)]
+        if dim.endswith('ARRAY'):
+            coords.append('int(%s & 0xffffu)' % self.R(c + n if c != RZ else RZ))
+        coords = coords[0] if len(coords) == 1 else 'ivec%d(%s)' % (len(coords), ', '.join(coords))
+        bound = bits(w, 51, 1)
+        h = self.cbuf(2, bits(w, 36, 13) * 4) if bound else self.R(bits(w, 39, 8))
+        name = {'f': 'i', 'a': 'ua', 'ai': 'ia'}[kind] + dim.lower()
+        self.uses.add('img_' + name)
+        img = '%s[%s(%s & 0xffffu)]' % (name, '' if bound else 'nonuniformEXT', h)
+        if dim in ('2D', '2DARRAY'):
+            self.uses.add('rscale')
+            if store and self.stage != 'fragment':
+                return img, coords, (h, dim)    # surface_store fills the block
+            coords = '%s(%s, %s)' % ('rs_c2' if dim == '2D' else 'rs_c3', h, coords)
+        return img, coords, None
+
+    def surface_store(self, img, coords, block, fmt):
+        """a store or atomic (fmt: GLSL with {img} and {c}); into a scaled image outside fragment shaders, at every
+        texel of the coordinates' N x N block"""
+        if block is None:
+            self.emit(fmt.format(img=img, c=coords))
+            return
+        h, dim = block
+        c = 'ivec2(c_.xy * s_ + ivec2(x_, y_))' if dim == '2D' else 'ivec3(c_.xy * s_ + ivec2(x_, y_), c_.z)'
+        self.emit('{ int s_ = tsc(%s); %s c_ = %s;' % (h, 'ivec2' if dim == '2D' else 'ivec3', coords))
+        self.emit('  for (int y_ = 0; y_ < s_; y_++) for (int x_ = 0; x_ < s_; x_++) ' + fmt.format(img=img, c=c) + ' }')
+
+    def op_SUST(self, w, form, pc):
+        if bits(w, 52, 1):
+            raise Unsupported('SUST.D')
+        if bits(w, 20, 4) != 15:
+            raise Unsupported('SUST.P partial mask')
+        img, coords, block = self.surface(w, 'f', store=True)
+        d = bits(w, 0, 8)
+        v = ', '.join(self.Rf(d + i if d != RZ else RZ) for i in range(4))
+        self.surface_store(img, coords, block, 'imageStore({img}, {c}, vec4(%s));' % v)
+
+    def op_SULD(self, w, form, pc):
+        if bits(w, 52, 1):
+            raise Unsupported('SULD.D')
+        mask = bits(w, 20, 4)
+        img, coords, _ = self.surface(w, 'f')
+        self.emit('{ vec4 v_ = imageLoad(%s, %s);' % (img, coords))
+        self.indent += 1
+        self.store_mask(bits(w, 0, 8), mask, 'v_')
+        self.indent -= 1
+        self.emit('}')
+
+    ATOM = {0: 'imageAtomicAdd', 1: 'imageAtomicMin', 2: 'imageAtomicMax', 5: 'imageAtomicAnd', 6: 'imageAtomicOr',
+            7: 'imageAtomicXor'}
+
+    def op_SURED(self, w, form, pc):
+        """surface reduction (an atomic without a result): op at 24, size at 20 (U32, S32)"""
+        op, size = bits(w, 24, 3), bits(w, 20, 3)
+        if op not in self.ATOM or size > 1:
+            raise Unsupported('SURED op %d size %d' % (op, size))
+        img, coords, block = self.surface(w, 'ai' if size else 'a', store=True)
+        v = self.R(bits(w, 0, 8))
+        self.surface_store(img, coords, block, '%s({img}, {c}, %s);' % (self.ATOM[op], 'int(%s)' % v if size else v))
+
+    def op_VMNMX(self, w, form, pc):
+        """video min/max: the min or max of byte/half/word lanes of A and B, then MIN or MAX with C"""
+        op, sat = bits(w, 51, 3), bits(w, 55, 1)
+        if op not in (5, 6) or sat or bits(w, 47, 1):
+            raise Unsupported('VMNMX op %d sat %d' % (op, sat))
+        breg = bits(w, 50, 1)
+        sa, sb, sd = bits(w, 48, 1), bits(w, 49, 1), bits(w, 54, 1)
+
+        def lane(x, width, sel, signed):
+            if width == 3:
+                return 'int(%s)' % x if signed else x
+            n = 16 if width == 2 else 8
+            return 'bitfieldExtract(%s(%s), %d, %d)' % ('int' if signed else '', x, sel * n, n)
+        a = lane(self.R(bits(w, 8, 8)), bits(w, 37, 2), bits(w, 36, 2), sa)
+        if breg:
+            b = lane(self.R(bits(w, 20, 8)), bits(w, 29, 2), bits(w, 28, 2), sb)
+        else:
+            b = lane('%du' % bits(w, 20, 16), 2, 0, sb)
+        # the first min/max compares as B's signedness says, the second as the destination's
+        cast = (lambda x: 'int(%s)' % x) if sb else (lambda x: 'uint(%s)' % x)
+        first = '%s(%s, %s)' % ('max' if bits(w, 56, 1) else 'min', cast(a), cast(b))
+        cast = (lambda x: 'int(%s)' % x) if sd else (lambda x: 'uint(%s)' % x)
+        self.set_r(bits(w, 0, 8), 'uint(%s(%s, %s))' % ('max' if op == 6 else 'min', cast(first), cast(self.R(bits(w, 39, 8)))))
+
+    def op_VOTE(self, w, form, pc):
+        """Rd = the ballot of Ps over the active threads; Pd = ALL / ANY / EQ of it"""
+        mode = bits(w, 48, 2)
+        if mode > 2:
+            raise Unsupported('VOTE mode %d' % mode)
+        self.uses.update(('subgroup', 'ballot'))
+        self.emit('{ bool v_ = %s;' % self.P(bits(w, 39, 3), bits(w, 42, 1)))
+        self.indent += 1
+        self.set_r(bits(w, 0, 8), 'subgroupBallot(v_).x')
+        if bits(w, 45, 3) != PT:
+            self.uses.add('vote')
+            self.set_p(bits(w, 45, 3), {0: 'subgroupAll(v_)', 1: 'subgroupAny(v_)', 2: 'subgroupAllEqual(v_)'}[mode])
+        self.indent -= 1
+        self.emit('}')
+
+    def op_KIL(self, w, form, pc):
+        t = self.flow(bits(w, 0, 5))
+        if t == 'true':
+            self.emit('if (kill_ok()) discard;')
+        elif t != 'false':
+            self.emit('if (%s && kill_ok()) discard;' % t)
+
+    # ------------------------------------------------------------------ outputs
+    def xfb_layout(self):
+        """GLSLC's transform feedback layout: per buffer b a stride (u16 at 0x6dc + 2b) and up to 32 varyings as
+        arrays at 0xdc (output slot + 0x20), 0x2dc (first component) and 0x4dc (component count), 0x80 bytes per
+        buffer. Returns [(buffer, stride, [(slot, first, count, offset)])], the varyings packed in order."""
+        if self.stage != 'vertex' or len(self.sh.control) < 0x6e4:
+            return []
+        c = self.sh.control
+        layout = []
+        for b in range(4):
+            stride = struct.unpack_from('<H', c, 0x6dc + 2 * b)[0]
+            vs, off = [], 0
+            for i in range(32):
+                a, first, n = (struct.unpack_from('<I', c, base + 0x80 * b + 4 * i)[0] for base in (0xdc, 0x2dc, 0x4dc))
+                if not n:
+                    break
+                if not 0x20 <= a < 0x40 or first + n > 4:
+                    raise Unsupported('transform feedback varying %#x components %d+%d' % (a, first, n))
+                vs.append((a - 0x20, first, n, off))
+                off += 4 * n
+            if vs:
+                if off > stride:
+                    raise Unsupported('transform feedback buffer %d: %d bytes in a stride of %d' % (b, off, stride))
+                layout.append((b, stride, vs))
+        return layout
+
+    def exit_outputs(self):
+        if self.stage == 'vertex':
+            # transform feedback: the captured components, copied into outputs that carry the buffer layout
+            for b, stride, vs in self.xfb:
+                for i, (slot, first, n, off) in enumerate(vs):
+                    self.out_attrs.add(slot)
+                    self.emit('xfb%d_%d = out_a%d.%s;' % (b, i, slot, 'xyzw'[first:first + n]))
+            return
+        if self.stage != 'fragment':
+            return
+        if self.omap_target & 0xf:
+            # NVN's alpha test (nvnColorStateSetAlphaTest + SetAlphaRef) on target 0, from push constants
+            self.emit('if (!alpha_ok(%s) && kill_ok()) discard;' % (self.Rf(3) if self.omap_target & 8 else '1.0'))
+        r = 0
+        for rt in range(8):
+            m = self.omap_target >> (4 * rt) & 0xf
+            if not m:
+                continue
+            for c in range(4):
+                if m >> c & 1:
+                    self.emit('out_c%d[%d] = %s;' % (rt, c, self.Rf(r)))
+                r += 1
+        if self.omap_flags & 1:
+            self.emit('gl_SampleMask[0] = int(%s);' % self.R(r))
+        if self.omap_flags & 2:
+            self.uses.add('fragdepth')
+            self.emit('gl_FragDepth = %s;' % self.Rf(r + 1))
+
+    # ------------------------------------------------------------------ control flow
+    @staticmethod
+    def branch_target(pc, w):
+        t = pc + sext(bits(w, 20, 24), 24) + 8
+        return t + 8 if t % 32 == 0 else t      # a scheduling word: the group's first instruction
+
+    def jump_table(self, ins, i):
+        """BRX targets as computed (pcs; one on a scheduling word means the next instruction). GLSLC's switch: Ry = IMNMX(x, N); Rx = SHL Ry, 2; Ra = LDC c[1][Rx + base];
+        BRX Ra + imm, with the table in the shader's embedded constants (c[1])"""
+        pc, w = ins[i]
+        ra = bits(w, 8, 8)
+
+        def find(reg, before, ops):
+            for j in range(before - 1, max(-1, before - 24), -1):
+                o = opcode(ins[j][1])
+                if o in ('BRA', 'BRX', 'EXIT', 'SYNC', 'BRK'):
+                    return None, None
+                if bits(ins[j][1], 0, 8) == reg and o not in ('ST', 'STG', 'STL', 'STS', 'AST', 'RED', 'SUST', 'SURED'):
+                    return (j, ins[j][1]) if o in ops else (None, None)
+            return None, None
+        j, ldc = find(ra, i, ('LDC',))
+        if ldc is None or bits(ldc, 36, 5) != 1 or bits(ldc, 44, 2) or bits(ldc, 48, 3) != 4:
+            raise Unsupported('BRX without a jump table')
+        base = sext(bits(ldc, 20, 16), 16)
+        j, shl = find(bits(ldc, 8, 8), j, ('SHL_I',))
+        if shl is None or bits(shl, 20, 19) != 2:
+            raise Unsupported('BRX index not scaled by 4')
+        j, mn = find(bits(shl, 8, 8), j, ('IMNMX_I',))
+        if mn is None or bits(mn, 39, 3) != PT or bits(mn, 42, 1):
+            raise Unsupported('BRX index without a bound')
+        count = sext(bits(mn, 20, 19) | bits(mn, 56, 1) << 19, 20) + 1
+        if count <= 0 or base < 0 or base + 4 * count > len(self.sh.consts):
+            raise Unsupported('BRX table outside the constants')
+        return [(struct.unpack_from('<I', self.sh.consts, base + 4 * k)[0] + pc + 8 + sext(bits(w, 20, 24), 24))
+                & 0xffffffff for k in range(count)]
+
+    def translate(self):
+        ins = list(self.sh.instructions())
+        n = len(ins)
+        idx_of = {pc: i for i, (pc, w) in enumerate(ins)}
+        # the end (the trailing `BRA self` / zero padding is cut off)
+        end = n
+        for i, (pc, w) in enumerate(ins):
+            if opcode(w) == 'BRA':
+                t = self.branch_target(pc, w)
+                if pc - 8 <= t <= pc and bits(w, 16, 4) == PT:     # `BRA self`
+                    end = min(end, i)
+                    break
+
+        def index(t):
+            if t not in idx_of or idx_of[t] >= end:
+                raise Unsupported('branch target %#x outside the code' % t)
+            return idx_of[t]
+        leaders = {0}
+        targets = {}            # instruction index -> target index (BRA, SSY, PBK) or list (BRX)
+        for i in range(end):
+            pc, w = ins[i]
+            o = opcode(w)
+            if o in ('BRA', 'SSY', 'PBK'):
+                targets[i] = index(self.branch_target(pc, w))
+                leaders.add(targets[i])
+                if o == 'BRA':
+                    leaders.add(i + 1)
+            elif o == 'BRX':
+                targets[i] = [index(t + 8 if t % 32 == 0 else t) for t in self.jump_table(ins, i)]
+                leaders.update(targets[i])
+                leaders.add(i + 1)
+            elif o in ('EXIT', 'SYNC', 'BRK'):
+                leaders.add(i + 1)
+            elif o in ('CONT', 'PCNT', 'CAL', 'RET', 'JMP', 'JMX'):
+                raise Unsupported(o)
+        leaders = sorted(l for l in leaders if l < end)
+        blocks = [(leaders[k], leaders[k + 1] if k + 1 < len(leaders) else end) for k in range(len(leaders))]
+        bid = {s: k for k, (s, e) in enumerate(blocks)}
+
+        # each block's terminator and its successors as functions of the CRS stack at its entry. The stack holds
+        # ('S', block) for SSY and ('B', block) for PBK; it is resolved statically (the same on every path into a
+        # block, or reconverging, where the shorter one is kept)
+        def cond_of(w, o):
+            cond = self.P(bits(w, 16, 3), bits(w, 19, 1))
+            if bits(w, 0, 5) != 15:
+                t = self.flow(bits(w, 0, 5))
+                if t != 'true':
+                    cond = t if cond == 'true' else '(%s && %s)' % (cond, t)
+            return cond
+        info = []
+        for k, (s, e) in enumerate(blocks):
+            pushes, term = [], None
+            for i in range(s, e):
+                pc, w = ins[i]
+                o = opcode(w)
+                if self.P(bits(w, 16, 3), bits(w, 19, 1)) == 'false':
+                    continue
+                if o in ('SSY', 'PBK'):         # their predicate field is not a condition
+                    pushes.append(('S' if o == 'SSY' else 'B', bid[targets[i]]))
+                elif o in ('BRA', 'SYNC', 'EXIT', 'BRK', 'BRX'):
+                    term = (o, cond_of(w, o), i)
+                    break
+            info.append((pushes, term))
+
+        def successors(k, entry):
+            """[(block, condition, stack)] in emission order"""
+            pushes, term = info[k]
+            st = tuple(entry) + tuple(pushes)
+            nxt = k + 1 if blocks[k][1] < end else None
+            if term is None:
+                return [(nxt, 'true', st)] if nxt is not None else []
+            o, cond, i = term
+            out = []
+            if o == 'BRA':
+                out.append((bid[targets[i]], cond, st))
+            elif o == 'BRX':
+                if cond != 'true':
+                    raise Unsupported('conditional BRX')
+                out += [(bid[t], None, st) for t in targets[i]]
+            elif o == 'SYNC':
+                if not st or st[-1][0] != 'S':
+                    raise Unsupported('SYNC without SSY')
+                out.append((st[-1][1], cond, st[:-1]))
+            elif o == 'BRK':
+                p = max((j for j, x in enumerate(st) if x[0] == 'B'), default=None)
+                if p is None:
+                    raise Unsupported('BRK without PBK')
+                out.append((st[p][1], cond, st[:p]))
+            if cond != 'true' and nxt is not None:
+                out.append((nxt, '!(%s)' % cond if o != 'EXIT' else 'true', st))
+            return out
+        stacks = {0: ()}
+        work = [0]
+        while work:
+            k = work.pop()
+            for t, c, st in successors(k, stacks[k]):
+                if t not in stacks or (stacks[t] != st and len(st) < len(stacks[t])):
+                    stacks[t] = st
+                    work.append(t)
+        loop = any(t <= k for k in stacks for t, c, st in successors(k, stacks[k]))
+
+        reach_needed = set()
+        body = []
+        self.lines = body
+        if loop:
+            # a back edge: run the blocks in address order again until no back edge was taken (one invocation
+            # follows one path, so exactly one block is pending at a time)
+            self.emit('bool again_ = true;')
+            self.emit('while (again_) {')
+            self.indent += 1
+            self.emit('again_ = false;')
+        for k, (s, e) in enumerate(blocks):
+            if k not in stacks:
+                continue            # unreachable
+            if k or loop:
+                self.emit('if (b%d) {' % k)
+                reach_needed.add(k)
+                self.indent += 1
+                if loop:
+                    self.emit('b%d = false;' % k)
+            pushes, term = info[k]
+            for i in range(s, term[2] if term else e):
+                pc, w = ins[i]
+                o = opcode(w)
+                cond = self.P(bits(w, 16, 3), bits(w, 19, 1))
+                if cond == 'false' or o in ('SSY', 'PBK'):
+                    continue
+                if cond != 'true':
+                    self.emit('if (%s) {' % cond)
+                    self.indent += 1
+                self.insn(pc, w)
+                if cond != 'true':
+                    self.indent -= 1
+                    self.emit('}')
+            if term and term[0] == 'EXIT':
+                cond = term[1]
+                if cond != 'true':
+                    self.emit('if (%s) {' % cond)
+                    self.indent += 1
+                self.exit_outputs()
+                self.emit('return;')
+                if cond != 'true':
+                    self.indent -= 1
+                    self.emit('}')
+            succ = successors(k, stacks[k])
+            if term and term[0] == 'BRX':
+                pc, w = ins[term[2]]
+                imm = (pc + 8 + sext(bits(w, 20, 24), 24)) & 0xffffffff
+                self.emit('{ uint t_ = %s + %du;' % (self.R(bits(w, 8, 8)), imm))
+                self.indent += 1
+                for (t, c, st), raw in zip(succ, self.jump_table(ins, term[2])):
+                    self.emit('if (t_ == %du) %s' % (raw, ('{ b%d = true; again_ = true; }' if t <= k else 'b%d = true;') % t))
+                self.indent -= 1
+                self.emit('}')
+            else:
+                for t, c, st in succ:
+                    set_ = ('{ b%d = true; again_ = true; }' if t <= k else 'b%d = true;') % t
+                    self.emit(set_ if c == 'true' else 'if (%s) %s' % (c, set_))
+            if k or loop:
+                self.indent -= 1
+                self.emit('}')
+        if loop:
+            self.indent -= 1
+            self.emit('}')
+        self.exit_outputs()
+        return body, sorted(reach_needed), loop
+
+    # ------------------------------------------------------------------ the whole shader
+    def generate(self):
+        body, flags, loop = self.translate()
+        out = ['#version 460',
+               '#extension GL_EXT_nonuniform_qualifier : require',
+               '#extension GL_EXT_samplerless_texture_functions : require']
+        if 'global' in self.uses:
+            out += ['#extension GL_EXT_buffer_reference : require',
+                    '#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require']
+        if any(u.startswith('img_i') and not u.startswith('img_ia') for u in self.uses):
+            out.append('#extension GL_EXT_shader_image_load_formatted : require')
+        for u, ext in (('subgroup', 'basic'), ('quad', 'quad'), ('shuffle', 'shuffle'), ('ballot', 'ballot'),
+                       ('vote', 'vote')):
+            if u in self.uses:
+                out.append('#extension GL_KHR_shader_subgroup_%s : require' % ext)
+        if 'layer' in self.uses:
+            out.append('#extension GL_ARB_shader_viewport_layer_array : require')
+        # float behaviour as the console's: .FTZ is on nearly every float instruction, so denormals flush in the whole
+        # shader; NaN and infinities must be kept, else the driver may assume there are none and fold isnan away
+        # (runtime/vk.c logs whether the device supports both: Vulkan 1.2 float controls)
+        out += ['#extension GL_EXT_spirv_intrinsics : require',
+                'spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4465], 4460, 32);',
+                'spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32);']
+        out.append('// translated from Maxwell shader %s (%s)' % (os.path.basename(self.sh.path), self.stage))
+        if self.stage == 'compute':
+            lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
+            out.append('layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;' % (lx, ly, lz))
+        out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }',
+                # .SAT gives 0 for NaN; FMNMX returns the operand that is not NaN
+                'float sat(float x) { return x > 0.0 ? min(x, 1.0) : 0.0; }',
+                'vec2 sat(vec2 x) { return vec2(sat(x.x), sat(x.y)); }',
+                'float nmin(float a, float b) { return isnan(a) ? b : isnan(b) ? a : min(a, b); }',
+                'float nmax(float a, float b) { return isnan(a) ? b : isnan(b) ? a : max(a, b); }']
+        if 'rz' in self.uses:
+            # round toward zero: the product rounded to nearest, stepped one ulp toward 0 when the exact product
+            # (its error from fma) is smaller in magnitude; an overflow gives the largest finite value. Integers
+            # to float keep their top 24 significant bits
+            out += ['float fmul_rz(float a, float b) {',
+                    '    precise float p = a * b;',
+                    '    precise float e = fma(a, b, -p);',
+                    '    if (isinf(p) && !isinf(a) && !isinf(b)) return uintBitsToFloat(floatBitsToUint(p) - 1u);',
+                    '    if (p != 0.0 && !isinf(p) && e != 0.0 && (e < 0.0) != (p < 0.0))',
+                    '        return uintBitsToFloat(floatBitsToUint(p) - 1u);',
+                    '    return p;',
+                    '}',
+                    'uint trunc24(uint v) { int m = findMSB(v); return m > 23 ? v & ~((1u << uint(m - 23)) - 1u) : v; }',
+                    'float i2f_rz(uint v) { return float(trunc24(v)); }',
+                    'float i2f_rz(int v) { float f = float(trunc24(uint(abs(v)))); return v < 0 ? -f : f; }']
+        if 'smem' in self.uses:
+            words = (struct.unpack_from('<I', self.sh.control, 0x754)[0] + 3) // 4
+            out += ['shared uint smem[%d];' % words,
+                    'uint smem_ld(uint i) { return i < %du ? smem[i] : 0u; }' % words,
+                    'void smem_st(uint i, uint v) { if (i < %du) smem[i] = v; }' % words]
+        if self.stage == 'vertex' and self.in_attrs:
+            # Vertex inputs are float; Maxwell hands 8/16-bit integer attributes over as integers. The runtime fetches
+            # those as USCALED / SSCALED (the same values as floats) and says which they are in INT_ATTRS (2 bits per
+            # location: 1 unsigned, 2 signed), a specialization constant: one SPIR-V for every vertex format
+            out += ['layout(constant_id = 1) const uint INT_ATTRS = 0u;',
+                    'uint ia(float v, uint k) {',
+                    '    uint m = (INT_ATTRS >> (2u * k)) & 3u;',
+                    '    return m == 0u ? floatBitsToUint(v) : m == 1u ? uint(v) : uint(int(v));',
+                    '}']
+        if 'fmz' in self.uses:
+            out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
+                    'float ffmz(float a, float b, float c) { return (a == 0.0 || b == 0.0) ? c : fma(a, b, c); }']
+        if self.stage in ('vertex', 'fragment', 'compute') or 'rscale' in self.uses:
+            out.append(PC_DECL)
+        if 'rscale' in self.uses:
+            frag = self.stage == 'fragment'
+            out += ['int tsc(uint h) { return ((h >> 18) & 1u) != 0u ? max(int(pc.scale & 0xffu), 1) : 1; }',
+                    'float rs_rt() { return float(max((pc.scale >> 8) & 0xffu, 1u)); }',
+                    ('ivec2 rs_sub() { int r = int((pc.scale >> 8) & 0xffu); '
+                     'return r > 1 ? ivec2(gl_FragCoord.xy) % r : ivec2(0); }') if frag else
+                    'ivec2 rs_sub() { return ivec2(0); }',
+                    'ivec2 rs_c2(uint h, ivec2 c) { int s = tsc(h); return s == 1 ? c : c * s + rs_sub(); }',
+                    'ivec3 rs_c3(uint h, ivec3 c) { int s = tsc(h); return s == 1 ? c : ivec3(c.xy * s + rs_sub(), c.z); }']
+        base = STAGE_BASE[self.stage]
+        # 16 push descriptor slots per stage (32 in all, the usual maxPushDescriptors) for c[0..16]: c[i] in slot i,
+        # and c[16] in a slot this shader leaves free; the runtime reads the slots back from the cbN bindings
+        slot = {i: i for i in self.cbufs if i < 16}
+        for i in sorted(i for i in self.cbufs if i >= 16):
+            free = [s for s in range(3, 16) if s not in slot.values()]
+            if not free:
+                raise Unsupported('c[%d] and every other constant buffer' % i)
+            slot[i] = free[0]
+        for i in sorted(self.cbufs):
+            out.append('layout(set = 0, binding = %d, std140) uniform CB%d { uvec4 d[4096]; } cb%d;' % (base + slot[i], i, i))
+            if 'cbdyn%d' % i in self.uses:
+                out.append('uint cbr%d(uint a) { return a < 65536u ? cb%d.d[a >> 4][(a >> 2) & 3u] : 0u; }' % (i, i))
+        if any(u.startswith('tex_') for u in self.uses):
+            decl = {'t1d': 'texture1D', 't2d': 'texture2D', 't3d': 'texture3D', 'tcube': 'textureCube',
+                    't2da': 'texture2DArray', 'tcubea': 'textureCubeArray', 't1da': 'texture1DArray',
+                    'ut2d': 'utexture2D', 'ut2da': 'utexture2DArray'}
+            for name, typ in decl.items():
+                if 'tex_' + name in self.uses:
+                    out.append('layout(set = 1, binding = %d) uniform %s %s[];' % (TEX_BINDING[name], typ, name))
+            out.append('layout(set = 2, binding = 0) uniform sampler smp[];')
+            if 'txq' in self.uses:
+                # size, layers or depth, levels: as a 2D array, else (only the black texture there) as 3D; integer
+                # textures (INT_FLAG) have their views only in ut2da (t2da holds the black texture)
+                nu = 'nonuniformEXT' if 'txq_nu' in self.uses else ''
+                out += [l.replace('nonuniformEXT', nu) for l in ['uvec4 txq(uint h, int lod) {',
+                        '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
+                        '    if (%s) {' % (INT_FLAG % 'h'),
+                        '        ivec3 u = textureSize(ut2da[nonuniformEXT(t)], lod);',
+                        '        u.xy /= tsc(h);',
+                        '        return uvec4(uvec3(u), uint(textureQueryLevels(usampler2DArray(ut2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]))));',
+                        '    }',
+                        '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
+                        '    int l = textureQueryLevels(sampler2DArray(t2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]));',
+                        '    if (z.xy == ivec2(1)) {',
+                        '        ivec3 d = textureSize(t3d[nonuniformEXT(t)], lod);',
+                        '        if (d != ivec3(1)) { z = d; l = textureQueryLevels(sampler3D(t3d[nonuniformEXT(t)], smp[nonuniformEXT(s)])); }',
+                        '    }',
+                        '    z.xy /= tsc(h);',
+                        '    return uvec4(uvec3(z), uint(l));',
+                        '}']]
+        # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)
+        idecl = {'1d': 'image1D', '1darray': 'image1DArray', '2d': 'image2D', '2darray': 'image2DArray', '3d': 'image3D'}
+        for dim, typ in idecl.items():
+            for pre, fmt, t in (('i', '', typ), ('ua', ', r32ui', 'u' + typ), ('ia', ', r32i', 'i' + typ)):
+                if 'img_' + pre + dim in self.uses:
+                    out.append('layout(set = 3, binding = 0%s) uniform %s %s%s[];' % (fmt, t, pre, dim))
+        if 'global' in self.uses:
+            out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMem { uint v; };')
+            if 'global_i' in self.uses:
+                out.append('layout(buffer_reference, std430, buffer_reference_align = 4) buffer GMemI { int v; };')
+        if self.stage == 'vertex':
+            for k in sorted(self.in_attrs):
+                out.append('layout(location = %d) in vec4 in_a%d;' % (k, k))
+            for k in sorted(self.out_attrs):
+                out.append('layout(location = %d) out vec4 out_a%d;' % (k, k))
+            loc = 31        # capture outputs take the locations from the top, which the game's varyings leave free
+            for b, stride, vs in self.xfb:
+                for i, (slot, first, n, off) in enumerate(vs):
+                    if loc in self.out_attrs:
+                        raise Unsupported('transform feedback output location %d is taken' % loc)
+                    out.append('layout(location = %d, xfb_buffer = %d, xfb_offset = %d, xfb_stride = %d) out %s xfb%d_%d;'
+                               % (loc, b, off, stride, 'float' if n == 1 else 'vec%d' % n, b, i))
+                    loc -= 1
+            if 'clip' in self.uses:
+                out.append('out float gl_ClipDistance[8];')
+        if self.stage == 'fragment':
+            for k in sorted(self.in_attrs):
+                q = self.in_attrs[k]
+                out.append('layout(location = %d) %sin vec4 in_a%d;' % (k, '' if q == 'smooth' else q + ' ', k))
+            for rt in range(8):
+                if self.omap_target >> (4 * rt) & 0xf:
+                    out.append('layout(location = %d) out vec4 out_c%d;' % (rt, rt))
+        if self.stage == 'fragment':
+            # debug: bit 0 of pc.debug (NX_NO_DISCARD) turns every discard off. The alpha test's function is a
+            # specialization constant (the pipeline's), so without one the driver drops its discard: early depth
+            out += ['layout(constant_id = 0) const uint ALPHA_FUNC = 0u;',
+                    'bool kill_ok() { return (pc.debug & 1u) == 0u; }',
+                    'bool alpha_ok(float a) {',
+                    '    switch (ALPHA_FUNC) {',
+                    '    case 1u: return false;',
+                    '    case 2u: return a < pc.alpha_ref;',
+                    '    case 3u: return a == pc.alpha_ref;',
+                    '    case 4u: return a <= pc.alpha_ref;',
+                    '    case 5u: return a > pc.alpha_ref;',
+                    '    case 6u: return a != pc.alpha_ref;',
+                    '    case 7u: return a >= pc.alpha_ref;',
+                    '    default: return true;',
+                    '    }',
+                    '}']
+        if 'lmem' in self.uses:
+            words = max(16, (self.sh.local_memory_size() + 3) // 4)
+            p2 = 1
+            while p2 < words:
+                p2 <<= 1
+            out.append('#define LMEM_MASK %du' % (p2 - 1))
+            out.append('uint lmem[%d];' % p2)
+        out.append('void main() {')
+        regs = sorted(self.regs)
+        for i in range(0, len(regs), 16):
+            out.append('    uint ' + ', '.join('r%d = 0u' % r for r in regs[i:i + 16]) + ';')
+        out.append('    bool p0 = false, p1 = false, p2 = false, p3 = false, p4 = false, p5 = false, p6 = false;')
+        if 'cc' in self.uses:
+            out.append('    bool cc_z = false, cc_s = false, cc_c = false, cc_o = false;')
+        for i in range(0, len(flags), 16):
+            out.append('    bool ' + ', '.join('b%d = %s' % (f, 'true' if f == 0 else 'false') for f in flags[i:i + 16]) + ';')
+        if self.stage == 'vertex':
+            out.append('    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);')
+            # components the shader leaves unwritten read as the hardware's default (0, 0, 0, 1), as for the
+            # position (the sky divides by a varying's w that only the default sets)
+            for k in sorted(self.out_attrs):
+                out.append('    out_a%d = vec4(0.0, 0.0, 0.0, 1.0);' % k)
+            out.append('    gl_PointSize = pc.point_size;')     # NVN's point size, unless the shader writes one
+        out += body
+        out.append('}')
+        return '\n'.join(out) + '\n'
+
+
+def translator_version():
+    """FNV-1a of this file: SPIR-V goes in spv/<version>, so a translator change never leaves stale translations
+    (runtime/gpu.c spv_path computes the same)"""
+    h = 2166136261
+    with open(__file__, 'rb') as f:
+        for b in f.read():
+            h = ((h ^ b) * 16777619) & 0xffffffff
+    return '%08x' % h
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    check = '--check' in sys.argv
+    spv = '--spv' in sys.argv
+    only = set()
+    for a in sys.argv[1:]:
+        if a.startswith('--only='):
+            v = a[7:]
+            if v.startswith('@'):       # --only=@file: hashes listed in a file (a command line holds ~2,000)
+                with open(v[1:]) as f:
+                    v = f.read().replace('\n', ',')
+            only |= {h.strip() for h in v.split(',') if h.strip()}
+    only = {e.split(':')[0] for e in only}      # <hash>:<mask> (integer-input variants) from older runtimes
+    here = os.path.dirname(os.path.abspath(__file__))
+    if args:
+        src = args[0]
+    else:
+        sys.path.insert(0, os.path.join(here, '..'))
+        import gamecfg
+        src = os.path.join(gamecfg.BUILD, 'shaders')
+    dst = args[1] if len(args) > 1 else os.path.join(src, 'glsl')
+    os.makedirs(dst, exist_ok=True)
+    ok, failed = 0, {}
+    outputs = []
+    for name in sorted(os.listdir(src)):
+        if not name.endswith('.bin') or only and name[:-4] not in only:
+            continue
+        sh = Shader(os.path.join(src, name))
+        h = name[:-4]
+        try:
+            text = Translator(sh).generate()
+        except Unsupported as e:
+            failed.setdefault(str(e), []).append(h)
+            continue
+        path = os.path.join(dst, '%s.%s' % (h, STAGE_EXT[sh.stage]))
+        with open(path, 'w', newline='\n') as f:
+            f.write(text)
+        outputs.append(path)
+        ok += 1
+    print('%d translated, %d not' % (ok, sum(len(v) for v in failed.values())))
+    for why, hs in sorted(failed.items(), key=lambda kv: -len(kv[1])):
+        print('  %4d  %s  (e.g. %s)' % (len(hs), why, hs[0]))
+    if check or spv:
+        from concurrent.futures import ThreadPoolExecutor
+        glslang = os.path.join(here, '../../../deps/glslang/bin/glslang.exe')
+        if not os.path.exists(glslang) and os.environ.get('VULKAN_SDK'):    # the Vulkan SDK's copy
+            glslang = os.path.join(os.environ['VULKAN_SDK'], 'Bin', 'glslangValidator.exe')
+        spvdir = os.path.join(src, 'spv', translator_version())
+        os.makedirs(spvdir, exist_ok=True)
+
+        def compile_one(p):
+            h = os.path.basename(p).split('.')[0]
+            outp = os.path.join(spvdir, h + '.spv') if spv else os.devnull
+            r = subprocess.run([glslang, '-V', '--target-env', 'vulkan1.3', '-o', outp, p],
+                               capture_output=True, text=True)
+            return p, r.returncode, r.stdout
+        bad = 0
+        with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+            for p, rc, out in ex.map(compile_one, outputs):
+                if rc:
+                    bad += 1
+                    if bad <= 5:
+                        print(p, out[-1500:])
+        print('glslang: %d of %d failed' % (bad, len(outputs)))
+
+
+if __name__ == '__main__':
+    main()
