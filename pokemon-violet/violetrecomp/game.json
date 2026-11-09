@@ -1,0 +1,14 @@
+{
+  "name": "violetrecomp",
+  "title": "Pokemon Violet",
+  "title_id": "01008F6008C5E000",
+  "version": "4.0.0",
+  "multiplayer": "Union Circle, Tera raids",
+  "modules": [["main", "0x7100000000"], ["subsdk0", "0x7104800000"], ["sdk", "0x7105000000"]],
+  "dump": "../dump",
+  "analysis": "../build/analysis",
+  "build": "../build",
+  "dlc": [1],
+  "framerate": 60,
+  "theme": {"background": "#17121f", "panel": "#261c36", "accent": "#8b5cf6", "accent2": "#f5c542", "text": "#f3eefc", "rounding": 7}
+}

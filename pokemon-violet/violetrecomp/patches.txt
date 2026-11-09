@@ -1,0 +1,33 @@
+# Instruction patches for the lifter (format: nxrecomp/tools/lifter/a64lift.py, load_patches), main 4.0.0
+# (build id 709BFD66...). Re-lift main after changing this file.
+#
+# Frame rates other than 30 (fps.c). The game steps by a frame duration from a table (main+3c2fbb0, 33.3 ms) and
+# derives its speed from the same entry; fps.c writes the entry each frame and keeps the speed's divisor at 30 fps,
+# so that one frame moves the game by (frame time / 33.3 ms) of a 30 fps step. Found with Fl4sh's Violet 4.0.0
+# 60 FPS and Dynamic FPS patches (gamebanana) as a map; the hooks are ours.
+main+d9643c  was f8747908  call fps_speed_base           # ldr x8, [x8, x20, lsl #3]: the speed's divisor
+main+b92784  was f9400501  call fps_timer_step           # ldr x1, [x8, #8]: 33.3 ms outside scene kind 2
+main+2936584 was 1a9f3288  after fps_scene_kind          # csel w8, w20, wzr, lo: the scene kind
+main+170c408 was 52a7f00a  if fps 52a84e0a               # mov w10, #1.0 -> #60.0 (both patches; purpose not known yet)
+main+20a8d3c was 72a8e868  if fps 72a8f868               # 50000.0 -> 100000.0 (both patches; purpose not known yet)
+main+2b7c540 was 1a893100  if fps 52800000               # distance LOD of animation updates -> 0: full rate
+main+20397d0 was 1e220101 call fps_effect_frames      # scvtf s1, w8: the effect manager's whole 60 Hz frames
+#
+# Graphics quality (gfx.c, always on): Fl4sh's Violet 4.0.0 "Improved Graphic Quality" and "2K Shadows" pchtxt mods.
+main+c07dc4  was bd401e60  if gfx 1e3e1000               # ldr s0, [x19, #0x1c] -> fmov s0, #-1.0 (quality value)
+main+7f1a6c  was bd401280  if gfx 1e3e1000               # ldr s0, [x20, #0x10] -> fmov s0, #-1.0 (quality value)
+main+c4d864  was f9001be9  if nodof f9001bff              # str x9, [sp, #0x30] -> str xzr: no depth-of-field blur
+main+146e80c was 52808008  if shadow 52810008              # mov w8, #0x400 -> #0x800: 2048x2048 shadow maps
+#
+# Mods' host->run_script (lua.c): chunks run at lua_pcallk's entry, where x0 is the caller's lua_State.
+main+b5ddd0 was d10103ff after lua_pcall_entry      # sub sp, sp, #0x40: lua_pcallk's first instruction
+#
+# Wild spawns made to order (wild.c, the raids mod's F8): the param constructor's entry (spec in x1) and end (x19).
+main+debf88  was aa0003f3 after wild_create          # mov x19, x0
+main+debff8  was aa1303e0 after wild_created         # mov x0, x19
+#
+# Dev toggle "wild Pokemon don't start battles" (wild.c, the raids mod's F8): the AI's set-encounter-enabled call.
+main+1d0e5e4 was 2a0103f3 after encount_enable       # mov w19, w1: the enable bit
+#
+# Tera raid crystals rebuilt on demand (raidgem.c, the raids mod's F6): the crystal manager's per-frame update.
+main+2933398 was aa0003f3 after raidgem_update       # mov x19, x0: the manager
