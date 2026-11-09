@@ -26,7 +26,7 @@ static bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 static struct {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers, async_shaders, refresh_wait;
+        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -991,6 +991,8 @@ static void img_copy(Image *s, u32 sl, u32 slayer, Image *d, u32 dl, u32 dlayer,
                    smooth(s->format));
 }
 
+static void image_upload(Image *im);
+
 /* the image holding texture t, and where in it t starts */
 static Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
     *layer = *level = 0;
@@ -1009,13 +1011,18 @@ static Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
     }
     Image *im = image_get(t);
     if (!im) return NULL;
-    /* a new container takes over the parts of it that exist as images of their own */
+    /* A new container takes over the parts of it that exist as images of their own. Its own guest memory is uploaded
+     * first, and only the parts the GPU wrote (which guest memory does not hold) are copied in over it. It used to
+     * copy every valid part and then count as valid: the layers / levels that were no image of their own stayed
+     * zero until the CPU happened to write those pages again, which a cache written once never does (a glyph atlas:
+     * letters blank wherever they appear; the reference port's notes describe the same symptom) */
     bool took = false;
     for (int j = byaddr_lower(im->info.addr); j < nbyaddr && byaddr[j]->info.addr < im->info.addr + im->size;) {
         Image *o = byaddr[j];
         u32 ly, lv;
         if (o == im || !sub_of(im, &o->info, &ly, &lv)) { j++; continue; }
-        if (o->valid) {
+        if (o->valid && !im->valid) image_upload(im);
+        if (o->valid && o->gpu_written) {
             end_rendering();
             if (!took) barrier();
             for (u32 l = 0; l < o->levels && lv + l < im->levels; l++) {
@@ -1065,6 +1072,13 @@ static Image *image_get(const TexInfo *t) {
     Image *im = image_create(&big, h);
     rs_hint = hint;
     if (!im) { old->next = buckets[h]; buckets[h] = old; return old; }
+    /* not written by the GPU: guest memory holds every level, so the new image is uploaded whole at its first use
+     * (copying the old levels left the new ones blank, for good unless the CPU wrote them again) */
+    if (!old->gpu_written) {
+        im->rt_frame = old->rt_frame;
+        image_destroy(old);
+        return im;
+    }
     end_rendering();
     for (u32 l = 0; l < old->levels; l++) {
         u32 w = old->info.width >> l ? old->info.width >> l : 1, hh = tex_height(&old->info) >> l ? tex_height(&old->info) >> l : 1;
@@ -1560,6 +1574,7 @@ typedef struct State {
 
 static State st;                        /* the GPU's state carries over between command buffers, as on NVN */
 static u64 draws, draws_skipped, dispatches;
+static u64 rt_kept;                     /* render-target sets that kept the pass (the same targets; NX_SAME_RT) */
 
 static void state_reset(State *s) {
     memset(s, 0, sizeof *s);
@@ -1866,6 +1881,8 @@ static void do_copy_buffer_to_texture(const CmdCopyBT *p) {
     u64 off;
     if (!im || !gpu_buffer(p->buffer, &buf, &off) || p->r.w <= 0) return;
     if (format_is_astc(p->tex.t.format)) return;
+    image_upload(im);                   /* the rest of the texture: its guest memory first (else zeros, for good once
+                                         * it counts as GPU-written below; a glyph atlas filled a region at a time) */
     end_rendering();
     VkBufferImageCopy r = bt_region(p, im, off);
     if (im->scale > 1) {                /* into a 1x copy of the region, blitted up */
@@ -3247,6 +3264,18 @@ typedef struct Pipe {
 } Pipe;
 #define PIPE_BUCKETS 1024
 static Pipe *pipes[PIPE_BUCKETS];       /* under pipes_lock */
+
+/* A pipeline leaves P_BUILDING: the render thread may be waiting for it (pipeline_get). It used to poll with Sleep(1),
+ * which sleeps to the next timer tick (up to 15.6 ms: nothing here raises the timer resolution) for each pipeline a
+ * worker was building */
+static SRWLOCK pipe_wait_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE pipe_wait_cv = CONDITION_VARIABLE_INIT;
+static void pipe_set_state(Pipe *p, LONG state) {
+    AcquireSRWLockExclusive(&pipe_wait_lock);
+    InterlockedExchange(&p->state, state);
+    ReleaseSRWLockExclusive(&pipe_wait_lock);
+    WakeAllConditionVariable(&pipe_wait_cv);
+}
 static SRWLOCK pipes_lock = SRWLOCK_INIT;
 static u32 npipes;
 static FILE *pipe_list;                 /* pipelines.list, appended to */
@@ -3583,11 +3612,11 @@ static unsigned __stdcall async_pipe_thread(void *arg) {
         if (vs && (!k->fs || fs)) {
             p->pipe = pipeline_build(k, vs, fs);
             InterlockedIncrement(&async_built);
-            InterlockedExchange(&p->state, P_READY);
+            pipe_set_state(p, P_READY);
         } else {                                /* not on disk: back to the render thread */
             p->no_async = true;
             InterlockedIncrement(&async_failed);
-            InterlockedExchange(&p->state, P_LISTED);
+            pipe_set_state(p, P_LISTED);
         }
         if (vs) vkDestroyShaderModule(vk.dev, vs, NULL);
         if (fs) vkDestroyShaderModule(vk.dev, fs, NULL);
@@ -3617,14 +3646,17 @@ static VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModu
     bool claimed;
     *pending = false;
     Pipe *p = pipe_claim(k, P_BUILDING, &claimed);
-    if (!claimed) {
+    while (!claimed) {
         if (p->state == P_READY) return p->pipe;
         if (async) { *pending = true; return NULL; }
         double t0 = ms_now();                   /* a worker is building it */
-        while (p->state != P_READY) Sleep(1);
+        AcquireSRWLockExclusive(&pipe_wait_lock);
+        while (p->state == P_BUILDING) SleepConditionVariableSRW(&pipe_wait_cv, &pipe_wait_lock, INFINITE, 0);
+        ReleaseSRWLockExclusive(&pipe_wait_lock);
         hf.pipe += ms_now() - t0;
         hf.npipe++;
-        return p->pipe;
+        if (p->state == P_READY) return p->pipe;
+        p = pipe_claim(k, P_BUILDING, &claimed);    /* the worker gave it back (no SPIR-V on disk): built here */
     }
     if (env.pipe_log && !k->compute) {
         char fb[256];
@@ -3693,7 +3725,7 @@ static unsigned __stdcall prebuild_thread(void *arg) {
         Pipe *p = vs && (!k->fs || fs) ? pipe_claim(k, P_BUILDING, &claimed) : NULL;
         if (claimed) {
             p->pipe = pipeline_build(k, vs, fs);
-            InterlockedExchange(&p->state, P_READY);
+            pipe_set_state(p, P_READY);
             InterlockedIncrement(&pre_built);
         }
         if (vs) vkDestroyShaderModule(vk.dev, vs, NULL);
@@ -4991,11 +5023,21 @@ static void run(u64 at, int depth) {
         case OP_RENDER_TARGETS: {
             CmdRenderTargets h;
             memcpy(&h, pay, sizeof h);
+            const TexRef *refs = (const TexRef *)(pay + sizeof h);
+            /* the same targets set again (the game re-sets them around its own state changes): the pass goes on.
+             * Ending it cost a store, a full barrier (a GPU drain) and a reload for nothing: NVN orders work at its
+             * barriers, not at a target change (ref/PokeZ-ARecomp-Online keeps such passes too). NX_SAME_RT=0 ends
+             * the pass as before */
+            if (st.rendering && env.same_rt && h.ncolor == st.nrt && (bool)h.has_depth == st.has_depth &&
+                !memcmp(refs, st.rt, st.nrt * sizeof *refs) &&
+                (!h.has_depth || !memcmp(&refs[h.ncolor], &st.depth, sizeof st.depth))) {
+                rt_kept++;
+                break;
+            }
             end_rendering();
             /* games submit a whole frame at once: hand the GPU what is recorded so far, at a pass boundary, so
              * that it works while the rest is translated (NX_FLUSH_DRAWS, 0 for one submission per guest one) */
             if (env.flush_draws && work_unflushed >= (u32)env.flush_draws) flush();
-            const TexRef *refs = (const TexRef *)(pay + sizeof h);
             st.nrt = h.ncolor > 8 ? 8 : h.ncolor;
             for (u32 i = 0; i < st.nrt; i++) st.rt[i] = refs[i];
             st.has_depth = h.has_depth;
@@ -5212,6 +5254,7 @@ void gpu_texture_written(const TexInfo *t, const ViewInfo *v, const CopyRegion *
         c.row_stride = (s64)row;
         c.image_stride = (s64)img;
         VkBufferImageCopy reg = bt_region(&c, im, off);
+        image_upload(im);               /* the rest of the texture first (as do_copy_buffer_to_texture) */
         end_rendering();
         vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &reg);
         im->valid = true;
@@ -5755,8 +5798,9 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
         hlog(0, "gpu: F12: frame %llu is traced and dumped to %s", capture_frame, frames_dir());
     }
     u64 frames = ++frame_no;
-    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines",
-                                  draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes);
+    if (frames % 600 == 0) hlog(1, "gpu: %llu draws so far (%llu skipped), %llu dispatches, %d images (%llu MB), %u pipelines, "
+                                  "%llu passes kept over a re-set of the same targets",
+                                  draws, draws_skipped, dispatches, nimages, image_bytes >> 20, npipes, rt_kept);
     if (frames % 600 == 0) {
         hlog(1, "gpu: CPU-written texture check %.2f ms/frame over %.0f MB; its thread %.2f ms/frame (longest %.1f), "
                 "%llu presents did not wait for it", refresh_ms / 600, refresh_mb / 600, scan_ms / 600, scan_ms_max,
@@ -5845,6 +5889,7 @@ static void env_init(void) {
     }
     env.refresh_pools = getenv("NX_REFRESH_POOLS") != NULL;
     env.refresh_wait = getenv("NX_REFRESH_WAIT") != NULL;
+    env.same_rt = !(e = getenv("NX_SAME_RT")) || atoi(e);
     /* Mirrors pay where the GPU reads host memory slowly (the GTX 1650 Ti laptop's x8 link: ~3 GB/s of pool reads
      * at 25 fps) and cost fps where it reads it fast (RX 7800 XT: 155-205 fps off vs 137-167 on). So they are on for
      * discrete GPUs on links under 20 GB/s (PCIe 4.0 x16 is 31.5) or whose link is not known; integrated GPUs read

@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 static char game_dir[1024], image_dir[1024], save_dir[1024];
 void audout_dump(void);
@@ -184,6 +186,9 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: " NX_NAME " [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
+    /* 1 ms timer resolution for the whole run: guest waits sleep in ms (kernel.c ksleep) and would otherwise round up
+     * to the 15.6 ms tick. Netplay builds got it from ENet's init; now every build has it */
+    timeBeginPeriod(1);
     nsp_open();
 #ifdef NX_NETPLAY
     netplay_startup(save_dir, game_dir);                /* the room browser, before anything else opens */

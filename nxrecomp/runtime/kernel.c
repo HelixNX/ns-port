@@ -424,9 +424,19 @@ static void waitprof_report(double wall) {
 
 /* Sleep until end_wait (klock held on entry and exit), without the core. Returns the wait result, or R_TIMED_OUT
  * if the deadline passed first; the caller then takes the thread off whatever it waits on. */
+/* microseconds, for wait deadlines. GetTickCount64 moves in 15.6 ms steps whatever the timer resolution: a guest
+ * wait of 1-2 ms (a job poll, a streaming thread's back-off) lasted until the next step, up to ~16 ms */
+static ULONGLONG kwait_now_us(void) {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (ULONGLONG)(c.QuadPart / f.QuadPart * 1000000 + c.QuadPart % f.QuadPart * 1000000 / f.QuadPart);
+}
+
 static u32 block(KThread *t, s64 timeout_ns) {
     ULONGLONG deadline = 0;
-    if (timeout_ns > 0) deadline = GetTickCount64() + (ULONGLONG)((timeout_ns + 999999) / 1000000);
+    if (timeout_ns > 0) deadline = kwait_now_us() + (ULONGLONG)((timeout_ns + 999) / 1000);
     core_release(t);
     LARGE_INTEGER q0, q1, qf;
     int kind = t->wait;                 /* end_wait clears it */
@@ -436,14 +446,15 @@ static u32 block(KThread *t, s64 timeout_ns) {
         if (t->woken) { r = t->wait_result; break; }
         DWORD ms = INFINITE;
         if (timeout_ns >= 0) {
-            ULONGLONG now = GetTickCount64();
+            ULONGLONG now = kwait_now_us();
             if (now >= deadline) {
                 /* nobody may end this wait any more while the thread waits for its core */
                 t->woken = true;
                 r = R_TIMED_OUT;
                 break;
             }
-            ms = (DWORD)(deadline - now);
+            ULONGLONG left = (deadline - now + 999) / 1000;
+            ms = left > 0x7fffffff ? 0x7fffffff : (DWORD)left;     /* (a huge timeout: not truncated into a short one) */
         }
         ksleep(t, ms);
     }
