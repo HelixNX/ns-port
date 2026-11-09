@@ -316,7 +316,7 @@ MK8 is not the current focus (`../CLAUDE.md`): the user checks it themselves.
 | `build/lifted/`, `build/cmake/`, `build/a64test/` | lifted C, the CMake/Ninja build, differential-test work files |
 | `build/image/`, `build/save/`, `build/sysdata/`, `build/run.log` | relocated module images, save data, system data archives (from `../firmware/22.5.0/`), the last run's log |
 | `build/shaders/`, `build/frames/` | dumped Maxwell shaders (+ `glsl/`, `spv/` translations); frame and render target dumps |
-| `mk8recomp/` | MK8's part of the source, a git repo: `game.json` (modules and bases, title, paths), `CMakeLists.txt` (calls `nx_game` from `../../nxrecomp/nxrecomp.cmake`), `build.bat`, `run.ps1`, `gputest.ps1`. Everything else (runtime, lifter, shader tools) is in the shared `../nxrecomp` (see `../CLAUDE.md`); its tools find `game.json` from the current directory, so run them from `mk8recomp` |
+| `mk8recomp/` | MK8's part of the source: `game.json` (modules and bases, title, paths), `CMakeLists.txt` (calls `nx_game` from `../../nxrecomp/nxrecomp.cmake`), `build.bat`, `run.ps1`, `gputest.ps1`. Everything else (runtime, lifter, shader tools) is in the shared `../nxrecomp` (see `../CLAUDE.md`); its tools find `game.json` from the current directory, so run them from `mk8recomp` |
 
 3.0.5 main: text 0xb510c8 (11.3 MB), ro 0x654c68, data 0x16abe0, bss 0x50cd0. 1.0.0 and 3.0.1 are 32-bit (A32); the shelved 1.0.0 work (dump, A32 lifter, plan) was deleted on 2026-10-17
 (still in git history before that date).

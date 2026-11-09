@@ -27,17 +27,16 @@ Everything starts from `start.ps1` at the root (PowerShell); `.\start.ps1` alone
 
 The first time, a game needs its setup (below: unpack, dump, export, lift); after that `start.ps1` is all.
 
-This repo is the workspace: it ties the three repos together as submodules, holds the project notes (`CLAUDE.md`
-files) and keeps the empty folders your own game data goes into. **No game data, keys or firmware are included, and
+This repo is the workspace: it holds all the source (`nxrecomp/` and each game's repo folder, merged in from
+their old separate repos with their history), the project notes (`CLAUDE.md` files) and the empty folders your
+own game data goes into. **No game data, keys or firmware are included, and
 none may ever be committed.** You must dump them from your own console and cartridges or eShop purchases. The
 `.gitignore` is a whitelist, so anything you put in those folders stays local.
 
 ## Get the code
 
 ```sh
-git clone --recursive https://github.com/s1099/ns-port.git
-# or, in an existing clone:
-git submodule update --init
+git clone https://github.com/s1099/ns-port.git
 ```
 
 Clone to a drive with lots of free space. One game needs about 30–40 GB (ROMs, dump, about 1 GB of lifted C and the
@@ -52,16 +51,16 @@ ns-port/
 ├── firmware/                your firmware dump: Firmware_<ver>.zip and its NCAs in <ver>/ (e.g. 22.5.0/)
 ├── deps/                    third-party libraries (see Prerequisites)
 ├── .tools/                  nstool.exe; ida-mcp (optional, headless IDA)
-├── nxrecomp/                shared code (submodule)
+├── nxrecomp/                shared code
 ├── pokemon-violet/
 │   ├── rom/                 your NSPs: base, update 4.0.0 (v786432), DLC
 │   ├── dump/                made by setup: exefs/, elf/, romfs/, aoc/
 │   ├── build/               made by setup: analysis/, lifted/, cmake/, the .exe
-│   └── violetrecomp/        game repo (submodule): game.json, CMakeLists.txt, build.bat, run.ps1
+│   └── violetrecomp/        game source: game.json, CMakeLists.txt, build.bat, run.ps1
 ├── mk8dx/
 │   ├── rom/                 game.nsp (base 1.0.0), mk8u_v1376256.nsp (update 3.0.5)
 │   ├── extract_v21/, dump_v21/, build/   made by setup
-│   └── mk8recomp/           game repo (submodule)
+│   └── mk8recomp/           game source
 ├── room/                    room server (own repo): build.bat or CMake, build/room_server.exe
 ├── ldn-beacon/              real-Switch bridge (own repo): build.bat or CMake, s3/ = the ESP32-S3 firmware
 └── start.ps1                the front door (Start here)
