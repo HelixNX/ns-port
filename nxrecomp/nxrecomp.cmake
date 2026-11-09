@@ -71,7 +71,8 @@ set(NX_RUNTIME_SOURCES
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
-    nca.c image.c nvn.c gpu.c tex.c vk.c astc.c input.c options.c mods.c ui.c movie.c swkbd.c)
+    nca.c image.c nvn.c gpu.c gpu_prof.c gpu_pool.c gpu_image.c gpu_draw.c gpu_xfer.c gpu_desc.c gpu_shader.c
+    gpu_pipe.c gpu_dump.c tex.c vk.c astc.c input.c options.c mods.c ui.c movie.c swkbd.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
