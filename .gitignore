@@ -2,7 +2,6 @@
 # Game data (ROMs, dumps, extracts, builds), keys, firmware, deps and tools never get committed.
 /*
 !/.gitignore
-!/.gitmodules
 !/README.md
 !/start.ps1
 !/CLAUDE.md

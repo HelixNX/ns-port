@@ -1,9 +1,0 @@
-[submodule "nxrecomp"]
-	path = nxrecomp
-	url = https://github.com/s1099/nxrecomp.git
-[submodule "mk8dx/mk8recomp"]
-	path = mk8dx/mk8recomp
-	url = https://github.com/s1099/mk8recomp.git
-[submodule "pokemon-violet/violetrecomp"]
-	path = pokemon-violet/violetrecomp
-	url = https://github.com/s1099/violetrecomp.git
