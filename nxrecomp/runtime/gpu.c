@@ -1485,6 +1485,8 @@ static bool image_upload_into(Image *im, VkImage target) {
         return true;
     }
     if (L.bpb != 1 && L.bpb != 2 && L.bpb != 4 && L.bpb != 8 && L.bpb != 16) return false;
+    /* packed D+S: not uploaded (checked here, before the texels are deswizzled into staging for nothing) */
+    if (im->aspects & VK_IMAGE_ASPECT_STENCIL_BIT && im->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) return false;
     u64 total = 0;
     for (u32 l = 0; l < L.levels; l++) total += (u64)L.level[l].w * L.level[l].h * L.level[l].d * L.bpb;
     total *= L.layers;
@@ -1516,7 +1518,6 @@ static bool image_upload_into(Image *im, VkImage target) {
                                             {w, h, d}};
         at += pitch * lv->h * lv->d * L.layers;
     }
-    if (im->aspects & VK_IMAGE_ASPECT_STENCIL_BIT && im->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) return false;  /* packed D+S */
     end_rendering();
     vkCmdCopyBufferToImage(cmd(), buf, target, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
     barrier();
@@ -5200,7 +5201,13 @@ u64 gpu_fence(u64 queue) {
 }
 
 bool gpu_wait(u64 value, u64 timeout_ns) {
-    if (value > submitted) gpu_flush(0);
+    if (value > submitted) {
+        gpu_flush(0);
+        /* still not submitted: nothing was recorded after the fence (a command buffer's FenceSync takes submitted + 1,
+         * and a submission that records no Vulkan work submits nothing), so the value would never be signalled and
+         * the wait lasted its whole timeout. Everything before it is what there is to wait for */
+        if (value > submitted) value = submitted;
+    }
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
                               .pValues = &value};
     double t0 = prof_on > 0 ? ms_now() : 0;

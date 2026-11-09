@@ -37,23 +37,24 @@ static SRWLOCK live_lock = SRWLOCK_INIT;
 
 static u32 live_slot(void *h) { return (u32)(((uintptr_t)h >> 4) * 0x9e3779b1u) & (live_cap - 1); }
 static void live_put(void *h, u64 owner) {
-    if ((live_count + 1) * 2 > live_cap) {
-        u32 oc = live_cap;
-        void *old = live;
-        live_cap = oc ? oc * 2 : 4096;
+    if ((live_count + 1) * 2 > live_cap) {              /* live_count: slots in use, tombstones included */
+        u32 oc = live_cap, n = 0;
+        __typeof__(live) old = live;
+        for (u32 i = 0; i < oc; i++) n += old[i].host && old[i].host != LIVE_TOMB;
+        /* grown only when the live objects need it: mostly tombstones (objects come and go all session) are
+         * dropped at the same size, where doubling each time grew the table without end */
+        live_cap = !oc ? 4096 : (n + 1) * 4 > oc ? oc * 2 : oc;
         live = calloc(live_cap, sizeof *live);
         live_count = 0;
-        for (u32 i = 0; i < oc; i++) {
-            void *hh = ((struct { void *host; u64 owner; } *)old)[i].host;
-            if (hh && hh != LIVE_TOMB) live_put(hh, ((struct { void *host; u64 owner; } *)old)[i].owner);
-        }
+        for (u32 i = 0; i < oc; i++)
+            if (old[i].host && old[i].host != LIVE_TOMB) live_put(old[i].host, old[i].owner);
         free(old);
     }
     u32 k = live_slot(h);
     while (live[k].host && live[k].host != LIVE_TOMB) k = (k + 1) & (live_cap - 1);
+    if (!live[k].host) live_count++;                    /* (a tombstone's slot is already counted) */
     live[k].host = h;
     live[k].owner = owner;
-    live_count++;
 }
 /* true if h is live and owned by owner (then it is forgotten) */
 static bool live_take(void *h, u64 owner) {
@@ -1181,11 +1182,10 @@ static void cmd_multi_draw_arrays(Ctx *c) {
     *p = (CmdDrawIndirect){(u32)A(1), ~0u, 0, A(2), A(3), (u32)A(4), (u32)A(5)};
 }
 /* MultiDrawElementsIndirectCount(cmd, mode, type, indexBuffer, indirect, parameterBuffer, maxDrawCount, stride):
- * the ninth argument is on the stack */
+ * eight arguments, so the stride is x7 (it was read from the stack, as a ninth would be) */
 static void cmd_multi_draw_elements(Ctx *c) {
-    u32 stride = LD32(c->x[31]);
     EMIT(OP_MULTI_DRAW_INDIRECT, CmdDrawIndirect);
-    *p = (CmdDrawIndirect){(u32)A(1), (u32)A(2), A(3), A(4), A(5), (u32)A(6), stride};
+    *p = (CmdDrawIndirect){(u32)A(1), (u32)A(2), A(3), A(4), A(5), (u32)A(6), (u32)A(7)};
 }
 static void cmd_dispatch(Ctx *c) { u32 v[3] = {(u32)A(1), (u32)A(2), (u32)A(3)}; EMIT_N(OP_DISPATCH, 12); memcpy(p, v, 12); }
 static void cmd_dispatch_indirect(Ctx *c) { u64 a = A(1); EMIT_N(OP_DISPATCH_INDIRECT, 8); memcpy(p, &a, 8); }
