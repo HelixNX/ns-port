@@ -1,4 +1,4 @@
-# Whitelist: this repo holds the source, the build entry, the docs and empty placeholder folders.
+# Whitelist: this repo holds the shared source (nxrecomp/), the build entry, the docs and empty placeholder folders.
 # Game data (ROMs, dumps, extracts, builds), keys, firmware, deps and tools never get committed.
 /*
 !/.gitignore
@@ -23,21 +23,7 @@
 /.tools/*
 !/.tools/.gitkeep
 
-!/mk8dx/
-/mk8dx/*
-!/mk8dx/CLAUDE.md
-!/mk8dx/rom/
-/mk8dx/rom/*
-!/mk8dx/rom/.gitkeep
-!/mk8dx/mk8recomp
-
-!/pkmn-violet/
-/pkmn-violet/*
-!/pkmn-violet/CLAUDE.md
-!/pkmn-violet/NOTES.md
-!/pkmn-violet/rom/
-/pkmn-violet/rom/*
-!/pkmn-violet/rom/.gitkeep
-!/pkmn-violet/violetrecomp
+# mk8dx/ and pkmn-violet/ are the games' own repos (github.com/HelixNX/mk8dx, HelixNX/pkmn-violet), cloned here
+# with .\start.ps1 clone; room/ and ldn-beacon/ are repos of their own too. All stay out of this one.
 
 !/nxrecomp

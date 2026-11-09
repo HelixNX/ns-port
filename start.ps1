@@ -8,8 +8,35 @@ $ErrorActionPreference = 'Stop'
 $ws = $PSScriptRoot
 
 $games = @{
-    violet = @{ repo = "$ws\pkmn-violet\violetrecomp"; id = '01008F6008C5E000'; title = 'Pokemon Violet' }
-    mk8    = @{ repo = "$ws\mk8dx\mk8recomp";             id = '0100152000022000'; title = 'Mario Kart 8 Deluxe' }
+    violet = @{ dir = 'pkmn-violet'; repo = "$ws\pkmn-violet\violetrecomp"; id = '01008F6008C5E000'; title = 'Pokemon Violet' }
+    mk8    = @{ dir = 'mk8dx';       repo = "$ws\mk8dx\mk8recomp";         id = '0100152000022000'; title = 'Mario Kart 8 Deluxe' }
+}
+# each game is its own repo under the organisation, cloned into the workspace as <dir> (.\start.ps1 clone <game>)
+$org = 'https://github.com/HelixNX'
+
+function Get-Game([string]$name) {
+    $g = $games[$name]
+    if (-not (Test-Path "$($g.repo)\game.json")) { throw "$($g.title) isn't in the workspace: .\start.ps1 clone $name" }
+    return $g
+}
+
+# Clone a game's repo into its folder. The folder may already hold game data (rom/, dump/, build/): then the repo is
+# set up in place (init, fetch, check out the tracked files) and everything else stays as it is.
+function Get-GameRepo([string]$name) {
+    $g = $games[$name]
+    $dir = "$ws\$($g.dir)"
+    $url = "$org/$($g.dir).git"
+    if (Test-Path "$dir\.git") { Write-Host "$($g.dir) is already a repo; pulling"; git -C $dir pull --ff-only; return }
+    if (-not (Test-Path $dir) -or -not (Get-ChildItem -Force $dir)) { git clone $url $dir; return }
+    git -C $dir init -q -b main
+    git -C $dir remote add origin $url
+    git -C $dir fetch -q origin
+    if ($LASTEXITCODE) { throw "fetch from $url failed" }
+    git -C $dir reset -q origin/main
+    git -C $dir branch -q -u origin/main
+    # tracked files missing from the folder come from the repo; files already there (and all game data) are kept
+    foreach ($f in @(git -C $dir ls-files --deleted)) { git -C $dir checkout -- $f }
+    git -C $dir status --short                          # local files that differ from the repo, if any
 }
 
 function Show-Help {
@@ -29,6 +56,7 @@ function Show-Help {
                                    log and pcap go to ldn-beacon\captures\<time>\
 
   Build
+    clone violet|mk8               get a game's repo (HelixNX/pkmn-violet, HelixNX/mk8dx) into its folder
     build violet|mk8|room|beacon   build one project
     package violet|mk8 <out dir>   a folder for players (nxrecomp\tools\package.ps1)
 
@@ -64,7 +92,7 @@ function ConvertTo-Splat([string[]]$a) {
 }
 
 function Start-Game([string]$name, [string[]]$a) {
-    $g = $games[$name]
+    $g = Get-Game $name
     $room = Get-Opt $a '-Room'
     $nick = Get-Opt $a '-Nick'
     $pass = ConvertTo-Splat (Remove-Opt $a @('-Room', '-Nick'))
@@ -135,10 +163,15 @@ switch ($What) {
 
     'build' { Build-Project $Target }
 
+    'clone' {
+        $which = if ($Target) { @($Target) } else { @($games.Keys) }
+        foreach ($n in $which) { if (-not $games.ContainsKey($n)) { throw 'clone violet|mk8 (none: both)' }; Get-GameRepo $n }
+    }
+
     'package' {
         if (-not $games.ContainsKey($Target) -or -not $Rest) { throw 'package violet|mk8 <out dir>' }
         $out = [IO.Path]::GetFullPath($Rest[0])
-        Push-Location $games[$Target].repo
+        Push-Location (Get-Game $Target).repo
         $more = ConvertTo-Splat @($Rest | Select-Object -Skip 1)
         try { & "$ws\nxrecomp\tools\package.ps1" -Out $out @more } finally { Pop-Location }
     }

@@ -5,9 +5,9 @@ SDK running over an emulated kernel and services, and NVN replayed into Vulkan.
 
 | Project | Game | Repo |
 |---|---|---|
-| `nxrecomp/` | shared runtime (kernel, SVCs, IPC, services, NVN on Vulkan, audio, input) and tools (lifter, shader translator, IDA export) | [s1099/nxrecomp](https://github.com/s1099/nxrecomp) |
-| `pkmn-violet/violetrecomp/` | Pokémon Violet 4.0.0 + DLC | [s1099/violetrecomp](https://github.com/s1099/violetrecomp) |
-| `mk8dx/mk8recomp/` | Mario Kart 8 Deluxe 3.0.5 | [s1099/mk8recomp](https://github.com/s1099/mk8recomp) |
+| `nxrecomp/` | shared runtime (kernel, SVCs, IPC, services, NVN on Vulkan, audio, input) and tools (lifter, shader translator, IDA export) | this repo |
+| `pkmn-violet/` | Pokémon Violet 4.0.0 + DLC (source in `violetrecomp/`) | [HelixNX/pkmn-violet](https://github.com/HelixNX/pkmn-violet) |
+| `mk8dx/` | Mario Kart 8 Deluxe 3.0.5 (source in `mk8recomp/`) | [HelixNX/mk8dx](https://github.com/HelixNX/mk8dx) |
 | `room/` | the multiplayer room server (the protocol Citra, yuzu and Eden rooms speak); Windows or Linux | local repo |
 | `ldn-beacon/` | a real Switch's local play bridged into a room, with an ESP32-S3 on USB as the radio | local repo |
 
@@ -27,8 +27,9 @@ Everything starts from `start.ps1` at the root (PowerShell); `.\start.ps1` alone
 
 The first time, a game needs its setup (below: unpack, dump, export, lift); after that `start.ps1` is all.
 
-This repo is the workspace: it holds all the source (`nxrecomp/` and each game's repo folder, merged in from
-their old separate repos with their history), the project notes (`CLAUDE.md` files) and the empty folders your
+This repo is the workspace: it holds the shared source (`nxrecomp/`), the build entry, `start.ps1`, the notes
+(`CLAUDE.md`) and the empty folders your keys and firmware go into. Each game is its own repo, cloned into the
+workspace as its project folder (`.\start.ps1 clone`), with its source, notes and the empty `rom/` folder your
 own game data goes into. **No game data, keys or firmware are included, and
 none may ever be committed.** You must dump them from your own console and cartridges or eShop purchases. The
 `.gitignore` is a whitelist, so anything you put in those folders stays local.
@@ -36,8 +37,13 @@ none may ever be committed.** You must dump them from your own console and cartr
 ## Get the code
 
 ```sh
-git clone https://github.com/s1099/ns-port.git
+git clone https://github.com/HelixNX/ns-port.git
+cd ns-port
+.\start.ps1 clone            # both games (HelixNX/pkmn-violet, HelixNX/mk8dx); or: .\start.ps1 clone violet
 ```
+
+`clone` also works on a project folder that already holds your data (`rom/`, `dump/`, `build/`): it sets up the repo
+in place and leaves the rest alone.
 
 Clone to a drive with lots of free space. One game needs about 30–40 GB (ROMs, dump, about 1 GB of lifted C and the
 build).
@@ -52,12 +58,12 @@ ns-port/
 ├── deps/                    third-party libraries (see Prerequisites)
 ├── .tools/                  nstool.exe; ida-mcp (optional, headless IDA)
 ├── nxrecomp/                shared code
-├── pkmn-violet/
+├── pkmn-violet/             game repo (HelixNX/pkmn-violet): CLAUDE.md, NOTES.md
 │   ├── rom/                 your NSPs: base, update 4.0.0 (v786432), DLC
 │   ├── dump/                made by setup: exefs/, elf/, romfs/, aoc/
 │   ├── build/               made by setup: analysis/, lifted/, cmake/, the .exe
 │   └── violetrecomp/        game source: game.json, game.cmake, build.bat, run.ps1
-├── mk8dx/
+├── mk8dx/                   game repo (HelixNX/mk8dx): CLAUDE.md
 │   ├── rom/                 game.nsp (base 1.0.0), mk8u_v1376256.nsp (update 3.0.5)
 │   ├── extract_v21/, dump_v21/, build/   made by setup
 │   └── mk8recomp/           game source

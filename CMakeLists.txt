@@ -17,6 +17,10 @@ if(NOT NX_GAME IN_LIST NX_GAMES)
     message(FATAL_ERROR "set NX_GAME to one of: ${NX_GAMES} (or use a preset: cmake --preset <game>)")
 endif()
 set(NX_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${NX_GAME_${NX_GAME}}")
+if(NOT EXISTS "${NX_GAME_DIR}/game.json")
+    # each game is its own repo (github.com/HelixNX/<folder>), cloned into the workspace
+    message(FATAL_ERROR "${NX_GAME_${NX_GAME}} is missing: get the game's repo with .\\start.ps1 clone ${NX_GAME}")
+endif()
 
 # the project is named after the game (game.json "name"), as each game's own CMakeLists.txt did before
 file(READ "${NX_GAME_DIR}/game.json" _json)

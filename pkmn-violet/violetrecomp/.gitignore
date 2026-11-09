@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-# game-derived files never live here; keep it that way
-*.nso
-*.nca
-*.nsp
-*.elf
-*.i64
-*.keys
