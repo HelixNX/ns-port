@@ -464,11 +464,19 @@ static void async_pipe_queue(Pipe *p) {
 /* the render thread's pipeline for k, from modules it has loaded. async (graphics draws with NX_ASYNC_SHADERS): NULL
  * with *pending set while a worker builds it */
 VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModule fs, bool async, bool *pending) {
-    bool claimed;
+    /* most draws repeat the previous draw's key: the last ready pipeline, without the hash and the lock (only the
+     * render thread calls this; pipelines are never destroyed, and a ready one never changes) */
+    static PipeKey last_key;
+    static Pipe *last;
     *pending = false;
+    if (last && !memcmp(&last_key, k, sizeof *k)) return last->pipe;
+    bool claimed;
     Pipe *p = pipe_claim(k, P_BUILDING, &claimed);
     while (!claimed) {
-        if (p->state == P_READY) return p->pipe;
+        if (p->state == P_READY) {
+            if (p->pipe) last_key = *k, last = p;
+            return p->pipe;
+        }
         if (async) { *pending = true; return NULL; }
         double t0 = ms_now();                   /* a worker is building it */
         AcquireSRWLockExclusive(&pipe_wait_lock);

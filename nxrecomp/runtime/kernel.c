@@ -176,6 +176,35 @@ u64 lifted_lo, lifted_hi;
 static u64 qpc_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (u64)q.QuadPart; }
 static void hold_end(KThread *t) { if (t->hold_since) t->hold_qpc += qpc_now() - t->hold_since; t->hold_since = 0; }
 
+/* Before sleeping on its condition variable, a thread whose wait is likely short polls for its end a while with klk
+ * released: an OS wake costs several us (more from a deep C-state), and the game's threads hand work to each other
+ * many times a frame (main joins its job workers ~12 times). After TotK Recomp's kspin. NX_KSPIN_US (default 20, 0
+ * off); off with fewer than 6 logical processors, where the spinning would take time from the other threads. The
+ * caller re-checks under klk afterwards, so a wake sent while it polls is never lost. Returns whether it ended. */
+static s64 kspin_ticks = -1;
+static bool kspin(KThread *t, bool for_core) {
+    if (kspin_ticks < 0) {
+        const char *e = getenv("NX_KSPIN_US");
+        long us = e ? strtol(e, NULL, 10) : 20;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        kspin_ticks = us > 0 && GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) >= 6 ? f.QuadPart * us / 1000000 : 0;
+    }
+    if (!kspin_ticks) return false;
+    ReleaseSRWLockExclusive(&klk);
+    wake_flush();
+    u64 end = qpc_now() + (u64)kspin_ticks;
+    bool done = false;
+    do {
+        for (int i = 0; i < 32 && !done; i++) {
+            done = for_core ? *(volatile int *)&t->cur_core >= 0 : *(volatile bool *)&t->woken;
+            YieldProcessor();
+        }
+    } while (!done && qpc_now() < end);
+    AcquireSRWLockExclusive(&klk);
+    return done;
+}
+
 static void core_assign(KThread *t, int c) {
     core_owner[c] = t;
     t->cur_core = c;
@@ -264,6 +293,7 @@ static void core_acquire(KThread *t) {
     LARGE_INTEGER q0, q1;
     QueryPerformanceCounter(&q0);
     int how = 0;
+    bool spun = false;
     for (;;) {
         bool free_core = false;
         for (int c = 0; c < NCORES && !free_core; c++) free_core = (t->affinity >> c & 1) && !core_owner[c];
@@ -272,6 +302,13 @@ static void core_acquire(KThread *t) {
         if (r == 1 || t->cur_core >= 0) break;
         if (r < 0) how = 2;
         else if (how != 2) how = 3;
+        if (r == 0 && !spun) {          /* wait for a release: the owner often gives the core up within us */
+            spun = true;
+            kspin(t, true);
+            /* a releaser may have handed it a core after its last poll: placing it again would take a second core */
+            if (t->cur_core >= 0) break;
+            continue;                   /* (a core may have come free meanwhile) */
+        }
         ksleep(t, r < 0 ? 1 : INFINITE);
         if (t->cur_core >= 0) break;
     }
@@ -442,6 +479,7 @@ static u32 block(KThread *t, s64 timeout_ns) {
     int kind = t->wait;                 /* end_wait clears it */
     if (t == waitprof_thread) QueryPerformanceCounter(&q0);
     u32 r;
+    bool spun = false;
     for (;;) {
         if (t->woken) { r = t->wait_result; break; }
         DWORD ms = INFINITE;
@@ -455,6 +493,11 @@ static u32 block(KThread *t, s64 timeout_ns) {
             }
             ULONGLONG left = (deadline - now + 999) / 1000;
             ms = left > 0x7fffffff ? 0x7fffffff : (DWORD)left;     /* (a huge timeout: not truncated into a short one) */
+        }
+        if (!spun) {                    /* once per wait; the loop re-checks woken and the deadline under klk */
+            spun = true;
+            kspin(t, false);
+            continue;
         }
         ksleep(t, ms);
     }

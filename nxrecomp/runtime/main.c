@@ -189,6 +189,12 @@ int main(int argc, char **argv) {
     /* 1 ms timer resolution for the whole run: guest waits sleep in ms (kernel.c ksleep) and would otherwise round up
      * to the 15.6 ms tick. Netplay builds got it from ENet's init; now every build has it */
     timeBeginPeriod(1);
+    /* Windows 11 may run a process it judges in the background (window occluded, unfocused) at EcoQoS, on efficiency
+     * cores, and ignore its timer resolution: guest threads hand work to each other many times a frame, so opt out of
+     * both (after TotK Recomp's plat_power_full) */
+    PROCESS_POWER_THROTTLING_STATE pt = {PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
     nsp_open();
 #ifdef NX_NETPLAY
     netplay_startup(save_dir, game_dir);                /* the room browser, before anything else opens */
