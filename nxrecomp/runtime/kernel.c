@@ -178,14 +178,15 @@ static void hold_end(KThread *t) { if (t->hold_since) t->hold_qpc += qpc_now() -
 
 /* Before sleeping on its condition variable, a thread whose wait is likely short polls for its end a while with klk
  * released: an OS wake costs several us (more from a deep C-state), and the game's threads hand work to each other
- * many times a frame (main joins its job workers ~12 times). After TotK Recomp's kspin. NX_KSPIN_US (default 20, 0
- * off); off with fewer than 6 logical processors, where the spinning would take time from the other threads. The
+ * many times a frame (main joins its job workers ~12 times). After TotK Recomp's kspin. NX_KSPIN_US (us; off by
+ * default: on the GTX 1650 Ti laptop, GPU-bound, 20 us gave nothing or worse, 2026-11-11); off with fewer than 6
+ * logical processors, where the spinning would take time from the other threads. The
  * caller re-checks under klk afterwards, so a wake sent while it polls is never lost. Returns whether it ended. */
 static s64 kspin_ticks = -1;
 static bool kspin(KThread *t, bool for_core) {
     if (kspin_ticks < 0) {
         const char *e = getenv("NX_KSPIN_US");
-        long us = e ? strtol(e, NULL, 10) : 20;
+        long us = e ? strtol(e, NULL, 10) : 0;
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         kspin_ticks = us > 0 && GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) >= 6 ? f.QuadPart * us / 1000000 : 0;
