@@ -3,9 +3,15 @@
  * The exception is a request for local communication while local wireless works (netplay builds in a room): the SDK's
  * nn::nifm::SetLocalNetworkMode(true) gives its request requirement preset 1 (4 otherwise), and such a request is
  * accepted, as a console in local play mode does.
+ * With game.json's "online_notice" (NX_ONLINE_NOTICE), a request for the internet (any other preset: Violet's
+ * "Connect to the Internet" submits preset 0) shows a box saying online play isn't supported while the request is on
+ * hold, as a console shows its connection screen; it is rejected when the box closes. One box at a time: a request
+ * made while one is up is rejected at once.
  * Command ids are from the SDK 4.4 proxies (IStaticService, IGeneralService, IRequest). */
 #include "../ipc.h"
+#include "game_config.h"
 #include <stdlib.h>
+#include <windows.h>
 #ifdef NX_NETPLAY
 #include "../net/net.h"
 #endif
@@ -19,14 +25,58 @@ typedef struct Request {
     KEvent *state_event, *other_event;              /* GetSystemEventReadableHandles: state changes, and a second */
     u32 state, result;
     u32 preset;
+    volatile LONG refs;                             /* the IRequest object's, and a notice box thread's */
+    volatile LONG gone;                             /* the IRequest object was destroyed */
 } Request;
 
-static void req_destroy(SvcObj *o) {
-    Request *q = o->data;
-    kobj_unref(&q->state_event->obj);
+static void req_release(Request *q) {
+    if (InterlockedDecrement(&q->refs)) return;
+    kobj_unref(&q->state_event->obj);               /* (interlocked: safe from the box's thread) */
     kobj_unref(&q->other_event->obj);
     free(q);
 }
+static void req_destroy(SvcObj *o) {
+    Request *q = o->data;
+    InterlockedExchange(&q->gone, 1);
+    req_release(q);
+}
+
+#if NX_ONLINE_NOTICE
+static volatile LONG notice_up;                     /* a box is showing */
+
+static DWORD WINAPI notice_thread(void *p) {
+    Request *q = p;
+    MessageBoxW(NULL,
+                L"Connecting to the internet isn't supported. Online play of our own may come in a future version; "
+                L"Nintendo's online services won't.\r\n\r\n"
+                L"Local play works: press Esc and open Multiplayer to join a room, then use the game's local "
+                L"communication (Union Circle, Tera raids, trades).",
+                L"" NX_TITLE ": no internet connection", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    hlog(1, "nifm: online notice closed: request rejected");
+    if (!q->gone) {
+        q->state = REQ_FREE;
+        q->result = R_NIFM_NO_NETWORK;
+        event_signal(q->state_event);
+    }
+    InterlockedExchange(&notice_up, 0);
+    req_release(q);
+    return 0;
+}
+
+/* shows the box and keeps q on hold until it closes; false if a box is up already (or no thread) */
+static bool notice_start(Request *q) {
+    if (InterlockedCompareExchange(&notice_up, 1, 0)) return false;
+    InterlockedIncrement(&q->refs);
+    q->state = REQ_ON_HOLD;
+    q->result = 0;
+    HANDLE t = CreateThread(NULL, 0, notice_thread, q, 0, NULL);
+    if (!t) { InterlockedDecrement(&q->refs); InterlockedExchange(&notice_up, 0); return false; }
+    CloseHandle(t);
+    hlog(1, "nifm: request with requirement preset %u: on hold while the online notice is up", q->preset);
+    event_signal(q->state_event);
+    return true;
+}
+#endif
 static void req_state(SvcObj *o, IpcReq *r) { out_u32(r, ((Request *)o->data)->state); }
 static void req_result(SvcObj *o, IpcReq *r) { r->result = ((Request *)o->data)->result; }
 static void req_events(SvcObj *o, IpcReq *r) {
@@ -39,6 +89,9 @@ static void req_submit(SvcObj *o, IpcReq *r) {
     bool local = false;
 #ifdef NX_NETPLAY
     local = q->preset == PRESET_LOCAL && room_joined();
+#endif
+#if NX_ONLINE_NOTICE
+    if (q->preset != PRESET_LOCAL && notice_start(q)) return;
 #endif
     q->state = local ? REQ_ACCEPTED : REQ_FREE;
     q->result = local ? 0 : R_NIFM_NO_NETWORK;
@@ -84,6 +137,7 @@ static void gs_client_id(SvcObj *o, IpcReq *r) {
 }
 static void gs_create_request(SvcObj *o, IpcReq *r) {
     Request *q = calloc(1, sizeof *q);
+    q->refs = 1;
     q->state_event = event_create();
     q->other_event = event_create();
     q->state = REQ_FREE;

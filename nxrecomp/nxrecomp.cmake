@@ -204,6 +204,13 @@ function(nx_game)
             endforeach()
         endif()
     endif()
+    # "online_notice": true: a request to connect to the internet shows a box saying it isn't supported (yet) while
+    # the game waits, then fails as before (nifm.c); absent: it fails silently, as a console without a network would
+    string(JSON _on ERROR_VARIABLE no_on GET "${json}" online_notice)
+    set(NX_ONLINE_NOTICE 0)
+    if(NOT no_on AND _on)
+        set(NX_ONLINE_NOTICE 1)
+    endif()
     list(LENGTH NX_DLC NX_DLC_COUNT)
     list(APPEND NX_DLC 0)                               # a C array may not be empty
     list(JOIN NX_DLC ", " NX_DLC)
@@ -224,6 +231,7 @@ function(nx_game)
 #define NX_DLC_INDICES {@NX_DLC@}
 #define NX_DEFAULT_FRAMERATE (@NX_DEFAULT_FRAMERATE@)
 #define NX_UI_THEME "@NX_UI_THEME@"
+#define NX_ONLINE_NOTICE @NX_ONLINE_NOTICE@
 ]] @ONLY)
 
     set(LIFTED_DIR "${build}/lifted" CACHE PATH "C sources written by tools/lifter/a64lift.py")
