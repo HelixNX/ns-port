@@ -91,6 +91,12 @@ static s16 disconnect_reason;
 /* access point: the stations in nodes 1..7, by fake address */
 static bool station_used[NODES];
 static u8 station_ip[NODES][4];
+/* access point: who scanned us lately (a searching console, ldn-beacon). DestroyNetwork goes to them too, so a bridge
+ * stops advertising the network at once: a link-code search hosts and scans in turns, and a bridge that kept a torn-
+ * down network on the air (ldn-beacon: until 5 s without a ScanResp) had a real Switch join it and give up after
+ * ~0.5 s. Not broadcast: a room member connected to another host might take any DestroyNetwork as its own. */
+enum { WATCHERS = 8, WATCH_MS = 10000 };
+static struct { u8 ip[4]; u64 ms; } watchers[WATCHERS];
 /* station */
 static NodeInfo self_node;
 static u8 host_ip[4];
@@ -168,7 +174,17 @@ static void on_ldn(const NetLdnPacket *p) {
     EnterCriticalSection(&lk);
     switch (p->type) {
     case LDN_SCAN:
-        if (state == ST_AP_CREATED) send_ldn(LDN_SCAN_RESP, p->local_ip, &net, sizeof net);
+        if (state == ST_AP_CREATED) {
+            send_ldn(LDN_SCAN_RESP, p->local_ip, &net, sizeof net);
+            int w = 0, oldest = 0;          /* remembered (watchers): the same address, else the oldest slot */
+            while (w < WATCHERS && memcmp(watchers[w].ip, p->local_ip, 4)) w++;
+            if (w == WATCHERS) {
+                for (int k = 1; k < WATCHERS; k++) if (watchers[k].ms < watchers[oldest].ms) oldest = k;
+                w = oldest;
+            }
+            memcpy(watchers[w].ip, p->local_ip, 4);
+            watchers[w].ms = GetTickCount64();
+        }
         break;
     case LDN_SCAN_RESP:
         if (p->size >= sizeof(NetworkInfo)) {
@@ -399,6 +415,14 @@ static void lc_open_ap(SvcObj *o, IpcReq *r) {
 static void destroy_network(void) {
     for (int i = 1; i < NODES; i++)
         if (station_used[i]) send_ldn(LDN_DESTROY_NETWORK, station_ip[i], NULL, 0);
+    u64 now = GetTickCount64();
+    for (int w = 0; w < WATCHERS; w++) {    /* and whoever scanned it lately (watchers), stations aside */
+        if (!watchers[w].ms || now - watchers[w].ms > WATCH_MS) continue;
+        bool station = false;
+        for (int i = 1; i < NODES; i++) station |= station_used[i] && !memcmp(station_ip[i], watchers[w].ip, 4);
+        if (!station) send_ldn(LDN_DESTROY_NETWORK, watchers[w].ip, NULL, 0);
+    }
+    memset(watchers, 0, sizeof watchers);
     reset_stations();
     state = ST_AP_OPENED;
     fire();
