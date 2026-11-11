@@ -16,6 +16,22 @@ static bool image_candidate(const TexInfo *t, VkFormat fmt, VkImageUsageFlags us
     s64 d = (s64)w * 9 - (s64)h * 16;
     return d >= -16 && d <= 16;
 }
+
+/* A colour target of another shape drawn while a scaled (screen) depth target is bound joins the render scale: Violet
+ * draws the menus' 3D player (400x800) and mons (360x360) that way, with the 1080p depth still bound, and a pass runs
+ * at its smallest target's scale, so they stayed 1x. Same limits as image_candidate apart from the shape; true if im
+ * can scale now. */
+bool image_promote(Image *im) {
+    if (im->can_scale) return true;
+    const TexInfo *t = &im->info;
+    if (t->flags & (TEX_FLAG_LINEAR | TEX_FLAG_LINEAR_RENDER_TARGET)) return false;
+    if (t->target != TEX_2D && t->target != TEX_2D_ARRAY && t->target != TEX_2D_MS && t->target != TEX_2D_MS_ARRAY)
+        return false;
+    if (!(im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) || !(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
+    if (t->width < 64 || tex_height(t) < 64) return false;
+    im->can_scale = true;
+    return true;
+}
 Image *wb_list[WB_MAX];
 void linear_wrote(Image *im) {
     if (!im || im->wb_pending || !(im->info.flags & TEX_FLAG_LINEAR)) return;

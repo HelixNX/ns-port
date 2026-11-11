@@ -174,7 +174,7 @@ typedef struct Image {
     int nviews, capviews;
     struct Image *next;
     u32 scale;                          /* render scale it was made at: its Vulkan size is the guest size times this */
-    bool can_scale;                     /* screen-shaped (image_candidate) */
+    bool can_scale;                     /* screen-shaped (image_candidate), or drawn with a scaled depth (image_promote) */
     VkImageCreateFlags cflags;
 } Image;
 
@@ -222,6 +222,7 @@ bool temp_image(VkFormat f, u32 w, u32 h, u32 levels, u32 layers, Temp *t);
 static inline void temp_free(Temp *t) { bury(DEAD_IMAGE, t->image, &t->alloc); }
 bool scale_blittable(const Image *im);
 void image_rescale(Image *im, u32 s);
+bool image_promote(Image *im);
 void image_upload(Image *im);
 
 /* ---------------------------------------------------------------------------------------------- state */

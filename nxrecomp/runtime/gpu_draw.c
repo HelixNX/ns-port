@@ -61,12 +61,13 @@ void watch(const char *what, const TexRef *r) {
 
 /* a render target's view, its image, level, first layer and layer count (layered rendering: gl_Layer picks among
  * them) */
-static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *first, u32 *layers) {
+static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *first, u32 *layers, bool promote) {
     watch("render target", r);
     ViewInfo v;
     rs_hint = true;                     /* made now: at the render scale */
     Image *im = image_ref(r, &v);
     rs_hint = false;
+    if (im && promote) image_promote(im);                       /* drawn with a scaled depth (image_promote) */
     if (im && im->can_scale && im->scale != rs_scale) image_rescale(im, rs_scale);   /* a texture first drawn into */
     if (out) *out = im;
     if (level) *level = v.base_level;
@@ -106,11 +107,20 @@ bool begin_rendering(void) {
     st.samples = 1;
     st.rt_scale = 0;
     bool any = false;
+    /* a scaled screen depth bound: the colour targets join its scale (image_promote) */
+    bool promote = false;
+    if (st.has_depth && rs_scale > 1) {
+        ViewInfo dv;
+        rs_hint = true;
+        Image *d = image_ref(&st.depth, &dv);
+        rs_hint = false;
+        promote = d && d->can_scale && !(d->aspects & VK_IMAGE_ASPECT_COLOR_BIT);
+    }
     for (u32 i = 0; i < st.nrt; i++) {
         color[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         Image *im;
         u32 l, l0, nl;
-        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &l0, &nl) : NULL;
+        VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &l0, &nl, promote) : NULL;
         if (!v) continue;
         st.rt_sub[i].addr = im->info.addr, st.rt_sub[i].size = im->size;
         st.rt_sub[i].level = l, st.rt_sub[i].layer = l0, st.rt_sub[i].nlayers = nl;
@@ -135,7 +145,7 @@ bool begin_rendering(void) {
     if (st.has_depth) {
         Image *im;
         u32 l, l0, nl;
-        VkImageView v = rt_view(&st.depth, &im, &l, &l0, &nl);
+        VkImageView v = rt_view(&st.depth, &im, &l, &l0, &nl, false);
         if (v) {
             st.rt_sub[8].addr = im->info.addr, st.rt_sub[8].size = im->size;
             st.rt_sub[8].level = l, st.rt_sub[8].layer = l0, st.rt_sub[8].nlayers = nl;
