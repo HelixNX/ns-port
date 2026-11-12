@@ -42,7 +42,7 @@
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
     X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) \
-    X(vkCmdSetVertexInputEXT) X(vkCmdSetPolygonModeEXT) X(vkCmdSetRasterizationSamplesEXT) \
+    X(vkCmdSetPolygonModeEXT) X(vkCmdSetRasterizationSamplesEXT) \
     X(vkCmdSetSampleMaskEXT) X(vkCmdSetAlphaToCoverageEnableEXT) X(vkCmdSetLogicOpEnableEXT) \
     X(vkCmdSetLogicOpEXT) X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) \
     X(vkCmdSetColorWriteMaskEXT) X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetDepthClipEnableEXT) \
@@ -52,7 +52,7 @@
 /* optional: NULL without the extension */
 #define VK_DEVICE_OPT_FNS(X) \
     X(vkCreatePipelineBinariesKHR) X(vkDestroyPipelineBinaryKHR) X(vkGetPipelineBinaryDataKHR) \
-    X(vkReleaseCapturedPipelineDataKHR)
+    X(vkReleaseCapturedPipelineDataKHR) X(vkCmdSetVertexInputEXT)
 /* NX_GPU_LABELS (VK_EXT_debug_utils): names for passes, draws and barriers in captures (RGP's user events) */
 #define VK_LABEL_FNS(X) X(vkCmdBeginDebugUtilsLabelEXT) X(vkCmdEndDebugUtilsLabelEXT)
 
@@ -78,14 +78,20 @@ typedef struct Vk {
     VkSurfaceKHR surface;
     u64 host_import_align;              /* minImportedHostPointerAlignment */
     u32 dyn_logic_op;                   /* extendedDynamicState2LogicOp (AMD has none: the logic op is in the pipeline) */
-    VkShaderStageFlags warp32;          /* stages whose pipelines ask for 32-wide subgroups (Maxwell's warps) */
+    VkShaderStageFlags warp_stages;     /* stages whose pipelines ask for subgroups of vk_warp's size */
     double pcie_gbps;                   /* the GPU's PCIe link in GB/s per direction (vk_pcie_link), 0 if unknown */
     bool pipeline_binary;               /* VK_KHR_pipeline_binary: gpu.c keeps compiled pipelines itself */
     bool labels;                        /* NX_GPU_LABELS, and the instance has VK_EXT_debug_utils */
+    /* optional on older GPUs (AMD's GCN driver has neither; docs/GPUS.md): without u8_indices 8-bit indices are
+     * widened to 16 bits (gpu_draw.c), without vi_dynamic the vertex layout is part of the pipeline (PipeKey vi) */
+    bool u8_indices;                    /* VK_KHR_index_type_uint8 (NX_NO_U8_INDICES=1: as if absent) */
+    bool vi_dynamic;                    /* VK_EXT_vertex_input_dynamic_state (NX_NO_VI_DYNAMIC=1: as if absent) */
 } Vk;
 
-/* chained into a pipeline stage that is in vk.warp32: the translated shaders' subgroup code assumes 32 lanes */
-extern const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp32;
+/* chained into a pipeline stage that is in vk.warp_stages: 32 lanes like Maxwell's warps where the GPU can (the
+ * translated shaders also work on 32-lane halves of 64-wide subgroups: tools/shader/translate.py LANE), 64 with
+ * NX_WARP64=1 (testing GCN's wave64 on RDNA) */
+extern VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp;
 extern Vk vk;
 
 /* device memory: sub-allocated from 64 MB blocks (dedicated above 16 MB) */

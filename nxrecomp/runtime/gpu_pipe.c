@@ -101,7 +101,7 @@ static SRWLOCK pipes_lock = SRWLOCK_INIT;
 u32 npipes;
 static FILE *pipe_list;                 /* pipelines.list, appended to */
 #define PIPE_LIST_MAGIC 0x4c50584eu     /* "NXPL", then the version and the key size */
-#define PIPE_LIST_VERSION 1u
+#define PIPE_LIST_VERSION 2u
 /* NX_PIPE_LOG (env.pipe_log): log each pipeline's shaders before it is made (a driver that aborts while compiling one) */
 u64 pipe_vs_hash, pipe_fs_hash;
 
@@ -155,7 +155,7 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
     if (k->compute) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, next,
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                      vk.warp32 & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp32 : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                      vk.warp_stages & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                       .module = vs, .pName = "main"}, .layout = layout_gfx};
         r = vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, pipe);
     } else {
@@ -166,9 +166,9 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
         VkSpecializationMapEntry vsme = {1, 0, sizeof k->vs_mask};
         VkSpecializationInfo vspec = {1, &vsme, sizeof k->vs_mask, &k->vs_mask};
         VkPipelineShaderStageCreateInfo stages[2] = {
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp32 : NULL,
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp_stages & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp : NULL,
              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main", .pSpecializationInfo = &vspec},
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp32 & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp32 : NULL,
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp_stages & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp : NULL,
              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main", .pSpecializationInfo = &spec}};
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -204,8 +204,37 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
                                                .pDynamicStates = dyn};
         VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, next, .colorAttachmentCount = k->ncolor,
             .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth, .stencilAttachmentFormat = k->stencil};
+        /* without dynamic vertex input the layout comes from the key (vi_key); strides stay dynamic (bound with the
+         * buffers), and VERTEX_INPUT_EXT in dyn[] becomes VERTEX_INPUT_BINDING_STRIDE */
+        VkDynamicState dyn2[sizeof dyn / sizeof *dyn];
+        VkVertexInputBindingDescription vb[32];
+        VkVertexInputAttributeDescription va[48];
+        VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                                                   .pVertexBindingDescriptions = vb, .pVertexAttributeDescriptions = va};
+        if (!vk.vi_dynamic) {
+            memcpy(dyn2, dyn, sizeof dyn);
+            for (u32 i = 0; i < sizeof dyn / sizeof *dyn; i++)
+                if (dyn2[i] == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) dyn2[i] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+            dy.pDynamicStates = dyn2;
+            u32 used = 0;
+            for (u32 i = 0; i < 32; i++) {
+                u32 e = k->vi[i];
+                if (e & 0xff) va[vi.vertexAttributeDescriptionCount++] = (VkVertexInputAttributeDescription){
+                    i, e >> 8 & 31, (VkFormat)(e & 0xff), e >> 13 & 0x3fff};
+                else if (i < 16)        /* the shader may read it: zeros from binding 31 (a null buffer) */
+                    va[vi.vertexAttributeDescriptionCount++] = (VkVertexInputAttributeDescription){
+                        i, 31, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+                if (e & 0xff) used |= 1u << (e >> 8 & 31);
+            }
+            used |= 1u << 31;
+            for (u32 s = 0; s < 32; s++)
+                if (used >> s & 1)
+                    vb[vi.vertexBindingDescriptionCount++] = (VkVertexInputBindingDescription){s, 0,
+                        s < 31 && k->vi_inst >> s & 1 ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+        }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri,
-            .stageCount = k->fs ? 2 : 1, .pStages = stages, .pInputAssemblyState = &ia, .pViewportState = &vp,
+            .stageCount = k->fs ? 2 : 1, .pStages = stages, .pVertexInputState = vk.vi_dynamic ? NULL : &vi,
+            .pInputAssemblyState = &ia, .pViewportState = &vp,
             .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
             .pDynamicState = &dy, .layout = layout_gfx};
         r = vkCreateGraphicsPipelines(vk.dev, pcache, 1, &ci, NULL, pipe);
@@ -234,7 +263,8 @@ static u32 translator_version(void) {
 }
 
 static BinHdr bins_header(void) {
-    BinHdr h = {BINS_MAGIC, 1, sizeof(PipeKey), vk.props.vendorID, vk.props.deviceID, vk.props.driverVersion,
+    /* (the version carries the subgroup size the pipelines were made for: NX_WARP64 runs keep their own) */
+    BinHdr h = {BINS_MAGIC, 1 | vk_warp.requiredSubgroupSize << 8, sizeof(PipeKey), vk.props.vendorID, vk.props.deviceID, vk.props.driverVersion,
                 translator_version()};
     memcpy(h.uuid, vk.props.pipelineCacheUUID, VK_UUID_SIZE);
     return h;

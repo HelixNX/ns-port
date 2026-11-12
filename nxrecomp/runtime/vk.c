@@ -27,7 +27,7 @@ VK_LABEL_FNS(VK_DEFINE)
 #undef VK_DEFINE
 
 Vk vk;
-const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp32 = {
+VkPipelineShaderStageRequiredSubgroupSizeCreateInfo vk_warp = {
     VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = 32};
 static SDL_Window *window;
 void input_event(const SDL_Event *e);
@@ -208,11 +208,13 @@ static void load_instance(void) {
 static const char *const device_exts[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
     VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
-    VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
+    VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-    VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
+    VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
 };
+/* optional (vk_init): VK_KHR_index_type_uint8 and VK_EXT_vertex_input_dynamic_state have fallbacks (vk.u8_indices,
+ * vk.vi_dynamic); AMD's GCN driver (RX 400 / 500, Vega) lacks both */
 
 /* The GPU's PCIe link, for gpu.c's pool mirrors: the display kernel gives the PCI address of the adapter with
  * Vulkan's LUID (VK_EXT_pci_bus_info would too, but AMD's Windows driver lacks it), and Windows' device tree has
@@ -344,8 +346,39 @@ void vk_init(void) {
     vk.dyn_logic_op = has2.extendedDynamicState2LogicOp;
     if (!vk.dyn_logic_op) hlog(1, "vk: no dynamic logic op: logic ops are part of the pipeline");
 
-    /* subgroups of 32 like Maxwell's warps: the translated ballots, lane masks and shuffles keep 32 lanes (AMD runs
-     * 64-wide waves by default, which lost lanes 32-63 and left a compute loop spinning until the driver reset) */
+    /* 8-bit indices and per-draw vertex input, where the device has them (else the fallbacks in gpu_draw.c / gpu_pipe.c);
+     * NX_NO_U8_INDICES=1 / NX_NO_VI_DYNAMIC=1 take the fallbacks on a GPU that has them (testing). NX_NO_VI_DYNAMIC
+     * keeps the extension enabled: with it off, AMD's RDNA3 driver (RX 7800 XT, 2026-11-12) lost the device on the
+     * first game draw whatever the pipelines held (docs/GPUS.md), which says nothing about our fallback */
+    bool vi_keep = false;
+    u32 ne = 0;
+    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, NULL);
+    VkExtensionProperties *dext = malloc((ne ? ne : 1) * sizeof *dext);
+    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, dext);
+    {
+        VkPhysicalDeviceIndexTypeUint8FeaturesKHR hasu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR};
+        VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT hasvi = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+        bool u8x = has_ext(dext, ne, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME);
+        bool vix = has_ext(dext, ne, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+        void *chain = NULL;
+        if (u8x) hasu8.pNext = chain, chain = &hasu8;
+        if (vix) hasvi.pNext = chain, chain = &hasvi;
+        VkPhysicalDeviceFeatures2 hasf8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, chain};
+        vkGetPhysicalDeviceFeatures2(vk.phys, &hasf8);
+        const char *nu8 = getenv("NX_NO_U8_INDICES"), *nvi = getenv("NX_NO_VI_DYNAMIC");
+        vk.u8_indices = u8x && hasu8.indexTypeUint8 && !(nu8 && atoi(nu8));
+        vk.vi_dynamic = vix && hasvi.vertexInputDynamicState && !(nvi && atoi(nvi));
+        vi_keep = vix && hasvi.vertexInputDynamicState;   /* enabled even when NX_NO_VI_DYNAMIC takes the fallback */
+        if (!vk.u8_indices) hlog(1, "vk: no 8-bit indices%s: widened to 16 bits", u8x ? " (NX_NO_U8_INDICES)" : "");
+        if (!vk.vi_dynamic) hlog(1, "vk: no dynamic vertex input%s: vertex layouts are part of the pipeline",
+                                 vix ? " (NX_NO_VI_DYNAMIC)" : "");
+    }
+
+    /* subgroups of 32 like Maxwell's warps where the GPU can (cheapest for the translated ballots, lane masks and
+     * shuffles). Before translate.py worked on 32-lane halves, AMD's default 64-wide waves lost lanes 32-63 and left
+     * a compute loop spinning until the driver reset; GCN (64 only) now relies on the halves. NX_WARP64=1 asks for 64
+     * instead (RDNA can: tests GCN's case) */
     VkPhysicalDeviceVulkan13Features has13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 hasf13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &has13};
     vkGetPhysicalDeviceFeatures2(vk.phys, &hasf13);
@@ -354,11 +387,20 @@ void vk_init(void) {
     VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p13};
     VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
     vkGetPhysicalDeviceProperties2(vk.phys, &pp);
-    if (has13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 && p11.subgroupSize != 32)
-        vk.warp32 = p13.requiredSubgroupSizeStages;
-    hlog(1, "vk: subgroup size %u (%u-%u), 32 required for stages %x", p11.subgroupSize, p13.minSubgroupSize,
-         p13.maxSubgroupSize, vk.warp32);
-    if (p11.subgroupSize != 32 && !vk.warp32) hlog(0, "vk: subgroups are not 32 wide: warp-level shader code will be wrong");
+    const char *w64 = getenv("NX_WARP64");
+    u32 want = w64 && atoi(w64) ? 64 : 32;
+    if (has13.subgroupSizeControl && p13.minSubgroupSize <= want && p13.maxSubgroupSize >= want &&
+        (p11.subgroupSize != want || p13.minSubgroupSize != p13.maxSubgroupSize)) {
+        vk.warp_stages = p13.requiredSubgroupSizeStages;
+        vk_warp.requiredSubgroupSize = want;
+    }
+    hlog(1, "vk: subgroup size %u (%u-%u), %u required for stages %x%s", p11.subgroupSize, p13.minSubgroupSize,
+         p13.maxSubgroupSize, vk_warp.requiredSubgroupSize, vk.warp_stages, want == 64 ? " (NX_WARP64)" : "");
+    /* warp code runs on 32-lane halves of the subgroup: 32, 64 or 128 wide is right, narrower is not (Intel's 8 / 16) */
+    u32 width = vk.warp_stages ? vk_warp.requiredSubgroupSize : p11.subgroupSize;
+    if (width < 32 || width > 128 || (!vk.warp_stages && p13.minSubgroupSize < 32))
+        hlog(0, "vk: subgroups of %u-%u lanes, not 32 or 64: warp-level shader code may be wrong", p13.minSubgroupSize,
+             p13.maxSubgroupSize);
     /* translated shaders flush 32-bit denormals (Maxwell's .FTZ) and keep NaN and infinities (the console's NaN
      * results: .SAT, FMNMX, F2I), as execution modes in every SPIR-V (tools/shader/translate.py) */
     if (!p12.shaderDenormFlushToZeroFloat32 || !p12.shaderSignedZeroInfNanPreserveFloat32)
@@ -371,7 +413,8 @@ void vk_init(void) {
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR u8i = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR,
                                                      &xfb, .indexTypeUint8 = 1};
     VkPhysicalDeviceDepthClipControlFeaturesEXT clipc = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &u8i, .depthClipControl = 1};
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, vk.u8_indices ? (void *)&u8i : &xfb,
+        .depthClipControl = 1};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT clip = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
                                                        &clipc, .depthClipEnable = 1};
     /* bounds-checked buffer and image access (out of range: reads zero, writes dropped) where the device has it, so
@@ -387,7 +430,7 @@ void vk_init(void) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, &border,
         .vertexInputDynamicState = 1};
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &vin,
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, vk.vi_dynamic || vi_keep ? (void *)&vin : &border,
         .extendedDynamicState2 = 1, .extendedDynamicState2LogicOp = vk.dyn_logic_op,
         .extendedDynamicState2PatchControlPoints = has2.extendedDynamicState2PatchControlPoints};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3 = {
@@ -399,7 +442,7 @@ void vk_init(void) {
         .extendedDynamicState3DepthClampEnable = 1, .extendedDynamicState3DepthClipEnable = 1};
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &eds3,
         .dynamicRendering = 1, .synchronization2 = 1, .maintenance4 = 1, .shaderDemoteToHelperInvocation = 1,
-        .subgroupSizeControl = vk.warp32 != 0};
+        .subgroupSizeControl = vk.warp_stages != 0};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13,
         .timelineSemaphore = 1, .bufferDeviceAddress = 1, .descriptorIndexing = 1, .runtimeDescriptorArray = 1,
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1,
@@ -413,13 +456,11 @@ void vk_init(void) {
         .shaderDrawParameters = 1};
     /* pipeline binaries (with maintenance5, which they need): compiled pipelines kept between sessions by gpu.c,
      * where the driver's own caches do not keep them (AMD); NX_PIPELINE_BINARY=0 turns them off */
-    const char *exts[sizeof device_exts / sizeof *device_exts + 2];
+    const char *exts[sizeof device_exts / sizeof *device_exts + 4];
     u32 next = 0;
     for (size_t i = 0; i < sizeof device_exts / sizeof *device_exts; i++) exts[next++] = device_exts[i];
-    u32 ne = 0;
-    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, NULL);
-    VkExtensionProperties *dext = malloc(ne * sizeof *dext);
-    vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &ne, dext);
+    if (vk.u8_indices) exts[next++] = VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME;
+    if (vk.vi_dynamic || vi_keep) exts[next++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
     VkPhysicalDevicePipelineBinaryFeaturesKHR hasbin = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR hasm5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &hasbin};
     VkPhysicalDeviceFeatures2 hasf5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hasm5};
@@ -468,6 +509,7 @@ void vk_init(void) {
     VK_DEVICE_FNS(VK_LOAD_D)
 #define VK_LOAD_OPT(f) f = (PFN_##f)vkGetDeviceProcAddr(vk.dev, #f);
     VK_DEVICE_OPT_FNS(VK_LOAD_OPT)
+    if (vk.vi_dynamic && !vkCmdSetVertexInputEXT) fatal("Vulkan: no vkCmdSetVertexInputEXT");
     if (vk.pipeline_binary && !(vkCreatePipelineBinariesKHR && vkDestroyPipelineBinaryKHR && vkGetPipelineBinaryDataKHR &&
                                 vkReleaseCapturedPipelineDataKHR))
         vk.pipeline_binary = false;

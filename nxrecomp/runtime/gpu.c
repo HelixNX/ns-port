@@ -225,6 +225,24 @@ void flush(void) {
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     VkResult r = vk_submit(&si, NULL);
     if (r < 0) fatal("vkQueueSubmit2: %d (device lost?)", r);
+    { /* NX_GPU_SYNC=1: waits for each submission and logs what it held; a hang or lost device names the last draw
+       * (with NX_FLUSH_DRAWS=1 NX_FLUSH_FIRST=1, one draw per submission; slow) */
+        static int sync = -1;
+        if (sync < 0) sync = getenv("NX_GPU_SYNC") != NULL;
+        if (sync) {
+            static u64 ld;
+            hlog(0, "NX_GPU_SYNC: submission %llu: draws %llu-%llu (%llu skipped so far), dispatches to %llu, mirror copy-in %d",
+                 s->value, ld + 1, draws, draws_skipped, dispatches, (int)pre);
+            ld = draws;
+            VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
+                                      .pValues = &s->value};
+            VkResult w = vkWaitSemaphores(vk.dev, &wi, 3000000000ull);
+            u64 now = 0;
+            vkGetSemaphoreCounterValue(vk.dev, timeline, &now);
+            if (w != VK_SUCCESS || now == ~0ull) fatal("NX_GPU_SYNC: submission %llu: %d; last draw %llu vs %016llx fs %016llx",
+                                       s->value, w, draws, pipe_vs_hash, pipe_fs_hash);
+        }
+    }
     cur = -1;
     work_unflushed = 0;
     reap();

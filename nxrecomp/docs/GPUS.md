@@ -1,7 +1,30 @@
 # GPUs: what the runtime needs, and older cards
 
 Written 2026-11-07 after a tester's Radeon RX 580 (Polaris, GCN 4) stopped at "No graphics card with Vulkan 1.3
-and the extensions the game needs". Nothing below is implemented yet; it is the plan for whoever picks it up.
+and the extensions the game needs".
+
+## State (2026-11-12): parts 1-3 built, not yet run on a GCN card
+
+| Part | Built | Checked on the RX 7800 XT |
+|---|---|---|
+| 1. 8-bit indices | `KHR_index_type_uint8` optional (`vk.u8_indices`); direct draws widen to 16 bits in staging (`gpu_draw.c` `u8_indices_widened`, 0xff -> 0xffff under primitive restart); indirect ones are skipped with one log line | `NX_NO_U8_INDICES=1`: 90 s at the title, validation clean of new errors. No 8-bit indexed draw happened there, so the widening itself is untested |
+| 2. Vertex input in the pipeline | `EXT_vertex_input_dynamic_state` optional (`vk.vi_dynamic`); without it `vi_key` puts the layout in `PipeKey` (`vi[32]`, `vi_inst`; `PIPE_LIST_VERSION` 2), `pipeline_create` builds `VkPipelineVertexInputStateCreateInfo` from it, strides stay dynamic (`VERTEX_INPUT_BINDING_STRIDE`, bound with the buffers) | `NX_NO_VI_DYNAMIC=1`: 1.76 M draws without a fault, validation clean of new errors. Many more pipelines (one per program x layout): pop-in while they build |
+| 3. 64-wide waves | `translate.py` works on 32-lane halves at any width (`LANE`, `WARP_BASE`, `HALF`: S2R lane id / LtMask, VOTE against the half's ballot of true, SHFL adds the half's base). One translation set for all GPUs (not a `--warp64` set as planned below): on 32-wide subgroups the forms give the same results, for a few instructions in the ~70 shaders with warp ops. `vk_warp` / `vk.warp_stages` (were `vk_warp32` / `vk.warp32`): 32 where the GPU can, `NX_WARP64=1` asks for 64; the pipeline binaries' header carries the size | `NX_WARP64=1`: 2 minutes at the title, 60 fps, no hang. In-game (the compute shader with ballot and shuffle) not yet |
+
+**The RDNA3 driver and a device without `EXT_vertex_input_dynamic_state`** (2026-11-12, about a dozen driver
+resets): with the extension left out of `vkCreateDevice`, the RX 7800 XT lost the device on the first game draw
+that ran, every time. The same commands and pipelines run fine with the extension enabled (and unused), and it
+still happened with pipelines holding no vertex layout, no dynamic state but viewport / scissor, no vkCmdSet* calls
+for the rest, nothing bound at binding 31, and wave32 off for vertex shaders; with every game draw skipped
+(`NX_GPU_SKIP=1`) it did not. So enabling the extension changes how this driver builds our draws; not found further.
+`NX_NO_VI_DYNAMIC` therefore keeps the extension enabled and only takes the fallback path. Whether GCN's driver
+(which has no such extension) does the same is open: the first thing a tester's run shows. If it does, next steps:
+compare a minimal draw (one built-in shader, no descriptors) against ours; `NX_GPU_SYNC=1 NX_FLUSH_DRAWS=1
+NX_FLUSH_FIRST=1` (one draw per submission, each waited for) names the draw a hang or lost device comes from.
+
+Left: an RX 580 tester's run (log.txt; F12 captures of anything drawn wrong); a compute pass widening 8-bit indices
+of indirect draws, if the log shows any skipped ("indirect draw with 8-bit indices"); `NX_WARP64=1` in game.
+The rest of this file is the original plan, kept for its references.
 
 Rough sizes (2026-11-07): parts 1 and 2 together about half an hour of edits plus builds and a test run; part 3
 a few hours, most of it re-translating and checking shaders. Parts 1 and 2 get an RX 580 past the start; part 3 is

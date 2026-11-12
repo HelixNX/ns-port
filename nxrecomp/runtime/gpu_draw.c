@@ -523,6 +523,62 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
     rec.d = d;
 }
 
+/* the format attribute i (NVN format f) is fetched as, VK_FORMAT_UNDEFINED if none */
+static VkFormat vi_format(u32 i, u32 f) {
+    VkFormat vf = vk_format(f);
+    if (vf == VK_FORMAT_UNDEFINED) return vf;
+    /* shader inputs are all float and read as raw bits (Maxwell hands integer attributes over as integers):
+     * 32-bit integer formats are fetched as the same-size float format, which keeps the bits (a UINT/SINT
+     * format into a float input is undefined; AMD did not keep them and integer-packed meshes vanished).
+     * 8/16-bit ones are fetched as USCALED / SSCALED (the same values, exact as floats), which the vertex
+     * shader turns back into integers where the pipeline's INT_ATTRS (int_attr_mask) says so */
+    switch (vf) {
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: vf = VK_FORMAT_R32_SFLOAT; break;
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: vf = VK_FORMAT_R32G32_SFLOAT; break;
+    case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: vf = VK_FORMAT_R32G32B32_SFLOAT; break;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: vf = VK_FORMAT_R32G32B32A32_SFLOAT; break;
+    default: {
+        static u32 warned[8];      /* VkFormats are below 256 here: one bit each */
+        bool small_int = (vf >= VK_FORMAT_R8_UINT && vf <= VK_FORMAT_R8G8B8A8_SINT && ((vf - VK_FORMAT_R8_UNORM) % 7 == 4 || (vf - VK_FORMAT_R8_UNORM) % 7 == 5)) ||
+                         (vf >= VK_FORMAT_R16_UNORM && vf <= VK_FORMAT_R16G16B16A16_SFLOAT && ((vf - VK_FORMAT_R16_UNORM) % 7 == 4 || (vf - VK_FORMAT_R16_UNORM) % 7 == 5));
+        if (!small_int) break;
+        VkFormat scaled = (VkFormat)(vf - 2);          /* UINT -> USCALED, SINT -> SSCALED (int_attr_mask) */
+        bool once = vf < 256 && !(warned[vf / 32] >> (vf % 32) & 1);
+        if (once) warned[vf / 32] |= 1u << (vf % 32);
+        if (i >= 16) {             /* INT_ATTRS holds locations 0-15 */
+            if (once) hlog(0, "gpu: 8/16-bit integer vertex format %d at location %u: read as float bits", vf, i);
+            break;
+        }
+        if (once) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(vk.phys, scaled, &fp);
+            if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
+                hlog(0, "gpu: the device cannot fetch vertex format %d (for integer format %d)", scaled, vf);
+        }
+        vf = scaled;
+        break;
+    }
+    }
+    return vf;
+}
+
+/* without dynamic vertex input: the vertex layout into the pipeline key (decoded by pipeline_create, gpu_pipe.c) */
+void vi_key(PipeKey *k) {
+    for (u32 i = 0; i < st.nattribs && i < 32; i++) {
+        u32 f = VA_FORMAT(st.attribs[i]), s = VA_STREAM(st.attribs[i]);
+        if (!f || s >= 31) continue;
+        VkFormat vf = vi_format(i, f);
+        if (vf == VK_FORMAT_UNDEFINED) continue;
+        if ((u32)vf > 0xff) {
+            static bool warned;
+            if (!warned) warned = true, hlog(0, "gpu: vertex format %d does not fit the pipeline key: read as zeros", vf);
+            continue;
+        }
+        k->vi[i] = VI_KEY(vf, s, VA_OFFSET(st.attribs[i]));
+        if (s < st.nstreams && st.streams[s].divisor) k->vi_inst |= 1u << s;
+    }
+}
+
 static void set_vertex_input(VkCommandBuffer c) {
     /* draws mostly keep the last one's attributes, streams and vertex buffers: then everything below would come to
      * what was recorded already (unless the command buffer, the pools or a mirror's bad ranges changed since) */
@@ -551,40 +607,8 @@ static void set_vertex_input(VkCommandBuffer c) {
     for (u32 i = 0; i < st.nattribs && i < 32; i++) {
         u32 f = VA_FORMAT(st.attribs[i]), s = VA_STREAM(st.attribs[i]);
         if (!f || s >= 31) continue;
-        VkFormat vf = vk_format(f);
+        VkFormat vf = vi_format(i, f);
         if (vf == VK_FORMAT_UNDEFINED) continue;
-        /* shader inputs are all float and read as raw bits (Maxwell hands integer attributes over as integers):
-         * 32-bit integer formats are fetched as the same-size float format, which keeps the bits (a UINT/SINT
-         * format into a float input is undefined; AMD did not keep them and integer-packed meshes vanished).
-         * 8/16-bit ones are fetched as USCALED / SSCALED (the same values, exact as floats), which the vertex
-         * shader turns back into integers where the pipeline's INT_ATTRS (int_attr_mask) says so */
-        switch (vf) {
-        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: vf = VK_FORMAT_R32_SFLOAT; break;
-        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: vf = VK_FORMAT_R32G32_SFLOAT; break;
-        case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: vf = VK_FORMAT_R32G32B32_SFLOAT; break;
-        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: vf = VK_FORMAT_R32G32B32A32_SFLOAT; break;
-        default: {
-            static u32 warned[8];      /* VkFormats are below 256 here: one bit each */
-            bool small_int = (vf >= VK_FORMAT_R8_UINT && vf <= VK_FORMAT_R8G8B8A8_SINT && ((vf - VK_FORMAT_R8_UNORM) % 7 == 4 || (vf - VK_FORMAT_R8_UNORM) % 7 == 5)) ||
-                             (vf >= VK_FORMAT_R16_UNORM && vf <= VK_FORMAT_R16G16B16A16_SFLOAT && ((vf - VK_FORMAT_R16_UNORM) % 7 == 4 || (vf - VK_FORMAT_R16_UNORM) % 7 == 5));
-            if (!small_int) break;
-            VkFormat scaled = (VkFormat)(vf - 2);          /* UINT -> USCALED, SINT -> SSCALED (int_attr_mask) */
-            bool once = vf < 256 && !(warned[vf / 32] >> (vf % 32) & 1);
-            if (once) warned[vf / 32] |= 1u << (vf % 32);
-            if (i >= 16) {             /* INT_ATTRS holds locations 0-15 */
-                if (once) hlog(0, "gpu: 8/16-bit integer vertex format %d at location %u: read as float bits", vf, i);
-                break;
-            }
-            if (once) {
-                VkFormatProperties fp;
-                vkGetPhysicalDeviceFormatProperties(vk.phys, scaled, &fp);
-                if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
-                    hlog(0, "gpu: the device cannot fetch vertex format %d (for integer format %d)", scaled, vf);
-            }
-            vf = scaled;
-            break;
-        }
-        }
         attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
                                                              NULL, i, s, vf, VA_OFFSET(st.attribs[i])};
         used[s] = located[i] = true;
@@ -594,11 +618,12 @@ static void set_vertex_input(VkCommandBuffer c) {
             attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
                                                                  NULL, i, 31, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
     VkBuffer bufs[32];
-    VkDeviceSize offs[32], sizes[32];
+    VkDeviceSize offs[32], sizes[32], strides[32];
     for (u32 s = 0; s < 32; s++) {
-        bufs[s] = NULL; offs[s] = 0; sizes[s] = VK_WHOLE_SIZE;
+        bufs[s] = NULL; offs[s] = 0; sizes[s] = VK_WHOLE_SIZE; strides[s] = 0;
         if (s < 31 && used[s]) {
             u32 stride = s < st.nstreams ? st.streams[s].stride : 0, div = s < st.nstreams ? st.streams[s].divisor : 0;
+            strides[s] = stride;
             bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL,
                 s, stride, div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, 1};
             u64 off;
@@ -613,8 +638,10 @@ static void set_vertex_input(VkCommandBuffer c) {
     rec_check();
     bool all = !rec.vi_ok;
     rec.vi_ok = true;
-    if (all || nb != rec.nb || na != rec.na || memcmp(bind, rec.bind, nb * sizeof *bind) ||
-        memcmp(attr, rec.attr, na * sizeof *attr)) {
+    /* without dynamic vertex input the layout is in the pipeline (vi_key) and only the strides are set, with the
+     * buffers */
+    if (vk.vi_dynamic && (all || nb != rec.nb || na != rec.na || memcmp(bind, rec.bind, nb * sizeof *bind) ||
+                          memcmp(attr, rec.attr, na * sizeof *attr))) {
         vkCmdSetVertexInputEXT(c, nb, bind, na, attr);
         rec.nb = nb;
         rec.na = na;
@@ -622,16 +649,31 @@ static void set_vertex_input(VkCommandBuffer c) {
         memcpy(rec.attr, attr, na * sizeof *attr);
     }
     if (all || memcmp(bufs, rec.bufs, sizeof bufs) || memcmp(offs, rec.offs, sizeof offs) ||
-        memcmp(sizes, rec.sizes, sizeof sizes)) {
+        memcmp(sizes, rec.sizes, sizeof sizes) || (!vk.vi_dynamic && memcmp(strides, rec.strides, sizeof strides))) {
         u32 top = 0;                    /* streams 0..top-1 in use, and 31: the zero source */
         for (u32 s = 0; s < 31; s++)
             if (used[s]) top = s + 1;
-        if (top) vkCmdBindVertexBuffers2(c, 0, top, bufs, offs, sizes, NULL);
-        vkCmdBindVertexBuffers2(c, 31, 1, &bufs[31], &offs[31], &sizes[31], NULL);
+        const VkDeviceSize *str = vk.vi_dynamic ? NULL : strides;
+        if (top) vkCmdBindVertexBuffers2(c, 0, top, bufs, offs, sizes, str);
+        vkCmdBindVertexBuffers2(c, 31, 1, &bufs[31], &offs[31], &sizes[31], str ? &strides[31] : NULL);
         memcpy(rec.bufs, bufs, sizeof bufs);
         memcpy(rec.offs, offs, sizeof offs);
         memcpy(rec.sizes, sizes, sizeof sizes);
+        memcpy(rec.strides, strides, sizeof strides);
     }
+}
+
+/* without VK_KHR_index_type_uint8 (vk.u8_indices): 8-bit indices widened to 16 bits in staging, the 8-bit restart
+ * index 0xff becoming 16 bits' 0xffff where primitive restart is on (as set_dynamic_state sets it) */
+static bool u8_indices_widened(const CmdDraw *d, VkBuffer *buf, u64 *off) {
+    const u8 *src = d->count ? gpu_cpu(d->index_addr, d->count) : NULL;
+    if (!src) return false;
+    static volatile LONG widened;
+    if (InterlockedIncrement(&widened) == 1) hlog(1, "gpu: 8-bit indices widened to 16 bits (no VK_KHR_index_type_uint8)");
+    bool restart = st.primitive_restart && (d->mode == 3 || d->mode == 5 || d->mode == 6);
+    u16 *out = staging((u64)d->count * 2, buf, off);
+    for (u32 i = 0; i < d->count; i++) out[i] = restart && src[i] == 0xff ? 0xffff : src[i];
+    return true;
 }
 
 /* quads as triangles: indices (0 1 2, 0 2 3) per quad */
@@ -943,6 +985,7 @@ static void draw_one(u32 op, const void *payload) {
     k.minus_one = depth_mode == 0;
     if (!vk.dyn_logic_op) k.logic_op = st.color.logic_op & 15;
     if (fs && st.color.alpha_test >= 1 && st.color.alpha_test <= 7) k.alpha_func = st.color.alpha_test;
+    if (!vk.vi_dynamic) vi_key(&k);
     bool pending;
     VkPipeline pipe = pipeline_get(&k, vs, fs, env.async_shaders, &pending);
     if (!pipe) { skip_draw(pending ? "pipeline being built (NX_ASYNC_SHADERS)" : "pipeline creation failed"); return; }
@@ -1136,6 +1179,12 @@ static void draw_one(u32 op, const void *payload) {
         }
         VkBuffer ib;
         u64 io;
+        if (d->index_type == 0 && !vk.u8_indices) {
+            if (!u8_indices_widened(d, &ib, &io)) { skip_draw("8-bit indices not readable"); return; }
+            vkCmdBindIndexBuffer(c, ib, io, VK_INDEX_TYPE_UINT16);
+            QUERIED(vkCmdDrawIndexed(c, d->count, d->instances, 0, d->base_vertex, d->base_instance));
+            return;
+        }
         if (!gpu_buffer_ro(d->index_addr, (u64)d->count << d->index_type, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }
         VkIndexType it = d->index_type == 0 ? VK_INDEX_TYPE_UINT8_KHR : d->index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         vkCmdBindIndexBuffer(c, ib, io, it);
@@ -1150,6 +1199,13 @@ static void draw_one(u32 op, const void *payload) {
         ind_log[nind_log++] = (IndLog){draws, pipe_vs_hash, pipe_fs_hash, d->indirect, op == OP_DRAW_ARRAYS_INDIRECT};
     if (op == OP_DRAW_ARRAYS_INDIRECT) {
         QUERIED(vkCmdDrawIndirect(c, buf, off, 1, 16));
+        return;
+    }
+    if (d->index_type == 0 && !vk.u8_indices) {
+        /* the count is in GPU memory: not widened on the CPU (a compute pass would be the fix if these show up) */
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) == 1) hlog(0, "gpu: indirect draw with 8-bit indices skipped (no VK_KHR_index_type_uint8)");
+        skip_draw("indirect draw with 8-bit indices");
         return;
     }
     if (!gpu_buffer_ro(d->index_addr, 1, &ib, &io)) { skip_draw("index buffer not GPU memory"); return; }

@@ -33,6 +33,13 @@ from maxwell import Shader, opcode, bits
 
 RZ = 255
 PT = 7
+# Maxwell's warps are 32 threads; a subgroup may be 64 wide (AMD's GCN runs only wave64; runtime/vk.c asks for 32
+# where it can). Warp code therefore works on 32-lane halves of the subgroup, whatever its width (32 wide: half 0
+# only, the same results as plain subgroup ops): the lane within the half, the half's first lane, and the half's 32
+# bits of a ballot or lane mask (a uvec4, word = invocation >> 5)
+LANE = '(gl_SubgroupInvocationID & 31u)'
+WARP_BASE = '(gl_SubgroupInvocationID & ~31u)'
+HALF = '%s[gl_SubgroupInvocationID >> 5u]'
 STAGE_EXT = {'vertex': 'vert', 'fragment': 'frag', 'compute': 'comp', 'geometry': 'geom',
              'tess_control': 'tesc', 'tess_eval': 'tese'}
 STAGE_BASE = {'vertex': 0, 'fragment': 16, 'compute': 0, 'geometry': 32, 'tess_control': 48, 'tess_eval': 64}
@@ -572,11 +579,11 @@ class Translator:
         self.uses.add('shuffle')
         src = {0: '(b_ & ~sm_) | mn_', 1: 'l_ - b_', 2: 'l_ + b_', 3: 'l_ ^ b_'}[mode]
         ok = 'int(s_) >= int(mn_)' if mode == 1 else 's_ <= mx_'
-        self.emit('{ uint l_ = gl_SubgroupInvocationID, b_ = %s, c_ = %s; uint sm_ = (c_ >> 8) & 31u; uint mn_ = l_ & sm_;'
-                  % (b, c))
+        self.emit('{ uint l_ = %s, b_ = %s, c_ = %s; uint sm_ = (c_ >> 8) & 31u; uint mn_ = l_ & sm_;'
+                  % (LANE, b, c))
         self.indent += 1
         self.emit('uint mx_ = mn_ | (c_ & 31u & ~sm_); uint s_ = %s; bool ok_ = %s;' % (src, ok))
-        self.emit('uint v_ = subgroupShuffle(%s, ok_ ? s_ : l_);' % a)
+        self.emit('uint v_ = subgroupShuffle(%s, %s | (ok_ ? s_ : l_));' % (a, WARP_BASE))
         self.set_r(d, 'v_')
         self.set_p(dp, 'ok_')
         self.indent -= 1
@@ -1156,10 +1163,10 @@ class Translator:
     def op_S2R(self, w, form, pc):
         sr = bits(w, 20, 8)
         e = {33: 'gl_LocalInvocationID.x', 34: 'gl_LocalInvocationID.y', 35: 'gl_LocalInvocationID.z',
-             37: 'gl_WorkGroupID.x', 38: 'gl_WorkGroupID.y', 39: 'gl_WorkGroupID.z', 0: 'gl_SubgroupInvocationID',
+             37: 'gl_WorkGroupID.x', 38: 'gl_WorkGroupID.y', 39: 'gl_WorkGroupID.z', 0: LANE,
              32: '(gl_LocalInvocationID.x | gl_LocalInvocationID.y << 16 | gl_LocalInvocationID.z << 26)',
              18: '0x3f800000u',     # Y direction +1.0: render targets hold rows as on the console
-             57: 'gl_SubgroupLtMask.x'}.get(sr)
+             57: HALF % 'gl_SubgroupLtMask'}.get(sr)
         if e is None:
             raise Unsupported('S2R %d' % sr)
         if sr in (0, 57):
@@ -1740,10 +1747,13 @@ class Translator:
         self.uses.update(('subgroup', 'ballot'))
         self.emit('{ bool v_ = %s;' % self.P(bits(w, 39, 3), bits(w, 42, 1)))
         self.indent += 1
-        self.set_r(bits(w, 0, 8), 'subgroupBallot(v_).x')
+        # this warp's 32 bits of the ballot; ALL / ANY / EQ against the warp's active threads (ballot of true), not
+        # the whole subgroup's, so that a 64-wide subgroup acts as two warps
+        self.emit('uint b_ = %s;' % (HALF % 'subgroupBallot(v_)'))
+        self.set_r(bits(w, 0, 8), 'b_')
         if bits(w, 45, 3) != PT:
-            self.uses.add('vote')
-            self.set_p(bits(w, 45, 3), {0: 'subgroupAll(v_)', 1: 'subgroupAny(v_)', 2: 'subgroupAllEqual(v_)'}[mode])
+            self.emit('uint a_ = %s;' % (HALF % 'subgroupBallot(true)'))
+            self.set_p(bits(w, 45, 3), {0: 'b_ == a_', 1: 'b_ != 0u', 2: 'b_ == 0u || b_ == a_'}[mode])
         self.indent -= 1
         self.emit('}')
 

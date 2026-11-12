@@ -387,8 +387,14 @@ typedef struct PipeKey {
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
     u32 alpha_func;                     /* NVN's alpha test (1-7; 0 = always passes): the fragment shader's ALPHA_FUNC */
-    u32 compute, pad;                   /* pad (0): no padding bytes in the key (memcmp, hashing, the file) */
+    u32 compute;
+    /* the vertex layout, only without dynamic vertex input (vk.vi_dynamic; else 0): per location the VkFormat as
+     * fetched (bits 0-7, 0: unset), stream (8-12) and offset (13-26); the streams read per instance (vi_inst) */
+    u32 vi_inst;
+    u32 vi[32];                         /* (the key has no padding bytes: memcmp, hashing, the file) */
 } PipeKey;
+#define VI_KEY(f, s, o) ((u32)(f) | (u32)(s) << 8 | (u32)(o) << 13)
+void vi_key(PipeKey *k);
 extern u32 npipes;
 extern u64 pipe_vs_hash, pipe_fs_hash;
 void bins_load(void);
@@ -430,7 +436,7 @@ struct Recorded {
     VkVertexInputBindingDescription2EXT bind[32];
     VkVertexInputAttributeDescription2EXT attr[48];
     VkBuffer bufs[32];
-    VkDeviceSize offs[32], sizes[32];
+    VkDeviceSize offs[32], sizes[32], strides[32];  /* strides: without vk.vi_dynamic (bound with the buffers) */
 };
 extern struct Recorded rec;
 
