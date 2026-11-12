@@ -54,6 +54,41 @@ u64 gpu_completed(void) {
     return v;
 }
 
+/* Host-memory imports are freed on a thread of their own: vkFreeMemory of an import unmaps it from the GPU's
+ * address space (the driver's FreeGpuVirtualAddress / DestroyAllocation2), about a millisecond each, and a
+ * change of area frees dozens in one frame: 17% of the render thread's samples in slow frames. The GPU is done
+ * with them by then (reap) and nothing else names them */
+static HostBuffer **junk;
+static int njunk, capjunk;
+static SRWLOCK junk_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE junk_cv = CONDITION_VARIABLE_INIT;
+
+static DWORD WINAPI junk_loop(void *p) {
+    (void)p;
+    for (;;) {
+        AcquireSRWLockExclusive(&junk_lock);
+        while (!njunk) SleepConditionVariableSRW(&junk_cv, &junk_lock, INFINITE, 0);
+        HostBuffer *hb = junk[--njunk];
+        ReleaseSRWLockExclusive(&junk_lock);
+        vk_release_host(hb);
+        free(hb);
+    }
+}
+
+static void junk_add(HostBuffer *hb) {
+    static bool started;
+    if (!started) {
+        started = true;
+        HANDLE t = CreateThread(NULL, 0, junk_loop, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    AcquireSRWLockExclusive(&junk_lock);
+    if (njunk == capjunk) junk = realloc(junk, (capjunk = capjunk * 2 + 64) * sizeof *junk);
+    junk[njunk++] = hb;
+    ReleaseSRWLockExclusive(&junk_lock);
+    WakeConditionVariable(&junk_cv);
+}
+
 void reap(void) {
     u64 done = gpu_completed();
     int j = 0;
@@ -61,7 +96,7 @@ void reap(void) {
         Dead *d = &dead[i];
         if (d->value > done) { dead[j++] = *d; continue; }
         switch (d->kind) {
-        case DEAD_HOSTBUF: vk_release_host(d->a); free(d->a); break;
+        case DEAD_HOSTBUF: junk_add(d->a); break;
         case DEAD_IMAGE: vkDestroyImage(vk.dev, d->a, NULL); vk_free(&d->alloc); break;
         case DEAD_VIEW: vkDestroyImageView(vk.dev, d->a, NULL); break;
         case DEAD_MIRROR: mirror_free(d->a); break;

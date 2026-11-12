@@ -18,6 +18,7 @@
 #include "vk.h"
 #include <stdlib.h>
 #include <windows.h>
+#include <immintrin.h>
 
 #define A(i) (c->x[i])
 #define F32(i) (((v4f32)c->v[i])[0])
@@ -1490,12 +1491,14 @@ static void queue_acquire(Ctx *c) {
  * (NX_DEFAULT_FRAMERATE), else the game's own */
 static volatile LONG framerate = -2;    /* -2 not read yet */
 static double frame_ns_smooth;          /* measured frame time, smoothed */
+static bool present_hold = true;        /* NX_PRESENT_HOLD=0: present as soon as a frame is done (hold_present) */
 
 s32 nx_framerate(void) {
     if (framerate == -2) {
         const char *e = getenv("NX_FRAMERATE");
         LONG r = e ? atoi(e) : getenv("NX_NOPACE") && atoi(getenv("NX_NOPACE")) ? FRAMERATE_UNCAPPED : NX_DEFAULT_FRAMERATE;
         InterlockedCompareExchange(&framerate, r, -2);
+        if ((e = getenv("NX_PRESENT_HOLD")) != NULL) present_hold = atoi(e) != 0;
         vk_set_unthrottled(framerate == FRAMERATE_UNCAPPED || framerate > 60);
     }
     return framerate;
@@ -1529,22 +1532,48 @@ double nx_frame_ns(void) {
     return ns < 1e9 / 15 ? ns : 1e9 / 15;   /* below 15 fps the game slows down rather than taking huge steps */
 }
 
+/* A frame starts on the pace's tick and is presented when its work is done, so a frame that takes 3 ms longer
+ * than the one before is shown 3 ms late: the picture judders while the pace holds (7% of frames at 2x were 2-8 ms
+ * late that way). So a frame done early waits until `hold` after its tick: the longest recent work plus a margin,
+ * coming down slowly, at most 3/4 of the period. Costs that much input latency over presenting at once. Called
+ * without an emulated core; `start` is the frame's tick, `period` the pace's, in counter ticks */
+static void hold_present(s64 start, s64 period, s64 freq) {
+    static double hold;                 /* ticks after the frame's start */
+    static HANDLE timer;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double work = (double)(now.QuadPart - start), cap = (double)period * 0.75;
+    double want = work + (double)freq * 0.0003;
+    if (work < 0 || want > cap) return; /* a slow frame: shown at once, and not what the others wait for */
+    if (want > hold) { hold = want; return; }
+    hold -= (hold - want) * 0.02;
+    s64 until = start + (s64)hold, spin = freq / 4000;
+    if (until - now.QuadPart > spin) {
+        if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -((until - now.QuadPart - spin) * 10000000 / freq);
+        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
+    }
+    do { _mm_pause(); QueryPerformanceCounter(&now); } while (now.QuadPart < until);
+}
+
 /* present, then keep the pace: the display's (60 Hz / the game's interval) or the frame rate set */
 static void queue_present(Ctx *c) {
     Window *w = obj_get(A(1), T_WINDOW);
     if (!w) return;
     u32 index = (u32)A(2);
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    s32 rate = nx_framerate();
+    s64 period = rate > 0 ? f.QuadPart / rate : f.QuadPart / 60 * (w->interval ? w->interval : 1);
     if (index < w->count) {
         core_leave();                           /* as for queue_submit */
+        if (w->last && rate != FRAMERATE_UNCAPPED && present_hold) hold_present(w->last, period, f.QuadPart);
         w->presented[index] = gpu_present(A(0), w, index);
         core_enter();
     }
-    LARGE_INTEGER f, now;
-    QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&now);
-    s32 rate = nx_framerate();
     game_step_ns = 1e9 / 60 * (w->interval ? w->interval : 1);
-    s64 period = rate > 0 ? f.QuadPart / rate : f.QuadPart / 60 * (w->interval ? w->interval : 1);
     if (w->last && rate != FRAMERATE_UNCAPPED) {
         s64 due = w->last + period - now.QuadPart;
         if (due > 0) thread_sleep(due * 1000000000 / f.QuadPart);
