@@ -843,6 +843,7 @@ static void env_init(void) {
     env.pool_mirror = (e = getenv("NX_POOL_MIRROR")) ? atoi(e) != 0 : slow;
     hlog(1, "gpu: pool mirrors %s%s", env.pool_mirror ? "on" : "off", e ? " (NX_POOL_MIRROR)" : "");
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
+    env.shader_preload = !(e = getenv("NX_SHADER_PRELOAD")) || atoi(e);
     /* draws skip shaders still being translated instead of waiting (see shader_load): on in netplay builds, where a
      * stalled game drops out of local play; off elsewhere, since a skipped draw into a texture drawn only once stays
      * missing */

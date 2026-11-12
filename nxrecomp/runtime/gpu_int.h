@@ -16,7 +16,7 @@ extern bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 struct GpuEnv {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, pool_mirror, feedback_log, timeline,
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, pool_mirror, feedback_log, timeline,
         view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;

@@ -143,6 +143,7 @@ typedef struct ShaderCode {
     bool tex_dyn;                       /* ... or it reads c[2] at offsets computed at run time (any slot) */
     bool missing;                       /* gpu.c: no SPIR-V, and none coming */
     u64 jit_seq;                        /* gpu.c: its translation request (gpu_shader_created), or 0 */
+    volatile long load_state;           /* gpu.c: 0 not loaded, 1 someone is loading it (shader_module_w), 2 done */
 } ShaderCode;
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
 enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8, SHC_TEX_NON2D = 16 };

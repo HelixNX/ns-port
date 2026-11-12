@@ -312,9 +312,52 @@ static u64 jit_request_variant(u64 hash, u32 mask) {
 
 static u64 jit_request(u64 hash) { return jit_request_variant(hash, 0); }
 
-/* nvn.c: the game made a shader (its code is dumped): translate it now if it has no SPIR-V */
+static VkShaderModule shader_load(ShaderCode *s, bool wait);
+
+/* Shaders loaded ahead of their first draw: reading a translation and making its module took 10-35 ms on the
+ * render thread in the frame that first drew with it (a 58 ms frame for three in the field). The game makes its
+ * shader objects while it loads, well before it draws with them, so a thread loads each one then
+ * (NX_SHADER_PRELOAD=0: at the first draw, as before). load_state says who loads a shader: this thread or the
+ * draw that got there first */
+static struct { SRWLOCK lock; CONDITION_VARIABLE cv; ShaderCode **q; u32 n, cap, head; bool started; } preload = {.lock = SRWLOCK_INIT};
+static volatile LONG preloaded;
+
+static unsigned __stdcall preload_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        AcquireSRWLockExclusive(&preload.lock);
+        while (preload.head == preload.n) SleepConditionVariableSRW(&preload.cv, &preload.lock, INFINITE, 0);
+        ShaderCode *s = preload.q[preload.head++];
+        if (preload.head == preload.n) preload.head = preload.n = 0;
+        ReleaseSRWLockExclusive(&preload.lock);
+        if (InterlockedCompareExchange(&s->load_state, 1, 0) != 0) continue;    /* a draw has it */
+        shader_load(s, true);
+        InterlockedExchange(&s->load_state, 2);
+        if (InterlockedIncrement(&preloaded) % 500 == 0) hlog(1, "gpu: %ld shaders loaded ahead of their draws", preloaded);
+    }
+}
+
+static void preload_request(ShaderCode *s) {
+    if (!env.shader_preload) return;
+    AcquireSRWLockExclusive(&preload.lock);
+    if (!preload.started) {
+        preload.started = true;
+        InitializeConditionVariable(&preload.cv);
+        _beginthreadex(NULL, 0, preload_thread, NULL, 0, NULL);
+    }
+    if (preload.n == preload.cap) {
+        preload.cap = preload.cap * 2 + 256;
+        preload.q = realloc(preload.q, preload.cap * sizeof *preload.q);
+    }
+    preload.q[preload.n++] = s;
+    ReleaseSRWLockExclusive(&preload.lock);
+    WakeConditionVariable(&preload.cv);
+}
+
+/* nvn.c: the game made a shader (its code is dumped): translate it now if it has no SPIR-V, else load it */
 void gpu_shader_created(ShaderCode *s) {
     if (!spv_exists(s->hash)) s->jit_seq = jit_request(s->hash);
+    else preload_request(s);
 }
 
 static bool jit_pending(u64 seq) { return seq && __atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq; }
@@ -404,7 +447,14 @@ VkShaderModule shader_module_w(ShaderCode *s, bool wait) {
     if (s->missing) return NULL;
     if (!wait && jit_pending(s->jit_seq)) return NULL;     /* cheap: no file lookup while it is being translated */
     double t0 = ms_now();
-    VkShaderModule m = shader_load(s, wait);
+    VkShaderModule m;
+    if (InterlockedCompareExchange(&s->load_state, 1, 0) == 1) {    /* the preload thread is on it: nearly done */
+        while (s->load_state == 1) Sleep(0);
+        m = s->module;
+    } else {                            /* ours (or loaded and failed before: as it was) */
+        m = shader_load(s, wait);
+        InterlockedExchange(&s->load_state, m || s->missing ? 2 : 0);
+    }
     hf.shader += ms_now() - t0;
     hf.nshader++;
     return m;
