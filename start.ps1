@@ -3,7 +3,7 @@
 # Plain $args (no param block): options for the projects' own scripts (-NoBuild, -Log 2, ...) pass through as typed.
 $What = if ($args.Count) { [string]$args[0] } else { '' }
 $Target = if ($args.Count -gt 1) { [string]$args[1] } else { '' }
-$Rest = if ($args.Count -gt 2) { [string[]]$args[2..($args.Count - 1)] } else { @() }
+$Rest = @(if ($args.Count -gt 2) { [string[]]$args[2..($args.Count - 1)] })   # @(): one argument stays an array
 $ErrorActionPreference = 'Stop'
 $ws = $PSScriptRoot
 

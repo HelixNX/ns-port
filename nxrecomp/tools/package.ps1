@@ -3,8 +3,9 @@
 # beforehand in shaders.pak, or the translator: an embeddable Python, translate.py, glslang) and the room server.
 # Usage: package.ps1 -Out <dir> [-ShaderPack <shaders.pak> | -PythonZip <python-3.x-embed-amd64.zip>] [-NoBuild]
 #                    [-Mods <name>,<name> | -Mods all]
-#   -Mods        mods to include (optional DLLs from <build>\cmake\mods, e.g. violet_raids), copied into mods\; their
-#                data files (game-derived) are not: players put them in %LOCALAPPDATA%\<title>\mods\
+#   -Mods        mods to include (optional DLLs from <build>\cmake\mods, e.g. violet_raids), copied into mods\ with
+#                their own data folder (mods\<name>\, if any); their game-derived data files are not: players put
+#                them in %LOCALAPPDATA%\<title>\mods\
 #   (neither)    the default: every shader in the game's shader folder (<build>\shaders) translated now
 #                (translate.py --spv) and packed (nxshpack: tools/shader/pack.c) into <build>\shaders.pak, which goes
 #                next to the exe; no translator in the package. Built from the game's files, as the exe's lifted code is
@@ -103,6 +104,7 @@ if ($Mods.Count) {
         }
         if (-not (Test-Path "$build\cmake\mods\$m.dll")) { throw "no mod $m (<build>\cmake\mods\$m.dll)" }
         Copy-Item "$build\cmake\mods\$m.dll" "$Out\mods" -Force
+        if (Test-Path "$build\cmake\mods\$m") { Copy-Item -Recurse "$build\cmake\mods\$m" "$Out\mods" -Force }   # its own data
     }
 }
 
