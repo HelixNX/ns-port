@@ -236,6 +236,36 @@ static KThread *next_for_core(int c) {
     return best;
 }
 
+/* Migration to an idle core, as the console's scheduler does it: a running thread that may also use a core that
+ * is idle moves there when a thread is ready behind it on its own core (KScheduler: the suggested thread for an
+ * idle core may be another core's running one if that core has a second thread queued). Without it a thread free
+ * to run anywhere kept the core of pinned threads of its own priority while another core sat idle: Violet's
+ * autosave thread (priority 44, cores 0-2) held core 1 for ~65 ms with job worker 5a ready behind it and main
+ * waiting for that worker on an idle core 0, a ~100 ms frame at every autosave. NX_CORE_MIGRATE=0: off */
+static bool core_migrate = true;
+static u64 core_migrations;              /* under klock */
+__attribute__((constructor)) static void core_migrate_init(void) {
+    const char *e = getenv("NX_CORE_MIGRATE");
+    if (e) core_migrate = atoi(e) != 0;
+}
+
+/* the owner of `from` (running) now owns the idle core `to` */
+static void core_move(int from, int to) {
+    KThread *o = core_owner[from];
+    core_owner[to] = o;
+    core_owner[from] = NULL;
+    o->cur_core = to;
+    core_migrations++;
+}
+
+/* an idle core the owner of c may use, or -1 */
+static int idle_core_for_owner(int c) {
+    KThread *o = core_owner[c];
+    for (int i = 0; o && i < NCORES; i++)
+        if (i != c && !core_owner[i] && (o->affinity >> i & 1)) return i;
+    return -1;
+}
+
 static void core_release(KThread *t) {
     int c = t->cur_core;
     if (c < 0) return;
@@ -244,7 +274,16 @@ static void core_release(KThread *t) {
     hold_end(t);
     core_owner[c] = NULL;
     KThread *n = next_for_core(c);
-    if (n) core_assign(n, c);
+    if (n) { core_assign(n, c); return; }
+    /* c is idle: a core whose owner may run here and has a thread ready behind it gives that owner up */
+    for (int i = 0; core_migrate && i < NCORES; i++) {
+        KThread *o = core_owner[i];
+        if (i == c || !o || !(o->affinity >> c & 1)) continue;
+        if (!(n = next_for_core(i))) continue;
+        core_move(i, c);
+        core_assign(n, i);
+        return;
+    }
 }
 
 /* stop o where it is if it is in lifted code */
@@ -270,6 +309,13 @@ static int core_try_place(KThread *t) {
             core_assign(t, c);
             return 1;
         }
+    for (int c = 0; core_migrate && c < NCORES; c++) {      /* an owner that can move to an idle core does */
+        int to = (t->affinity >> c & 1) ? idle_core_for_owner(c) : -1;
+        if (to < 0) continue;
+        core_move(c, to);
+        core_assign(t, c);
+        return 1;
+    }
     int v = -1;
     for (int c = 0; c < NCORES; c++)
         if ((t->affinity >> c & 1) && core_owner[c]->prio > t->prio && (v < 0 || core_owner[c]->prio > core_owner[v]->prio))
@@ -1012,6 +1058,9 @@ void kernel_report_cpu(u64 frames) {
         n += snprintf(line + n, sizeof line - n, "cpu: %.1f fps; threads", (double)(frames - last_frames) / wall);
         for (int i = 0; i < nb && n < (int)sizeof line - 40; i++)
             n += snprintf(line + n, sizeof line - n, " %s %.0f%%", busy[i].name, busy[i].pct);
+        static u64 last_migr;
+        snprintf(line + n, sizeof line - n, "; %llu moves to an idle core", core_migrations - last_migr);
+        last_migr = core_migrations;
         hlog(0, "%s", line);
         for (int i = 0; i < nb; i++)
             if (busy[i].ready >= 1 || busy[i].sleep >= 1)
