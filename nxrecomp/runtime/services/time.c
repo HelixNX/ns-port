@@ -2,13 +2,15 @@
  * one rule: the host's current UTC offset (the console's tz database lives in a system archive we don't have). */
 #include "../ipc.h"
 #include <windows.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
 static const u8 clock_source_id[16] = {0x6d, 0x6b, 0x38, 0x72, 0x65, 0x63, 0x6f, 0x6d, 0x70, 0x20, 0x73, 0x74, 0x65, 0x61, 0x64, 0x79};
 static s64 boot_posix;                           /* host time at start-up */
 static s32 utc_offset;                           /* seconds east of UTC */
-static s64 time_shift;                           /* NX_TIME=<posix seconds>: the clocks start there (benchmarks) */
+static s64 time_shift;                           /* the clocks start at NX_TIME=<posix seconds> (benchmarks), else at */
+                                                 /* clock.txt's in the cache folder (a mod's "start the clock at") */
 
 static s64 now_posix(void) { return (s64)time(NULL) + time_shift; }
 static s64 steady_seconds(void) { return (s64)(host_cntpct() / 19200000u); }
@@ -191,6 +193,16 @@ static SvcObj *open_time(const char *name) { return svcobj_new(&iface_time, NULL
 
 void time_register(void) {
     const char *e = getenv("NX_TIME");
+    char buf[32] = "", path[1100];
+    if (!e) {                                    /* clock.txt: Unix seconds first; the rest of the file is ignored */
+        snprintf(path, sizeof path, "%s\\clock.txt", nx_cache_dir());
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(buf, sizeof buf, f) && strtoll(buf, NULL, 10) > 0) e = buf;
+            fclose(f);
+        }
+        if (e) hlog(0, "time: the clocks start at %lld (%s)", strtoll(e, NULL, 10), path);
+    }
     if (e) time_shift = strtoll(e, NULL, 10) - (s64)time(NULL);
     boot_posix = now_posix();
     TIME_ZONE_INFORMATION tz;
