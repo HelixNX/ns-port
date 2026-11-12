@@ -58,6 +58,13 @@ void mods_window_toggle(uint32_t i) {
 }
 static void hotkey_toggle(void *ud) { mods_window_toggle((u32)(uintptr_t)ud); }
 
+/* mods' settings: settings.ini keys "mod.<key>" (options.c) */
+static const char *setting_key(const char *key, char *buf, size_t n) { snprintf(buf, n, "mod.%s", key); return buf; }
+static const char *setting_get(const char *key, const char *def) { char k[128]; return options_get(setting_key(key, k, sizeof k), def); }
+static void setting_set(const char *key, const char *value) { char k[128]; options_set(setting_key(key, k, sizeof k), value); }
+static int setting_get_int(const char *key, int def) { char k[128]; return options_get_int(setting_key(key, k, sizeof k), def); }
+static void setting_set_int(const char *key, int value) { char k[128]; options_set_int(setting_key(key, k, sizeof k), value); }
+
 static bool add_window(const char *title, const char *default_key, bool (*is_open)(void), void (*toggle)(void)) {
     if (nwindows == MAX_WINDOWS || !title || !is_open || !toggle) return false;
     ModWindow *w = &windows[nwindows];
@@ -102,6 +109,10 @@ void mods_load(SDL_Window *window) {
                        run_script};
     ui_imgui_host(&host.imgui_version, &host.imgui_context, &host.imgui_alloc, &host.imgui_free, &host.imgui_alloc_ud);
     host.add_window = add_window;
+    host.setting_get = setting_get;
+    host.setting_set = setting_set;
+    host.setting_get_int = setting_get_int;
+    host.setting_set_int = setting_set_int;
     char dir[MAX_PATH], pat[MAX_PATH + 16];
     GetModuleFileNameA(NULL, dir, MAX_PATH);
     char *s = strrchr(dir, '\\');

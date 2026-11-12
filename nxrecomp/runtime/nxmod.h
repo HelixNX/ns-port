@@ -15,6 +15,7 @@
  * (modkit::init does that; the mod is built against the same ImGui, host->imgui_version). The runtime frees the
  * mouse when one of a mod's windows opens and keeps the game's keyboard while ImGui has keyboard focus.
  * Version 3 mods (their own ImGui, draw() into the swapchain image) are not loaded any more.
+ * Version 5: host->setting_get / setting_set keep a mod's values in the runtime's settings.ini.
  *
  * Threads: event() runs on the window thread (SDL's main thread), ui() and draw() on the render thread inside the
  * present; a mod synchronises its own state between them. */
@@ -29,7 +30,7 @@
 extern "C" {
 #endif
 
-#define NXMOD_VERSION 4
+#define NXMOD_VERSION 5
 #define NXMOD_HEAP_BASE 0x2000000000ull     /* hos.h HEAP_BASE: svcSetHeapSize's heap */
 #define NXMOD_HEAP_MAX  0x0180000000ull     /* the most it can span (hos.h HEAP_MAX) */
 #define NXMOD_ALIAS_BASE 0x1000000000ull    /* hos.h ALIAS_BASE: svcMapPhysicalMemory's region, where games with */
@@ -67,6 +68,13 @@ typedef struct NxModHost {
      * (default_key: an SDL key name such as "F6", or NULL for none; the player can rebind it). Call from
      * nx_mod_init. false: too many windows */
     bool (*add_window)(const char *title, const char *default_key, bool (*is_open)(void), void (*toggle)(void));
+    /* version 5: values kept between sessions (settings.ini, as "mod.<key>": start the key with the mod's name,
+     * "mons.all_shiny"). Any thread; a set is written to the file within a frame or two. setting_get's text is
+     * the runtime's: copy it before the same key is set again */
+    const char *(*setting_get)(const char *key, const char *def);
+    void (*setting_set)(const char *key, const char *value);
+    int (*setting_get_int)(const char *key, int def);
+    void (*setting_set_int)(const char *key, int value);
 } NxModHost;
 
 /* draw()'s frame: the swapchain image in COLOR_ATTACHMENT_OPTIMAL (left so), `cmd` recording. Submissions of the
