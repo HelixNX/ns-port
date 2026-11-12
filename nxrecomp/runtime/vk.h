@@ -127,7 +127,7 @@ VkResult vk_submit(const VkSubmitInfo2 *si, VkFence fence);
 u64 vk_presents_dropped(void);         /* frames not shown, uncapped (the display was busy with the last one) */
 /* where vk_present's time went (ms, added up; gpu.c reads and clears it for its slow-frame lines): sw_lock, the
  * last frame's vkQueuePresentKHR done here, the present fence, vkAcquireNextImageKHR, the copy's submit */
-typedef struct { double lock, present, fence, acquire, submit; } VkPresentTimes;
+typedef struct { double lock, present, fence, acquire, submit, record, ui, mods; } VkPresentTimes;
 extern VkPresentTimes vk_present_times;
 
 #endif

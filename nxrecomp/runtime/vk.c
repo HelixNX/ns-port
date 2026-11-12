@@ -1233,6 +1233,7 @@ static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, 
     vk_present_times.acquire += pt_ms() - t1;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { InterlockedExchange(&resized, 1); return; }
     if (r < 0) fatal("vkAcquireNextImageKHR: %d", r);
+    double t_rec = pt_ms(), t_ui = 0;   /* recording: all of it, the menu and mods' windows, mods' raw draws */
     VKCHECK(vkResetFences(vk.dev, 1, &sw.fence[f]));
     VKCHECK(vkResetCommandPool(vk.dev, sw.pool[f], 0));
     VkCommandBuffer cmd = sw.cmd[f];
@@ -1283,8 +1284,13 @@ static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, 
     }
     if (sw.views[idx] && (draw_ui || draw_mods)) {      /* the menu and mods' windows (ui.c), then mods' raw draws */
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        double u0 = pt_ms();
         if (draw_ui) ui_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
+        double u1 = pt_ms();
         if (draw_mods) mods_draw(cmd, dst, sw.views[idx], sw.format, sw.extent.width, sw.extent.height, sw.count);
+        vk_present_times.ui += u1 - u0;
+        vk_present_times.mods += pt_ms() - u1;
+        t_ui = pt_ms() - u0;
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -1301,6 +1307,7 @@ static void present_locked(VkImage src, VkFormat src_fmt, u32 src_w, u32 src_h, 
                         .pWaitSemaphoreInfos = waits, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     double t2 = pt_ms();
+    vk_present_times.record += t2 - t_rec - t_ui;
     VKCHECK(vk_submit(&si, sw.fence[f]));
     vk_present_times.submit += pt_ms() - t2;
     pq.idx[pq.head++ % MAX_IMAGES] = idx;

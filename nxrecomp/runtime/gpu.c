@@ -788,8 +788,9 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
         const VkPresentTimes *pt = &vk_present_times;
         hlog(0, "gpu:   presenting: gpu_cs wait %.2f, texture check %.2f, before the flush %.2f, flush %.2f, "
                 "before vk_present %.2f, vk_present %.2f (sw_lock %.2f, last present %.2f, fence %.2f, acquire %.2f, "
-                "submit %.2f) ms", t_cs - t_present0, t_refresh - t_cs, t_flush0 - t_refresh, t_flush - t_flush0,
-             t_vk - t_flush, t_end - t_vk, pt->lock, pt->present, pt->fence, pt->acquire, pt->submit);
+                "submit %.2f, recording %.2f, menu and mod windows %.2f, mods' draws %.2f) ms", t_cs - t_present0, t_refresh - t_cs, t_flush0 - t_refresh, t_flush - t_flush0,
+             t_vk - t_flush, t_end - t_vk, pt->lock, pt->present, pt->fence, pt->acquire, pt->submit,
+             pt->record, pt->ui, pt->mods);
     }
     memset(&vk_present_times, 0, sizeof vk_present_times);
     if (env.hitch_ms > 0) {
