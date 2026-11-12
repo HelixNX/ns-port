@@ -20,6 +20,13 @@ void state_reset(State *s) {
     s->stencil_value_mask[0] = s->stencil_value_mask[1] = 0xff;
     s->stencil_mask[0] = s->stencil_mask[1] = 0xff;
 }
+/* the captures since the last barrier one by one (st.xfb_dirty is their hull per buffer, the quick test): Violet's
+ * skinning draws capture into scattered places of one pool, and the hull made each look like it overwrote the
+ * others (26 passes a frame ended for that). Full: the hull decides */
+#define XFB_RANGES 1024
+static u64 xfb_ranges[XFB_RANGES][2];
+static u32 nxfb_ranges;
+
 PendingWrite pending[1024];
 u32 npending;
 
@@ -50,6 +57,7 @@ void end_rendering_at(const char *at) {
     barrier_at(GPU_AT, full ? VK_ACCESS_2_MEMORY_WRITE_BIT : ACCESS_NO_ATTACHMENTS);
     st.xfb_captured = false;
     memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
+    nxfb_ranges = 0;
 }
 
 /* NX_WATCH=<hex address>: log every GPU write to that texture storage */
@@ -704,6 +712,11 @@ static bool quad_indices(const CmdDraw *d, bool indexed, VkBuffer *buf, u64 *off
  * begin and end around each draw, since pipelines cannot change while one is active; each buffer continues from the
  * bytes captured so far, counted here from the draw (indirect draws are not counted). */
 static bool xfb_capturing;
+static u64 xfb_hazards[8];
+static const char *const xfb_hazard_names[8];
+static bool xfb_stored;                 /* the draw's shader stores its captures itself (no transform feedback span) */
+u64 gpu_device_addr(u64 addr);
+static u64 xfb_prev_end[4];             /* NX_GPU_PROF: where the last capture ended in each buffer */
 
 static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
     const ShaderCode *vs = st.program ? st.program->stage[ST_VERTEX] : NULL;
@@ -711,6 +724,13 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
     VkBuffer bufs[4];
     VkDeviceSize offs[4], sizes[4];
     u32 n = 0, used = 4;
+    /* A point list drawn without indices captures vertex k at k * stride: the shader stores that itself where the
+     * runtime gives it the addresses (translate.py PC_DECL_XFB), and the draw needs no transform feedback span.
+     * Each span was a stall on AMD: Violet's 140-170 skinning draws a frame took 6.6 us each, 1 ms of GPU time
+     * at any render scale. NX_XFB_STORE=0: always transform feedback */
+    const CmdDraw *pd = op == OP_DRAW_ARRAYS ? payload : NULL;
+    bool store = env.xfb_store && pd && pd->mode == 0 && pd->instances <= 1;
+    u32 pcx[PC_XFB_SIZE / 4] = {0};
     for (u32 b = 0; b < 4; b++) {
         u64 off;
         bufs[b] = NULL, offs[b] = 0, sizes[b] = 0;
@@ -720,15 +740,53 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
         u64 w = st.xfb_written[b] < st.xfb[b].size ? st.xfb_written[b] : st.xfb[b].size;
         offs[b] = off + w;
         sizes[b] = st.xfb[b].size - w;
+        u64 da = store ? gpu_device_addr(st.xfb[b].addr) : 0;
+        if (!da || (u64)pd->count * vs->xfb_stride[b] > sizes[b]) store = false;     /* (a capture stops at the end) */
+        pcx[1 + 2 * b] = (u32)(da + w);
+        pcx[2 + 2 * b] = (u32)((da + w) >> 32);
         n = b + 1;
         if (used == 4) used = b;
     }
     if (!n) return;
     for (u32 b = 0; b < n; b++)          /* a buffer the shader skips: any valid one, with nothing to write */
         if (!bufs[b]) bufs[b] = bufs[used], offs[b] = offs[used], sizes[b] = 0;
-    vkCmdBindTransformFeedbackBuffersEXT(c, 0, n, bufs, offs, sizes);
-    vkCmdBeginTransformFeedbackEXT(c, 0, 0, NULL, NULL);
-    xfb_capturing = true;
+    if (prof_on > 0) {                  /* how the game lays its captures out (could runs share one Begin / End?) */
+        static VkBuffer pb[4]; static u64 paddr[4]; static const ShaderCode *pvs; static u32 pn;
+        static u64 cnt, same_buf, contig, same_bind, same_vs, last_frame;
+        bool sb = n == pn, ct = n == pn, bd = n == pn;
+        for (u32 b = 0; b < n; b++) {
+            if (bufs[b] != pb[b]) sb = ct = false;
+            if (vs->xfb_stride[b] && offs[b] != xfb_prev_end[b]) ct = false;
+            if (st.xfb[b].addr != paddr[b]) bd = false;
+        }
+        static u64 stored;
+        stored += store;
+        cnt++; same_buf += sb; contig += ct; same_bind += bd; same_vs += vs == pvs;
+        for (u32 b = 0; b < 4; b++) pb[b] = bufs[b], paddr[b] = st.xfb[b].addr;
+        pvs = vs; pn = n;
+        if (frame_no >= last_frame + 600) {
+            hlog(0, "gpu prof: xfb draws %.1f/frame: same VkBuffers as the one before %.1f, same binding %.1f, starting "
+                    "where it ended %.1f, same vertex shader %.1f, stored by the shader %.1f; buffers %u, first stride %u, size %llu",
+                 cnt / 600.0, same_buf / 600.0, same_bind / 600.0, contig / 600.0, same_vs / 600.0, stored / 600.0, n,
+                 vs->xfb_stride[used], (unsigned long long)st.xfb[used].size);
+            char hz[200];
+            int o = 0;
+            hz[0] = 0;
+            for (int k = 1; k < 8; k++)
+                if (xfb_hazards[k]) o += snprintf(hz + o, sizeof hz - o, " %s %.1f", xfb_hazard_names[k], xfb_hazards[k] / 600.0);
+            hlog(0, "gpu prof: passes ended before a draw that reads captures, per frame:%s", o ? hz : " none");
+            memset(xfb_hazards, 0, sizeof xfb_hazards);
+            cnt = same_buf = contig = same_bind = same_vs = stored = 0; last_frame = frame_no;
+        }
+    }
+    if (!store) memset(pcx, 0, sizeof pcx);
+    vkCmdPushConstants(c, layout_gfx, PC_STAGES, PC_SIZE, PC_XFB_SIZE, pcx);
+    if (store) xfb_stored = true;
+    else {
+        vkCmdBindTransformFeedbackBuffersEXT(c, 0, n, bufs, offs, sizes);
+        vkCmdBeginTransformFeedbackEXT(c, 0, 0, NULL, NULL);
+        xfb_capturing = true;
+    }
     /* vertices captured: whole primitives, as lists */
     u64 v = 0;
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
@@ -750,10 +808,13 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
     for (u32 b = 0; b < 4; b++) {
         if (!vs->xfb_stride[b]) continue;
         u64 lo = st.xfb[b].addr + st.xfb_written[b], hi = v ? lo + v * vs->xfb_stride[b] : st.xfb[b].addr + st.xfb[b].size;
+        if (nxfb_ranges < XFB_RANGES) xfb_ranges[nxfb_ranges][0] = lo, xfb_ranges[nxfb_ranges][1] = hi;
+        nxfb_ranges++;                  /* (past XFB_RANGES: counted, not kept) */
         u64 *d = st.xfb_dirty[b];
         if (d[0] == d[1]) d[0] = lo, d[1] = hi;
         else d[0] = lo < d[0] ? lo : d[0], d[1] = hi > d[1] ? hi : d[1];
         st.xfb_written[b] += v * vs->xfb_stride[b];
+        xfb_prev_end[b] = offs[b] + v * vs->xfb_stride[b];
     }
 }
 
@@ -761,36 +822,57 @@ static bool xfb_dirty_overlaps(u64 addr, u64 size) {
     if (!addr) return false;
     if (!size) size = 1;
     for (u32 b = 0; b < 4; b++)
-        if (st.xfb_dirty[b][0] < st.xfb_dirty[b][1] && addr < st.xfb_dirty[b][1] && st.xfb_dirty[b][0] < addr + size)
-            return true;
+        if (st.xfb_dirty[b][0] < st.xfb_dirty[b][1] && addr < st.xfb_dirty[b][1] && st.xfb_dirty[b][0] < addr + size) {
+            if (nxfb_ranges > XFB_RANGES) return true;
+            for (u32 i = 0; i < nxfb_ranges; i++)
+                if (addr < xfb_ranges[i][1] && xfb_ranges[i][0] < addr + size) return true;
+            return false;
+        }
     return false;
 }
 
 /* does this draw read (or capture over) what earlier draws captured since the last barrier? Captures go to
  * successive offsets, so a run of capturing draws needs no barrier between them, nor does a draw that reads none
  * of the captured bytes */
-static bool xfb_hazard(u32 op, const void *payload) {
+static u64 xfb_hazards[8];              /* NX_GPU_PROF: by what the draw would read (xfb_hazard_names) */
+static const char *const xfb_hazard_names[8] = {"", "vertex buffer", "uniform buffer", "storage buffer", "indices",
+                                                "indirect draw", "other draw kind", "captures over them"};
+
+/* 0, or which of xfb_hazard_names. Only what the draw can read: the vertex streams its attributes name (a stream
+ * left bound by an earlier draw is not read) and the buffers of the stages its program has */
+static int xfb_hazard_kind(u32 op, const void *payload) {
+    u32 streams = 0;
+    for (u32 i = 0; i < st.nattribs && i < 32; i++)
+        if (VA_FORMAT(st.attribs[i]) && VA_STREAM(st.attribs[i]) < 31) streams |= 1u << VA_STREAM(st.attribs[i]);
     for (u32 i = 0; i < 32; i++)
-        if (xfb_dirty_overlaps(st.vbuf[i].addr, st.vbuf[i].size ? st.vbuf[i].size : ~0ull - st.vbuf[i].addr)) return true;
+        if ((streams >> i & 1) &&
+            xfb_dirty_overlaps(st.vbuf[i].addr, st.vbuf[i].size ? st.vbuf[i].size : ~0ull - st.vbuf[i].addr)) return 1;
     for (u32 stage = 0; stage < ST_COUNT; stage++) {
-        for (u32 i = 0; i < 18; i++) if (xfb_dirty_overlaps(st.ubo[stage][i].addr, st.ubo[stage][i].size)) return true;
-        for (u32 i = 0; i < 16; i++) if (xfb_dirty_overlaps(st.ssbo[stage][i].addr, st.ssbo[stage][i].size)) return true;
+        if (stage != ST_COMPUTE && st.program && !st.program->stage[stage]) continue;
+        for (u32 i = 0; i < 18; i++) if (xfb_dirty_overlaps(st.ubo[stage][i].addr, st.ubo[stage][i].size)) return 2;
+        for (u32 i = 0; i < 16; i++) if (xfb_dirty_overlaps(st.ssbo[stage][i].addr, st.ssbo[stage][i].size)) return 3;
     }
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
         const CmdDraw *d = payload;
-        if (d->index_type != ~0u && xfb_dirty_overlaps(d->index_addr, (u64)(d->first + d->count) * 4)) return true;
+        if (d->index_type != ~0u && xfb_dirty_overlaps(d->index_addr, (u64)(d->first + d->count) * 4)) return 4;
     } else if (op == OP_DRAW_ARRAYS_INDIRECT || op == OP_DRAW_ELEMENTS_INDIRECT) {
         const CmdDrawIndirect *d = payload;
         if (xfb_dirty_overlaps(d->index_addr, ~0ull >> 8) || xfb_dirty_overlaps(d->indirect, 64) ||
-            xfb_dirty_overlaps(d->count_addr, 4)) return true;
-    } else return true;
+            xfb_dirty_overlaps(d->count_addr, 4)) return 5;
+    } else return 6;
     const ShaderCode *vs = st.program ? st.program->stage[ST_VERTEX] : NULL;
     if (st.xfb_active && vs && vs->caps & SHC_XFB)
         for (u32 b = 0; b < 4; b++)
             if (vs->xfb_stride[b] && st.xfb_written[b] < st.xfb[b].size &&
                 xfb_dirty_overlaps(st.xfb[b].addr + st.xfb_written[b], st.xfb[b].size - st.xfb_written[b]))
-                return true;
-    return false;
+                return 7;
+    return 0;
+}
+
+static bool xfb_hazard(u32 op, const void *payload) {
+    int k = xfb_hazard_kind(op, payload);
+    xfb_hazards[k]++;
+    return k != 0;
 }
 
 static void draw_one(u32 op, const void *payload);
@@ -854,6 +936,7 @@ void draw(u32 op, const void *payload) {
         if (!in_pass) barrier();        /* end_rendering has made one */
         st.xfb_captured = false;
         memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
+    nxfb_ranges = 0;
     }
     draw_one(op, payload);
     label_draw_end();
@@ -861,6 +944,10 @@ void draw(u32 op, const void *payload) {
     if (xfb_capturing) {
         vkCmdEndTransformFeedbackEXT(cmd(), 0, 0, NULL, NULL);
         xfb_capturing = false;
+        st.xfb_captured = true;
+    }
+    if (xfb_stored) {
+        xfb_stored = false;
         st.xfb_captured = true;
     }
 }

@@ -45,7 +45,7 @@ void layouts_init(void) {
     tci.pBindings = &ib;
     VKCHECK(vkCreateDescriptorSetLayout(vk.dev, &tci, NULL, &set_img));
     VkDescriptorSetLayout sets[4] = {set_ubo, set_tex, set_smp, set_img};
-    VkPushConstantRange pr = {PC_STAGES, 0, PC_SIZE};
+    VkPushConstantRange pr = {PC_STAGES, 0, PC_SIZE + PC_XFB_SIZE};
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 4,
                                       .pSetLayouts = sets, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VKCHECK(vkCreatePipelineLayout(vk.dev, &lci, NULL, &layout_gfx));

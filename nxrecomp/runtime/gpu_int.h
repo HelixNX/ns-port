@@ -16,7 +16,7 @@ extern bool gpu_ready;
 
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 struct GpuEnv {
-    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, pool_mirror, feedback_log, timeline,
+    bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, xfb_store, pool_mirror, feedback_log, timeline,
         view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
@@ -318,6 +318,7 @@ extern VkPipelineLayout layout_gfx;
  * every stage (compute reads only the scale) */
 #define PC_STAGES (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT)
 #define PC_SIZE 20
+#define PC_XFB_SIZE 36                  /* after it: a pad word, then 4 capture addresses (translate.py PC_DECL_XFB) */
 extern VkDescriptorSet empty_tex, empty_smp, empty_img;
 extern u64 submit_serial;
 extern u32 window_origin, depth_mode;

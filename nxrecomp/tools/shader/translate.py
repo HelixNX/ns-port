@@ -55,6 +55,10 @@ INT_FLAG = '((%s >> 19) & 1u) != 0u'
 # its N x N block in fragment shaders), sizes divided by it; stores into scaled images outside fragment shaders
 # fill the whole block. Sampling with normalized coordinates needs nothing.
 PC_DECL = 'layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; uint scale; } pc;'
+# vertex shaders with transform feedback: where each capture buffer's bytes go when the runtime has the shader store
+# them itself (device addresses as two words, 0 = captured by transform feedback; runtime gpu_draw.c xfb_begin)
+PC_DECL_XFB = ('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; '
+               'uint scale; uint xfb_pad; uvec2 xfb_addr[4]; } pc;')
 
 
 class Unsupported(Exception):
@@ -1797,6 +1801,18 @@ class Translator:
                 for i, (slot, first, n, off) in enumerate(vs):
                     self.out_attrs.add(slot)
                     self.emit('xfb%d_%d = out_a%d.%s;' % (b, i, slot, 'xyzw'[first:first + n]))
+            # ... or stored by the shader: one transform feedback span per draw is a pipeline stall each on AMD
+            # (6.6 us a skinning draw, 140-170 a frame in Violet). Point lists drawn without indices only (the
+            # runtime decides): vertex k of the draw goes to k * stride
+            for b, stride, vs in self.xfb:
+                self.uses.add('global')
+                self.emit('if (pc.xfb_addr[%d] != uvec2(0u)) {' % b)
+                self.emit('    uint64_t xa_ = packUint2x32(pc.xfb_addr[%d]) + uint64_t(uint(gl_VertexIndex - gl_BaseVertex)) * uint64_t(%d);'
+                          % (b, stride))
+                for slot, first, n, off in vs:
+                    for k in range(n):
+                        self.emit('    GMem(xa_ + %d).v = floatBitsToUint(out_a%d.%s);' % (off + 4 * k, slot, 'xyzw'[first + k]))
+                self.emit('}')
             return
         if self.stage != 'fragment':
             return
@@ -2087,7 +2103,7 @@ class Translator:
             out += ['float fmz(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                     'float ffmz(float a, float b, float c) { return (a == 0.0 || b == 0.0) ? c : fma(a, b, c); }']
         if self.stage in ('vertex', 'fragment', 'compute') or 'rscale' in self.uses:
-            out.append(PC_DECL)
+            out.append(PC_DECL_XFB if self.xfb else PC_DECL)
         if 'rscale' in self.uses:
             frag = self.stage == 'fragment'
             out += ['int tsc(uint h) { return ((h >> 18) & 1u) != 0u ? max(int(pc.scale & 0xffu), 1) : 1; }',

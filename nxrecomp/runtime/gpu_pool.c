@@ -38,6 +38,12 @@ bool gpu_buffer(u64 addr, VkBuffer *buf, u64 *off) {
     return true;
 }
 
+/* a GPU address as the device address shaders reach it by (0: none) */
+u64 gpu_device_addr(u64 addr) {
+    PoolEnt *p = pool_find(addr);
+    return p && p->hb && p->hb->addr ? p->hb->addr + (addr - p->gpu) : 0;
+}
+
 /* a GPU address as a CPU pointer to guest memory, if it has one */
 u8 *gpu_cpu(u64 addr, u64 size) {
     PoolEnt *p = pool_find(addr);
