@@ -2108,11 +2108,16 @@ class Translator:
             frag = self.stage == 'fragment'
             out += ['int tsc(uint h) { return ((h >> 18) & 1u) != 0u ? max(int(pc.scale & 0xffu), 1) : 1; }',
                     'float rs_rt() { return float(max((pc.scale >> 8) & 0xffu, 1u)); }',
-                    ('ivec2 rs_sub() { int r = int((pc.scale >> 8) & 0xffu); '
-                     'return r > 1 ? ivec2(gl_FragCoord.xy) % r : ivec2(0); }') if frag else
-                    'ivec2 rs_sub() { return ivec2(0); }',
-                    'ivec2 rs_c2(uint h, ivec2 c) { int s = tsc(h); return s == 1 ? c : c * s + rs_sub(); }',
-                    'ivec3 rs_c3(uint h, ivec3 c) { int s = tsc(h); return s == 1 ? c : ivec3(c.xy * s + rs_sub(), c.z); }']
+                    # rs_s: where this fragment is inside its guest pixel, worked out once (main) and without an
+                    # integer modulo: the driver has no integer divide, and one per fetched coordinate was 28% of
+                    # the deferred lighting shader's instructions. The float quotient is never near a whole number
+                    # (a pixel centre over 2..4), so its floor is exact
+                    'ivec2 rs_s = ivec2(0);',
+                    ('void rs_init() { int r = int((pc.scale >> 8) & 0xffu); '
+                     'if (r > 1) rs_s = ivec2(gl_FragCoord.xy) - ivec2(gl_FragCoord.xy / float(r)) * r; }') if frag else
+                    'void rs_init() {}',
+                    'ivec2 rs_c2(uint h, ivec2 c) { int s = tsc(h); return s == 1 ? c : c * s + rs_s; }',
+                    'ivec3 rs_c3(uint h, ivec3 c) { int s = tsc(h); return s == 1 ? c : ivec3(c.xy * s + rs_s, c.z); }']
         base = STAGE_BASE[self.stage]
         # 16 push descriptor slots per stage (32 in all, the usual maxPushDescriptors) for c[0..16]: c[i] in slot i,
         # and c[16] in a slot this shader leaves free; the runtime reads the slots back from the cbN bindings
@@ -2226,6 +2231,8 @@ class Translator:
             for k in sorted(self.out_attrs):
                 out.append('    out_a%d = vec4(0.0, 0.0, 0.0, 1.0);' % k)
             out.append('    gl_PointSize = pc.point_size;')     # NVN's point size, unless the shader writes one
+        if 'rscale' in self.uses:
+            out.append('    rs_init();')
         out += body
         out.append('}')
         return '\n'.join(out) + '\n'
