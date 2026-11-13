@@ -6,6 +6,7 @@
 State st;                               /* the GPU's state carries over between command buffers, as on NVN */
 u64 draws, draws_skipped, dispatches;
 u64 rt_kept;                            /* render-target sets that kept the pass (the same targets; NX_SAME_RT) */
+u64 bind_gen[ST_COUNT], vi_gen, dyn_gen, desc_gen;
 
 void state_reset(State *s) {
     memset(s, 0, sizeof *s);
@@ -243,6 +244,7 @@ bool begin_rendering(void) {
     vkCmdBeginRendering(cmd(), &ri);
     st.rendering = true;
     occ_begin();
+    dyn_gen++;                          /* the area, scale, samples and target count are set_dynamic_state's too */
     pass_att_writes = false;
     return true;
 }
@@ -332,6 +334,7 @@ static void skip_draw(const char *why) {
  * buffers), which most draws leave as the last draw had them: then its staging copy is used again */
 typedef struct {
     u64 serial, pools_gen;
+    u64 bind_gen, desc_gen, image_epoch;    /* when it was last found right, + 1 (0: never) */
     BufferRange ssbo[16], ubo[18];
     u32 tex[32], img[8];
     VkBuffer sbuf;
@@ -349,6 +352,12 @@ static bool desc_scaled(const DescSet *d, u32 id) {
 static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescriptorSet *w, VkDescriptorBufferInfo *bi) {
     static DrvCache cache[ST_COUNT];
     cmd();
+    DrvCache *cc = &cache[stage % ST_COUNT];
+    /* nothing it is made from changed since the last draw: the stage's bindings, the descriptor sets' entries, the
+     * images (their scale), the pools, the command buffer */
+    if (cc->bind_gen == bind_gen[stage % ST_COUNT] + 1 && cc->desc_gen == desc_gen + 1 && cc->image_epoch == image_epoch + 1 &&
+        cc->serial == slot_serial && cc->pools_gen == pools_gen && !env.ssbo_log)
+        goto staged;
     DescSet *ts = descset_get(&st.texpool, DS_TEX), *is = NULL;
     for (DescSet *d = descsets; d; d = d->next)
         if (d->addr == st.texpool.addr && d->kind == DS_IMG) is = d;
@@ -364,7 +373,6 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
         if (h && desc_scaled(is, id)) h |= HANDLE_SCALED;
         img[k] = h;
     }
-    DrvCache *cc = &cache[stage % ST_COUNT];
     /* compared in place (twice a draw, ~2,000 draws a frame): the key is built only when it changed */
     bool hit = !env.ssbo_log && cc->serial == slot_serial && cc->pools_gen == pools_gen &&
                !memcmp(cc->ssbo, st.ssbo[stage], sizeof cc->ssbo) && !memcmp(cc->tex, tex, sizeof tex) &&
@@ -412,6 +420,10 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
         for (u32 k = 0; k < 8; k++) memcpy(drv + 0x600 + 0x120 + 8 * k, &key.img[k], 4);   /* image handles at 0x120 */
         *cc = key;
     }
+    cc->bind_gen = bind_gen[stage % ST_COUNT] + 1;
+    cc->desc_gen = desc_gen + 1;
+    cc->image_epoch = image_epoch + 1;
+staged:;
     VkBuffer sbuf = cc->sbuf;
     u64 soff = cc->soff;
     u32 used = sc && sc->slots_used ? sc->slots_used : 0xffff, n = 0;   /* only the slots the shader declares */
@@ -431,6 +443,12 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
             bool found = addr && size && gpu_buffer_ro(addr, size > 65536 ? 65536 : size, &buf, &off);
             if (found && !(off & 63)) {
                 if (size > 65536) size = 65536;
+                if (size > ro_room) {           /* bound past its pool's end: the part inside it */
+                    static u32 logged;
+                    if (logged++ < 5) hlog(0, "gpu: stage %u c[%u] at %llx size %llx ends %llx past its pool (shader %016llx)",
+                                           stage, i, addr, size, size - ro_room, sc ? sc->hash : 0);
+                    size = ro_room;
+                }
                 *b = (VkDescriptorBufferInfo){buf, off, size};
             } else if (trace_frame())
                 hlog(0, "gpu:   stage %u c[%u] at %llx size %llx left unbound: %s", stage, i, addr, size,
@@ -453,6 +471,14 @@ static void rec_check(void) {
 static bool debug_rt_hit(void) { return env.debug_rt && st.nrt && st.rt[0].t.addr == env.debug_rt; }
 
 static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
+    /* most draws find the state the last one recorded: no command since has set any of it (dyn_gen) */
+    static u64 last_gen = ~0ull, last_serial;
+    static u32 last_mode;
+    rec_check();
+    if (rec.dyn_ok && last_gen == dyn_gen && last_mode == mode && last_serial == slot_serial && !env.debug_rt) return;
+    last_gen = dyn_gen;
+    last_mode = mode;
+    last_serial = slot_serial;
     DynState d;
     memset(&d, 0, sizeof d);
     float S = (float)(st.rt_scale ? st.rt_scale : 1);  /* the viewport is in the game's pixels */
@@ -627,16 +653,22 @@ void vi_key(PipeKey *k) {
 static void set_vertex_input(VkCommandBuffer c) {
     /* draws mostly keep the last one's attributes, streams and vertex buffers: then everything below would come to
      * what was recorded already (unless the command buffer, the pools or a mirror's bad ranges changed since) */
-    static struct { u64 serial, pools_gen; u32 nattribs, nstreams; VertexAttribState attribs[32];
+    static struct { u64 serial, pools_gen, bad_gen, vi_gen; u32 nattribs, nstreams; VertexAttribState attribs[32];
                     VertexStreamState streams[32]; BufferRange vbuf[32]; } last = {~0ull};
     rec_check();
-    if (rec.vi_ok && !nmirrors && last.serial == slot_serial && last.pools_gen == pools_gen &&
-        last.nattribs == st.nattribs && last.nstreams == st.nstreams &&
-        !memcmp(last.attribs, st.attribs, st.nattribs * sizeof *st.attribs) &&
-        !memcmp(last.streams, st.streams, st.nstreams * sizeof *st.streams) && !memcmp(last.vbuf, st.vbuf, sizeof st.vbuf))
-        return;
+    if (rec.vi_ok && last.serial == slot_serial && last.pools_gen == pools_gen && last.bad_gen == bad_gen) {
+        if (last.vi_gen == vi_gen) return;              /* no command set any of it */
+        if (last.nattribs == st.nattribs && last.nstreams == st.nstreams &&
+            !memcmp(last.attribs, st.attribs, st.nattribs * sizeof *st.attribs) &&
+            !memcmp(last.streams, st.streams, st.nstreams * sizeof *st.streams) && !memcmp(last.vbuf, st.vbuf, sizeof st.vbuf)) {
+            last.vi_gen = vi_gen;                       /* set again to the same */
+            return;
+        }
+    }
     last.serial = slot_serial;
     last.pools_gen = pools_gen;
+    last.bad_gen = bad_gen;
+    last.vi_gen = vi_gen;
     last.nattribs = st.nattribs;
     last.nstreams = st.nstreams;
     memcpy(last.attribs, st.attribs, sizeof last.attribs);
@@ -1052,6 +1084,17 @@ static void feedback_check(DescSet *ts) {
     }
 }
 
+/* the slots of `slots` (a shader's texint_slots) whose bound texture is read through its integer view: the
+ * pipeline's TEX_INT for that stage (after descset_use has resolved the stage's entries) */
+static u32 texint_mask(const DescSet *ts, u32 stage, u32 slots) {
+    u32 m = 0;
+    for (u32 left = ts ? slots : 0; left; left &= left - 1) {
+        u32 k = (u32)__builtin_ctz(left), id = (u32)st.tex[stage][k] & 0xfffff;
+        if (st.tex[stage][k] && id < ts->count && ts->intv[id]) m |= 1u << k;
+    }
+    return m;
+}
+
 static void draw_one(u32 op, const void *payload) {
     draws++;
     work_unflushed++;
@@ -1104,6 +1147,8 @@ static void draw_one(u32 op, const void *payload) {
     memset(&k, 0, sizeof k);
     k.vs = pipe_vs_hash;
     k.vs_mask = vs_mask;
+    k.vs_texint = texint_mask(ts, ST_VERTEX, pr->stage[ST_VERTEX]->texint_slots);
+    if (pr->stage[ST_FRAGMENT]) k.fs_texint = texint_mask(ts, ST_FRAGMENT, pr->stage[ST_FRAGMENT]->texint_slots);
     k.fs = pipe_fs_hash;
     k.ncolor = st.nrt;
     memcpy(k.color, st.rt_format, sizeof k.color);

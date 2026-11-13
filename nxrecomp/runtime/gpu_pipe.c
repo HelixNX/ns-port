@@ -160,11 +160,14 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
         r = vkCreateComputePipelines(vk.dev, pcache, 1, &ci, NULL, pipe);
     } else {
         /* the alpha test is a specialization constant, so a draw without one has no discard from it (early depth) */
-        VkSpecializationMapEntry sme = {0, 0, sizeof k->alpha_func};
-        VkSpecializationInfo spec = {1, &sme, sizeof k->alpha_func, &k->alpha_func};
+        /* constant 2, both stages: TEX_INT, the texture slots that hold integer textures (a shader without the
+         * constant ignores it) */
+        u32 fdata[2] = {k->alpha_func, k->fs_texint}, vdata[2] = {k->vs_mask, k->vs_texint};
+        VkSpecializationMapEntry sme[2] = {{0, 0, 4}, {2, 4, 4}};
+        VkSpecializationInfo spec = {2, sme, sizeof fdata, fdata};
         /* the vertex shader's integer inputs (INT_ATTRS, constant 1): which inputs are fetched as USCALED / SSCALED */
-        VkSpecializationMapEntry vsme = {1, 0, sizeof k->vs_mask};
-        VkSpecializationInfo vspec = {1, &vsme, sizeof k->vs_mask, &k->vs_mask};
+        VkSpecializationMapEntry vsme[2] = {{1, 0, 4}, {2, 4, 4}};
+        VkSpecializationInfo vspec = {2, vsme, sizeof vdata, vdata};
         VkPipelineShaderStageCreateInfo stages[2] = {
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp_stages & VK_SHADER_STAGE_VERTEX_BIT ? &vk_warp : NULL,
              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main", .pSpecializationInfo = &vspec},

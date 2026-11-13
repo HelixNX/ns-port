@@ -394,8 +394,12 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
     u64 *cval = env.feedback_log && bound ? calloc(bound, sizeof *cval) : NULL;    /* OpConstant: 1 << 32 | value */
     s->tex_slots = 0;
     s->tex_dyn = false;
+    s->texint_slots = 0;
+    u32 texint_id = 0;                  /* the constant decorated SpecId 2 (TEX_INT) */
     for (long i = 5; i < n / 4;) {      /* what the shader touches: PhysicalStorageBufferAddresses, sampled images */
         u32 op = code[i] & 0xffff, wc = code[i] >> 16;
+        if (op == 71 && wc == 4 && code[i + 2] == 1 && code[i + 3] == 2) texint_id = code[i + 1];
+        if (op == 50 && wc == 4 && texint_id && code[i + 2] == texint_id) s->texint_slots = code[i + 3];   /* its default */
         if (op == 5 && wc >= 3 && ncb < 17) {                   /* OpName "cb<N>": c[N] */
             const char *nm = (const char *)&code[i + 2];
             if (nm[0] == 'c' && nm[1] == 'b' && nm[2] >= '0' && nm[2] <= '9') {

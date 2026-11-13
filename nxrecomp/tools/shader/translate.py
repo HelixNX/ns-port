@@ -25,6 +25,7 @@ Model:
     for integer formats (see the attribute macros in the preamble).
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -49,6 +50,13 @@ TEX_BINDING = {'t2d': 0, 't3d': 1, 'tcube': 2, 't2da': 3, 'tcubea': 4, 't1d': 5,
 # (UINT/SINT, stencil) and puts its integer view in ut2d / ut2da at the same index; fetches and gathers of 2D and 2D
 # array textures read through it when the bit is set (a float read of an integer view is undefined)
 INT_FLAG = '((%s >> 19) & 1u) != 0u'
+# Where the handle is that of a fixed slot (c[2] at a constant offset: nearly always), vertex and fragment shaders
+# take the choice from the pipeline instead: bit k of the specialization constant TEX_INT (constant 2) says slot k
+# holds an integer texture, so the driver compiles one fetch, not both and a select (the deferred lighting shader's
+# 14 fetches: 0.33 of its 2.2 ms on a GTX 1650 Ti). The constant's default value is the mask of the slots tested
+# this way: the runtime reads it from the SPIR-V (gpu_shader.c, ShaderCode.texint_slots) and always gives the
+# constant its value for the draw's textures (PipeKey.vs_texint / fs_texint).
+INT_SPEC = '((TEX_INT >> %du) & 1u) != 0u'
 # Render scale (runtime/gpu.c HANDLE_SCALED, rs_scale): bit 18 of a handle marks a texture or image made N times the
 # game's size, N in pc.scale bits 0-7; the pass's targets' scale is in bits 8-15. gl_FragCoord is divided by the
 # targets' scale, integer coordinates of scaled textures and images are multiplied by N (plus the pixel's place in
@@ -92,6 +100,7 @@ class Translator:
         self.in_attrs = {}          # generic input index -> interpolation ('smooth', 'flat', 'noperspective')
         self.out_attrs = set()
         self.uses = set()           # features: 'global', 'lmem', 'fragdepth', 'vertexid', ...
+        self.texint_slots = 0       # texture slots whose integer choice is the pipeline's (INT_SPEC)
         self.indent = 1
         self.lmem_words = 0
         # texture / image handles read from c[2] at a fixed offset are the same for the whole draw, so their
@@ -303,6 +312,18 @@ class Translator:
     # ------------------------------------------------------------------ textures
     def tex_handle(self, cbuf_offset):
         return self.cbuf(2, cbuf_offset * 4)
+
+    def emit_tex(self, h, typ, e):
+        """Opens the block of a texture read: { uint h_ = <the handle h>; <typ> v_ = <the read e, of handle h_>;"""
+        m = re.fullmatch(r'cb2\.d\[(\d+)\]\[(\d)\]', h)
+        flag = INT_FLAG % 'h_'
+        if m and flag in e and self.stage in ('vertex', 'fragment'):
+            off = int(m.group(1)) * 16 + int(m.group(2)) * 4
+            if 0x20 <= off < 0x120 and not off & 7:
+                k = (off - 0x20) >> 3
+                self.texint_slots |= 1 << k
+                e = e.replace(flag, INT_SPEC % k)
+        self.emit('{ uint h_ = %s; %s v_ = %s;' % (h, typ, e))
 
     def sample(self, kind, handle, coords, lod=None, bias=None, dref=None, offset=None, gather=None, query=False):
         """GLSL sampling expression; kind: 1D 2D 3D CUBE 2DARRAY CUBEARRAY 1DARRAY. Returns vec4 (or float for dref)"""
@@ -1441,7 +1462,7 @@ class Translator:
         if sw >= len(masks):
             raise Unsupported('TEXS swizzle')
         mask = masks[sw]
-        self.emit('{ uint h_ = %s; %s v_ = %s;' % (h, 'float' if dref else 'vec4', e))
+        self.emit_tex(h, 'float' if dref else 'vec4', e)
         self.indent += 1
         comps = [c for c in range(4) if mask >> c & 1]
         val = lambda c: ('v_' if c < 3 else '1.0') if dref else 'v_[%d]' % c
@@ -1532,7 +1553,7 @@ class Translator:
             dref = self.Rf(meta)
             meta += 1
         e = self.sample(kind, 'h_', coords, lod=lod, bias=bias, dref=dref, offset=off)
-        self.emit('{ uint h_ = %s; %s v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), 'float' if dc else 'vec4', e))
+        self.emit_tex(self.tex_handle(bits(w, 36, 13)), 'float' if dc else 'vec4', e)
         self.indent += 1
         self.store_mask(d, mask, 'v_', shadow=bool(dc))
         self.indent -= 1
@@ -1556,7 +1577,7 @@ class Translator:
             dref = self.Rf(meta)
             meta += 1
         e = self.sample(kind, 'h_', coords, dref=dref, offset=off, gather=comp)
-        self.emit('{ uint h_ = %s; vec4 v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), e))
+        self.emit_tex(self.tex_handle(bits(w, 36, 13)), 'vec4', e)
         self.indent += 1
         self.store_mask(d, mask, 'v_')
         self.indent -= 1
@@ -1578,7 +1599,7 @@ class Translator:
         elif dc:
             dref = self.Rf(b)
         e = self.sample('2D', 'h_', coords, dref=dref, offset=off, gather=comp)
-        self.emit('{ uint h_ = %s; vec4 v_ = %s;' % (self.tex_handle(bits(w, 36, 13)), e))
+        self.emit_tex(self.tex_handle(bits(w, 36, 13)), 'vec4', e)
         self.indent += 1
         if f16:
             self.set_r(da, 'packHalf2x16(v_.xy)')
@@ -2065,11 +2086,15 @@ class Translator:
             lx, ly, lz = struct.unpack_from('<3I', self.sh.control, 0x748)   # GLSLC: the workgroup size
             out.append('layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;' % (lx, ly, lz))
         out += ['float F(uint x) { return uintBitsToFloat(x); }', 'uint U(float x) { return floatBitsToUint(x); }',
-                # .SAT gives 0 for NaN; FMNMX returns the operand that is not NaN
+                # .SAT gives 0 for NaN; FMNMX returns the operand that is not NaN: GLSL.std.450's NMin / NMax (79,
+                # 80) are exactly that, in one instruction (isnan tests and selects around min / max were 6% of the
+                # deferred lighting shader's time)
                 'float sat(float x) { return x > 0.0 ? min(x, 1.0) : 0.0; }',
                 'vec2 sat(vec2 x) { return vec2(sat(x.x), sat(x.y)); }',
-                'float nmin(float a, float b) { return isnan(a) ? b : isnan(b) ? a : min(a, b); }',
-                'float nmax(float a, float b) { return isnan(a) ? b : isnan(b) ? a : max(a, b); }']
+                'spirv_instruction(set = "GLSL.std.450", id = 79) float nmin(float a, float b);',
+                'spirv_instruction(set = "GLSL.std.450", id = 80) float nmax(float a, float b);']
+        if self.texint_slots:
+            out.append('layout(constant_id = 2) const uint TEX_INT = 0x%08xu;' % self.texint_slots)
         if 'rz' in self.uses:
             # round toward zero: the product rounded to nearest, stepped one ulp toward 0 when the exact product
             # (its error from fma) is smaller in magnitude; an overflow gives the largest finite value. Integers

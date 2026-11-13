@@ -322,6 +322,7 @@ static void run(u64 at, int depth) {
     for (;;) {
         u32 hdr = LD32(at), op = hdr & 0xff, len = hdr >> 8;
         const u8 *pay = (const u8 *)(uintptr_t)(at + 4);
+        if ((op >= OP_BLEND && op <= OP_DEPTH_STENCIL) || (op >= OP_VIEWPORTS && op <= OP_RENDER_TARGETS)) dyn_gen++;
         switch (op) {
         case OP_END: return;
         case OP_JUMP: at = LD64(at + 4); continue;
@@ -339,6 +340,7 @@ static void run(u64 at, int depth) {
             memcpy(&n, pay, 4);
             st.nattribs = n > 32 ? 32 : n;
             memcpy(st.attribs, pay + 4, 4 * st.nattribs);
+            vi_gen++;
             break;
         }
         case OP_VERTEX_STREAMS: {
@@ -346,6 +348,7 @@ static void run(u64 at, int depth) {
             memcpy(&n, pay, 4);
             st.nstreams = n > 32 ? 32 : n;
             memcpy(st.streams, pay + 4, 8 * st.nstreams);
+            vi_gen++;
             break;
         }
         case OP_PROGRAM: {              /* binds the program's shaders for the given stages only */
@@ -371,6 +374,8 @@ static void run(u64 at, int depth) {
             BufferRange *dst = op == OP_VERTEX_BUFFERS ? st.vbuf : op == OP_UNIFORM_BUFFERS ? st.ubo[b.stage % ST_COUNT] : st.ssbo[b.stage % ST_COUNT];
             u32 cap = op == OP_VERTEX_BUFFERS ? 32 : op == OP_UNIFORM_BUFFERS ? 18 : 16;
             for (u32 i = 0; i < b.count && b.first + i < cap; i++) dst[b.first + i] = r[i];
+            if (op == OP_VERTEX_BUFFERS) vi_gen++;
+            else if (op == OP_STORAGE_BUFFERS || b.stage % ST_COUNT == ST_COMPUTE) bind_gen[b.stage % ST_COUNT]++;
             break;
         }
         case OP_TEXTURES: case OP_IMAGES: case OP_SEP_TEXTURES: case OP_SEP_SAMPLERS: {
@@ -379,6 +384,7 @@ static void run(u64 at, int depth) {
             const u64 *h = (const u64 *)(pay + sizeof b);
             u64 *dst = op == OP_IMAGES ? st.img[b.stage % ST_COUNT] : st.tex[b.stage % ST_COUNT];
             u32 cap = op == OP_IMAGES ? 8 : 32;
+            bind_gen[b.stage % ST_COUNT]++;
             for (u32 i = 0; i < b.count && b.first + i < cap; i++) {
                 if (op == OP_SEP_TEXTURES) dst[b.first + i] = (dst[b.first + i] & ~0xfffffull) | (h[i] & 0xfffff);
                 else if (op == OP_SEP_SAMPLERS) dst[b.first + i] = (dst[b.first + i] & 0xfffff) | (h[i] & ~0xfffffull);
@@ -416,9 +422,11 @@ static void run(u64 at, int depth) {
             /* the game waits for its last frame before submitting the next, so the GPU idles until the first
              * flush: hand it the first draws early, even in the middle of a pass (that pass splits), then twice as
              * many each time, so that it has the next part before it runs out, until flushes come at pass
-             * boundaries (NX_FLUSH_DRAWS) */
+             * boundaries (NX_FLUSH_DRAWS). Not while it still has work (a frame run ahead of the game's wait,
+             * nvn_submit_ahead: the split pass would cost a store, a barrier and a load for nothing;
+             * NX_FLUSH_BUSY=1 flushes as before) */
             if (head_flush && work_unflushed >= head_flush) {
-                flush();
+                if (env.flush_busy || gpu_completed() >= submitted) flush();
                 head_flush *= 2;
                 if (head_flush >= (u32)env.flush_draws) head_flush = 0;
             }
@@ -586,7 +594,12 @@ static void run(u64 at, int depth) {
         }
         case OP_RESET_COUNTER: { PL(CmdReport); if (p->counter == 1) occ_mark(false, 0); break; }
         case OP_REPORT_VALUE: { PL(CmdReport); if (p->addr) gpu_write(p->addr, &p->value, 4); break; }
-        case OP_TEXTURE_POOL: { PL(CmdPool); st.texpool = *p; break; }
+        case OP_TEXTURE_POOL: {
+            PL(CmdPool);
+            st.texpool = *p;
+            for (int i = 0; i < ST_COUNT; i++) bind_gen[i]++;
+            break;
+        }
         case OP_SAMPLER_POOL: { PL(CmdPool); st.smppool = *p; break; }
         case OP_XFB: {                  /* Begin starts the buffers over; Pause and Resume keep their offsets */
             u32 kind;
@@ -868,6 +881,7 @@ static void env_init(void) {
     env.gpu_skip = (e = getenv("NX_GPU_SKIP")) ? atoi(e) : 0;
     env.flush_draws = (e = getenv("NX_FLUSH_DRAWS")) ? atoi(e) : 250;
     env.flush_first = (e = getenv("NX_FLUSH_FIRST")) ? atoi(e) : 32;
+    env.flush_busy = (e = getenv("NX_FLUSH_BUSY")) && atoi(e);
     env.hitch_ms = (e = getenv("NX_HITCH_MS")) ? atof(e) : 0;
     env.feedback_log = getenv("NX_FEEDBACK_LOG") != NULL;
     env.view_log = getenv("NX_VIEW_LOG") != NULL;

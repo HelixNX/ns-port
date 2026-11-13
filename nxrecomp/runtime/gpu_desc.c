@@ -216,6 +216,7 @@ DescSet *descset_get(const CmdPool *p, u32 kind) {
     d->epoch = ~0ull;
     d->next = descsets;
     descsets = d;
+    desc_gen++;
     hlog(1, "gpu: %s pool at %llx: %u entries", smp ? "sampler" : kind == DS_IMG ? "image" : "texture", p->addr, d->count);
     return d;
 }
@@ -301,6 +302,7 @@ static void descset_resolve(DescSet *d, u32 i) {
     if (im) image_upload(im);
     d->res[i] = 1;
     d->gen++;
+    desc_gen++;
     if (d->kind == DS_TEX) {
         d->img[i] = tex_write(d->set, i, im, &v);
         d->intv[i] = d->img[i] && tex_is_int(d->img[i], &v);
@@ -321,18 +323,26 @@ void descset_use(DescSet *d, const u64 *tex, u32 n) {
     if (!d) return;
     /* draws mostly use the textures the last one did: in the same frame, with the same entries and images, the
      * images are already touched (n <= 32; one record per handle array: each stage's textures and images) */
-    static struct { const u64 *tex; const DescSet *d; u64 gen, frame, epoch; u64 h[32]; } seen[8];
+    static struct { const u64 *tex; const DescSet *d; u64 gen, frame, epoch, bind; u64 h[32]; } seen[8];
     int e = 0;
     while (e < 8 && seen[e].tex && seen[e].tex != tex) e++;
     if (e == 8) e = (int)(((uintptr_t)tex >> 4) & 7);
+    /* the stage's handles as the last draw had them (bind_gen), or set again to the same ones */
+    u64 bind = 0;
+    for (int s = 0; s < ST_COUNT; s++)
+        if (tex == st.tex[s] || tex == st.img[s]) bind = bind_gen[s] + 1;
     if (seen[e].tex == tex && seen[e].d == d && seen[e].gen == d->gen && seen[e].frame == frame_no &&
-        seen[e].epoch == image_epoch && n <= 32 && !memcmp(seen[e].h, tex, n * sizeof *tex))
+        seen[e].epoch == image_epoch && n <= 32 &&
+        ((bind && seen[e].bind == bind) || !memcmp(seen[e].h, tex, n * sizeof *tex))) {
+        seen[e].bind = bind;
         return;
+    }
     for (int pass = 0; pass < 4; pass++) {
         if (d->epoch != image_epoch) {          /* images were destroyed: the pointers may be stale */
             memset(d->res, 0, d->count);
             d->epoch = image_epoch;
             d->gen++;
+            desc_gen++;
         }
         for (u32 k = 0; k < n; k++) {
             u32 h = (u32)tex[k], id = h & 0xfffff;
@@ -351,6 +361,7 @@ void descset_use(DescSet *d, const u64 *tex, u32 n) {
         seen[e].gen = d->gen;
         seen[e].frame = frame_no;
         seen[e].epoch = image_epoch;
+        seen[e].bind = bind;
         memcpy(seen[e].h, tex, n * sizeof *tex);
     }
 }
@@ -368,7 +379,7 @@ void descset_sync(DescSet *d) {
         u32 want = magic == (d->kind == DS_SMP ? SDESC_MAGIC : TDESC_MAGIC) ? x : ~0u;
         if (want == d->idx[i]) continue;
         d->idx[i] = want;
-        if (d->kind != DS_SMP) { d->res[i] = 0; d->gen++; continue; }
+        if (d->kind != DS_SMP) { d->res[i] = 0; d->gen++; desc_gen++; continue; }
         if (want == ~0u) continue;
         memset(&infos[n], 0, sizeof infos[n]);
         infos[n].sampler = sampler_get(want);

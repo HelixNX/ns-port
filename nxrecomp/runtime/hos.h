@@ -224,6 +224,7 @@ GuestFn guest_fn(u64 addr);                            /* lifted function or hos
 void dispatch_override(u64 addr, GuestFn fn);          /* calls through pointers to addr go to fn */
 void dispatch_trace_init(void);                         /* NX_TRACE_CALLS */
 void nvn_init(void);
+void nvn_submit_ahead(u32 n, const u64 *handles);    /* a game's hook: command buffers it submits after a fence wait */
 void guest_call(Ctx *c, u64 addr);                      /* call_ind without the guest's LR */
 void host_thread_init(Ctx *c);                         /* per host thread: FP state */
 

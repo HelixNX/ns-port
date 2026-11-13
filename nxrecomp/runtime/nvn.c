@@ -303,12 +303,41 @@ static void queue_get_error(Ctx *c) { if (A(1)) memset(P(void, 1), 0, 0x18); RET
 /* nvnQueueSubmitCommands(queue, int count, const NVNcommandHandle *). Translating the commands is the console GPU's
  * work, not the CPU core's: the thread gives up its core meanwhile (else the threads sharing that core waited
  * for it, the main thread 60% of the time in Mesagoza) */
+static u64 *ahead_h;                    /* the command buffers nvn_submit_ahead ran, until the game submits them */
+static u32 ahead_n, ahead_cap;
+static volatile LONG ahead_tid;         /* the thread that ran them, 0: none */
 static void queue_submit(Ctx *c) {
     u32 n = (u32)A(1);
     if (!n) return;
+    if (ahead_tid && (DWORD)ahead_tid == GetCurrentThreadId()) {
+        bool same = n == ahead_n && !memcmp(P(u64, 2), ahead_h, 8ull * n);
+        ahead_tid = 0;
+        if (same) return;               /* ran already */
+        static u32 logged;
+        if (logged++ < 10) hlog(0, "nvn: the game submits %u command buffers, not the %u run ahead", n, ahead_n);
+    }
     core_leave();
     gpu_submit(A(0), n, P(u64, 2));
     core_enter();
+}
+/* For a game's hook: the command buffers the calling thread will pass to its next nvnQueueSubmitCommands, at a point
+ * where they are complete but the game first waits for its last frame's fence (nvnSyncWait). Run now, they are
+ * translated and handed to the GPU while it still draws that frame; else the GPU idled from the end of one frame to
+ * the first flush of the next, and again whenever translation fell behind it (4.7 of 14 ms on the GTX 1650 Ti
+ * laptop). The game sees nothing change but the time its wait and its submit take: guest memory is read by the
+ * translation a little earlier (the game no longer writes it: on the console its wait may return at once), and by
+ * the GPU in the same order as before. NX_SUBMIT_AHEAD=0: off */
+void nvn_submit_ahead(u32 n, const u64 *handles) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NX_SUBMIT_AHEAD"); on = !e || atoi(e); }
+    if (!on || !n || ahead_tid) return;
+    if (n > ahead_cap) ahead_h = realloc(ahead_h, 8ull * (ahead_cap = n + 64));
+    memcpy(ahead_h, handles, 8ull * n);
+    ahead_n = n;
+    core_leave();
+    gpu_submit(0, n, ahead_h);
+    core_enter();
+    ahead_tid = (LONG)GetCurrentThreadId();
 }
 static void queue_flush(Ctx *c) { gpu_flush(A(0)); }
 static void queue_finish(Ctx *c) { gpu_wait_site = c->x[30] + 1; gpu_finish(A(0)); }

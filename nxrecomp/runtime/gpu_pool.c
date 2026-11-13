@@ -9,6 +9,8 @@ int nmirrors;
 PoolEnt *pools;
 int npools, cappools;
 u64 pools_gen;                          /* bumped when pools come or go (cached device addresses) */
+u64 bad_gen;
+u64 ro_room;                            /* gpu_buffer_ro's last answer: the bytes from there to its pool's end */
 
 PoolEnt *pool_find(u64 addr) {
     static int last = -1;               /* draws look up the same few pools over and over */
@@ -102,6 +104,7 @@ void mirror_bad(u64 addr, u64 size) {
     }
     if (m->nbad == m->capbad) m->bad = realloc(m->bad, (m->capbad = m->capbad * 2 + 16) * sizeof *m->bad);
     m->bad[m->nbad++] = (Range){lo, hi};
+    bad_gen++;
     hlog(2, "gpu: pool mirror: %llx+%llx is written by the GPU (%d ranges)", lo, hi - lo, m->nbad);
 }
 
@@ -115,10 +118,25 @@ void mirror_bad_ssbos(const BufferRange *ssbo, const ShaderCode *sc) {
 /* a range draws only read (vertex, index or uniform data; size 0: to the pool's end) as (buffer, offset): from the
  * pool's mirror when it has one and the GPU writes none of the range */
 bool gpu_buffer_ro(u64 addr, u64 size, VkBuffer *buf, u64 *off) {
+    /* asked ~15 times a draw, mostly for the ranges of the draws before: the answers are kept while the pools and
+     * the mirrors' written ranges stay as they are (the pool search and the scan of those ranges were 5% of the
+     * render thread) */
+    static struct { u64 addr, size, pools_gen, bad_gen, off, room; VkBuffer buf; } memo[256];
+    u32 slot = (u32)((addr >> 6) ^ (addr >> 14) ^ (addr >> 22) ^ size) & 255;
+    if (memo[slot].buf && memo[slot].addr == addr && memo[slot].size == size && memo[slot].pools_gen == pools_gen &&
+        memo[slot].bad_gen == bad_gen) {
+        *buf = memo[slot].buf;
+        *off = memo[slot].off;
+        ro_room = memo[slot].room;
+        return true;
+    }
     PoolEnt *p = pool_find(addr);
     if (!p || !p->hb) return false;
     *buf = p->hb->buf;
     *off = addr - p->gpu;
+    memo[slot].addr = addr, memo[slot].size = size, memo[slot].pools_gen = pools_gen, memo[slot].bad_gen = bad_gen;
+    memo[slot].off = *off;
+    memo[slot].room = ro_room = p->end - addr;
     Mirror *m = p->mir;
     if (m) {
         u64 hi = size && size < p->end - addr ? addr + size : p->end;
@@ -126,6 +144,7 @@ bool gpu_buffer_ro(u64 addr, u64 size, VkBuffer *buf, u64 *off) {
         for (int i = 0; i < m->nbad && !bad; i++) bad = m->bad[i].lo < hi && addr < m->bad[i].hi;
         if (!bad) *buf = m->b.buf;
     }
+    memo[slot].buf = *buf;
     return true;
 }
 

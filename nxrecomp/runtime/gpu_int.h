@@ -17,7 +17,7 @@ extern bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 struct GpuEnv {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, xfb_store, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt, occlusion, barrier_skip;
+        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt, occlusion, barrier_skip, flush_busy;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -143,6 +143,8 @@ typedef struct PoolEnt { u64 gpu, end, cpu; u32 flags; HostBuffer *hb; Mirror *m
 extern PoolEnt *pools;
 extern int npools, cappools;
 extern u64 pools_gen;
+extern u64 ro_room;
+extern u64 bad_gen;                     /* bumped when a mirror gets a range the GPU writes (gpu_buffer_ro's answers change) */
 PoolEnt *pool_find(u64 addr);
 bool gpu_buffer(u64 addr, VkBuffer *buf, u64 *off);
 u8 *gpu_cpu(u64 addr, u64 size);
@@ -267,6 +269,12 @@ typedef struct State {
     u64 xfb_dirty[4][2];                /* the bytes captured since then: [lo, hi) of each buffer's addresses */
 } State;
 extern State st;
+/* generations of parts of st, bumped by the commands that set them (run, gpu.c): a draw that finds a part as the
+ * last draw left it skips working it out again (~1,800 draws a frame; these were a third of the translation) */
+extern u64 bind_gen[ST_COUNT];          /* a stage's textures, images and storage buffers (compute: uniform buffers too); the texture pool */
+extern u64 vi_gen;                      /* vertex attributes, streams and buffers */
+extern u64 dyn_gen;                     /* what set_dynamic_state reads (the pass's part: begin_rendering) */
+extern u64 desc_gen;                    /* any descriptor set's entries (every DescSet.gen) */
 extern u64 draws, draws_skipped, dispatches;
 extern u64 rt_kept;
 void state_reset(State *s);
@@ -393,6 +401,7 @@ u32 int_attr_mask(void);
 typedef struct PipeKey {
     u64 vs, fs;                         /* shader hashes (fs 0: none) */
     u32 vs_mask;                        /* the vertex shader's integer inputs (int_attr_mask, INT_ATTRS) */
+    u32 vs_texint, fs_texint;           /* the slots (of the shader's texint_slots) that hold integer textures: TEX_INT */
     VkFormat color[8], depth, stencil;
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
