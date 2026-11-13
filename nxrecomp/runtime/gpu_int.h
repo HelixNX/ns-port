@@ -17,7 +17,7 @@ extern bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 struct GpuEnv {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, xfb_store, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt;
+        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt, occlusion, barrier_skip;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -121,6 +121,7 @@ void barrier_at(const char *at, VkAccessFlags2 src);
 #define GPU_AT (__FILE_NAME__ ":" GPU_STR(__LINE__))
 #define barrier() barrier_at(GPU_AT, VK_ACCESS_2_MEMORY_WRITE_BIT)
 extern bool pass_att_writes;
+extern bool barrier_pending;
 #define end_rendering() end_rendering_at(GPU_AT)
 extern int nwb;
 void flush(void);
@@ -295,6 +296,14 @@ void do_copy_texture_to_texture(const CmdCopyTT *p);
 void do_downsample(const CmdDownsample *p);
 void gpu_write(u64 addr, const void *data, u32 size);
 u64 now_ns(void);
+
+/* samples-passed counts from occlusion queries (gpu_query.c) */
+void occ_begin(void);
+void occ_end(void);
+bool occ_mark(bool report, u64 addr);
+void occ_slot_open(int slot);
+void occ_submitted(int slot, u64 value);
+void occ_resolve(void);
 
 /* ---------------------------------------------------------------------------------------------- draws
  * One pipeline layout for every graphics pipeline:

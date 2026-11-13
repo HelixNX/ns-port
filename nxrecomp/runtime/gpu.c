@@ -51,6 +51,7 @@ int ndead, capdead;
 u64 gpu_completed(void) {
     u64 v = 0;
     if (timeline) vkGetSemaphoreCounterValue(vk.dev, timeline, &v);
+    occ_resolve();                      /* what is done has its counter reports written before anyone hears of it */
     return v;
 }
 
@@ -150,6 +151,7 @@ void slot_open(void) {
         tl_collect(next);
         vkResetQueryPool(vk.dev, tl_pool, 2 * next, 2);
     }
+    occ_slot_open(next);
     for (int i = 0; i < s->nextra; i++) vk_buffer_free(&s->extra[i]);
     s->nextra = 0;
     s->staging_used = 0;
@@ -260,6 +262,7 @@ void flush(void) {
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     VkResult r = vk_submit(&si, NULL);
     if (r < 0) fatal("vkQueueSubmit2: %d (device lost?)", r);
+    occ_submitted(cur, s->value);
     { /* NX_GPU_SYNC=1: waits for each submission and logs what it held; a hang or lost device names the last draw
        * (with NX_FLUSH_DRAWS=1 NX_FLUSH_FIRST=1, one draw per submission; slow) */
         static int sync = -1;
@@ -522,6 +525,9 @@ static void run(u64 at, int depth) {
         case OP_DOWNSAMPLE: { PL(CmdDownsample); do_downsample(p); break; }
         case OP_BARRIER:                /* the game's: ends the pass (with its barrier), or nothing outside one */
             if (vk.labels) { label_begin(cmd(), "nvn barrier%s", st.rendering ? "" : " (no pass)"); vkCmdEndDebugUtilsLabelEXT(cmd()); }
+            /* inside a pass the next draw decides (gpu_draw.c barrier_due): Violet has one after every skinning
+             * draw, 64 pass ends a frame for draws that read nothing the pass wrote */
+            if (env.barrier_skip && st.rendering) { barrier_pending = true; break; }
             end_rendering();
             break;
         case OP_FENCE_SYNC: {
@@ -558,15 +564,16 @@ static void run(u64 at, int depth) {
         }
         case OP_REPORT_COUNTER: {
             PL(CmdReport);
-            /* NVNcounterData {u64 value, u64 timestamp}: timestamps are ours, other counters report "visible" */
-            /* Counters are running totals the game subtracts (samples passed after a test draw minus before). A
-             * constant answer made every difference 0, "occluded": trees and other occlusion-tested objects were
-             * never drawn near the camera. Each report now counts up by 0x10000, so every test passes (no occlusion
-             * culling; real counts would need Vulkan occlusion queries). Timestamps stay ours. */
+            /* NVNcounterData {u64 value, u64 timestamp}: timestamps are ours. Samples passed (1) is counted
+             * (gpu_query.c). The other counters, and that one with NX_OCCLUSION=0, are a total that goes up by
+             * 0x10000 with each report, so every test between two reports passes: a constant made every difference
+             * 0, "occluded", and trees and other occlusion-tested objects were never drawn near the camera. But a
+             * glare test's "all of it passed" was then 65,536 samples whatever the size of the light: far house
+             * lights and the moon flared over the screen */
             static u64 running;
             running += 0x10000;
             u64 v[2] = {p->counter == 0 ? 0 : running, now_ns()};
-            if (p->addr) gpu_write(p->addr, v, 16);
+            if (p->counter != 1 || !occ_mark(true, p->addr)) { if (p->addr) gpu_write(p->addr, v, 16); }
             static u32 seen[8];                 /* which counter types the game reads, once each, with how often */
             static u64 n_reports;
             n_reports++;
@@ -577,7 +584,7 @@ static void run(u64 at, int depth) {
             }
             break;
         }
-        case OP_RESET_COUNTER: break;
+        case OP_RESET_COUNTER: { PL(CmdReport); if (p->counter == 1) occ_mark(false, 0); break; }
         case OP_REPORT_VALUE: { PL(CmdReport); if (p->addr) gpu_write(p->addr, &p->value, 4); break; }
         case OP_TEXTURE_POOL: { PL(CmdPool); st.texpool = *p; break; }
         case OP_SAMPLER_POOL: { PL(CmdPool); st.smppool = *p; break; }
@@ -654,6 +661,7 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     u64 back = submitted - value;
     double tw = ms_now();
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
+    occ_resolve();
     if (env.timeline) tl_woke = ms_now();
     t_wait_ms += ms_now() - tw;
     hf.wait += ms_now() - tw;
@@ -845,6 +853,8 @@ static void env_init(void) {
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.shader_preload = !(e = getenv("NX_SHADER_PRELOAD")) || atoi(e);
     env.xfb_store = !(e = getenv("NX_XFB_STORE")) || atoi(e);
+    env.occlusion = !(e = getenv("NX_OCCLUSION")) || atoi(e);
+    env.barrier_skip = !(e = getenv("NX_BARRIER_SKIP")) || atoi(e);
     /* draws skip shaders still being translated instead of waiting (see shader_load): on in netplay builds, where a
      * stalled game drops out of local play; off elsewhere, since a skipped draw into a texture drawn only once stays
      * missing */

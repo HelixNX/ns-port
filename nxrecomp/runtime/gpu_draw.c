@@ -30,12 +30,47 @@ static u32 nxfb_ranges;
 PendingWrite pending[1024];
 u32 npending;
 
+/* The game's barrier inside a pass (OP_BARRIER) waits for the next draw: the pass ends for it only if that draw
+ * could read what the pass has written. That is a texture that is one of the pass's targets, or anything at all
+ * once a shader of the pass could store to memory or images (pass_side_writes). Captures are not in that: every
+ * draw is checked against them, barrier or not (xfb_hazard). NX_BARRIER_SKIP=0: every barrier ends the pass */
+bool barrier_pending;
+static bool pass_side_writes;
+static u64 barriers_kept, barriers_skipped;
+
+static bool samples_target(const DescSet *ts) {
+    if (!ts) return false;
+    for (u32 stage = ST_VERTEX; stage <= ST_FRAGMENT; stage++) {
+        const ShaderCode *s = st.program->stage[stage];
+        if (!s || !(s->caps & SHC_TEXTURE)) continue;
+        u32 used = s->tex_dyn ? ~0u : s->tex_slots;
+        for (u32 k = 0; k < 32; k++) {
+            u32 id = (u32)st.tex[stage][k] & 0xfffff;
+            if (!(used >> k & 1) || !st.tex[stage][k] || id >= ts->count || !ts->img[id]) continue;
+            const Image *im = ts->img[id];
+            for (u32 t = 0; t < 9; t++) {
+                const u64 lo = st.rt_sub[t].addr, hi = lo + st.rt_sub[t].size;
+                if (st.rt_sub[t].size && im->info.addr < hi && im->info.addr + im->size > lo) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void barrier_due(const DescSet *ts) {
+    barrier_pending = false;
+    if (!st.rendering) return;
+    if (pass_side_writes || samples_target(ts)) { barriers_kept++; end_rendering(); }
+    else barriers_skipped++;
+}
+
 void end_rendering_at(const char *at) {
     if (!st.rendering) return;
     if (prof_on > 0)
         for (u32 i = 0; i < 64; i++)
             if (!prof_ends[i].at || !strcmp(prof_ends[i].at, at)) { prof_ends[i].at = at; prof_ends[i].count++; break; }
     label_draw_end();
+    occ_end();
     vkCmdEndRendering(cmd());
     if (vk.labels) {                    /* the pass's region, then who ended it */
         vkCmdEndDebugUtilsLabelEXT(cmd());
@@ -43,6 +78,7 @@ void end_rendering_at(const char *at) {
         vkCmdEndDebugUtilsLabelEXT(cmd());
     }
     st.rendering = false;
+    barrier_pending = pass_side_writes = false;
     prof_mark("outside passes (copies, clears, barriers)");
     bool full = pass_att_writes || env.full_barriers;
     if (npending) {
@@ -206,6 +242,7 @@ bool begin_rendering(void) {
     }
     vkCmdBeginRendering(cmd(), &ri);
     st.rendering = true;
+    occ_begin();
     pass_att_writes = false;
     return true;
 }
@@ -776,6 +813,9 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
                 if (xfb_hazards[k]) o += snprintf(hz + o, sizeof hz - o, " %s %.1f", xfb_hazard_names[k], xfb_hazards[k] / 600.0);
             hlog(0, "gpu prof: passes ended before a draw that reads captures, per frame:%s", o ? hz : " none");
             memset(xfb_hazards, 0, sizeof xfb_hazards);
+            hlog(0, "gpu prof: the game's barriers inside passes, per frame: %.1f ended the pass, %.1f did not",
+                 barriers_kept / 600.0, barriers_skipped / 600.0);
+            barriers_kept = barriers_skipped = 0;
             cnt = same_buf = contig = same_bind = same_vs = stored = 0; last_frame = frame_no;
         }
     }
@@ -1056,6 +1096,7 @@ static void draw_one(u32 op, const void *payload) {
         descset_use(is, st.img[ST_VERTEX], 8);
         descset_use(is, st.img[ST_FRAGMENT], 8);
     }
+    if (barrier_pending) barrier_due(ts);
     if (!begin_rendering()) { skip_draw("no render targets"); return; }
     if (env.feedback_log) feedback_check(ts);
     VkCommandBuffer c = cmd();
@@ -1247,6 +1288,7 @@ static void draw_one(u32 op, const void *payload) {
     }
     set_vertex_input(c);
     xfb_begin(c, op, payload);
+    if (caps & (SHC_GLOBAL | SHC_IMAGE) && !xfb_stored) pass_side_writes = true;
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
         const CmdDraw *d = payload;
         bool indexed = op == OP_DRAW_ELEMENTS;
