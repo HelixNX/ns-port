@@ -498,6 +498,51 @@ void vk_init(void) {
         /* descriptor arrays indexed by a handle that is the same for the whole draw (translate.py: from c[2], no
          * nonuniformEXT) */
         .shaderSampledImageArrayDynamicIndexing = 1, .shaderStorageImageArrayDynamicIndexing = 1, .shaderFloat64 = 1, .shaderInt64 = 1, .shaderInt16 = 1};
+    {
+        /* each only where the device has it: asked for regardless, one it lacks failed vkCreateDevice with a bare
+         * error code (Intel's GPUs have no shaderFloat64). What needs a missing one may draw wrong; the log names it */
+        static const char *const names[] = {
+            "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend", "geometryShader",
+            "tessellationShader", "sampleRateShading", "dualSrcBlend", "logicOp", "multiDrawIndirect",
+            "drawIndirectFirstInstance", "depthClamp", "depthBiasClamp", "fillModeNonSolid", "depthBounds", "wideLines",
+            "largePoints", "alphaToOne", "multiViewport", "samplerAnisotropy", "textureCompressionETC2",
+            "textureCompressionASTC_LDR", "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery",
+            "vertexPipelineStoresAndAtomics", "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize",
+            "shaderImageGatherExtended", "shaderStorageImageExtendedFormats", "shaderStorageImageMultisample",
+            "shaderStorageImageReadWithoutFormat", "shaderStorageImageWriteWithoutFormat",
+            "shaderUniformBufferArrayDynamicIndexing", "shaderSampledImageArrayDynamicIndexing",
+            "shaderStorageBufferArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing", "shaderClipDistance",
+            "shaderCullDistance", "shaderFloat64", "shaderInt64", "shaderInt16", "shaderResourceResidency",
+            "shaderResourceMinLod", "sparseBinding", "sparseResidencyBuffer", "sparseResidencyImage2D",
+            "sparseResidencyImage3D", "sparseResidency2Samples", "sparseResidency4Samples", "sparseResidency8Samples",
+            "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate", "inheritedQueries"};
+        _Static_assert(sizeof names / sizeof *names * sizeof(VkBool32) == sizeof(VkPhysicalDeviceFeatures),
+                       "one name per VkPhysicalDeviceFeatures member, in order");
+        VkBool32 want[sizeof names / sizeof *names], has[sizeof names / sizeof *names];
+        memcpy(want, &f.features, sizeof want);
+        memcpy(has, &hasf.features, sizeof has);
+        char miss[1024] = "";
+        size_t ml = 0;
+        for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+            if (!want[i] || has[i]) continue;
+            want[i] = 0;
+            if (ml < sizeof miss) ml += snprintf(miss + ml, sizeof miss - ml, " %s", names[i]);
+        }
+        memcpy(&f.features, want, sizeof want);
+        if (miss[0]) hlog(0, "vk: this GPU lacks:%s (left off: what needs them may draw wrong)", miss);
+        vk.features = f.features;
+    }
+    /* may a draw's topology be of another class (points, lines, triangles, patches) than its pipeline's? Where not,
+     * the class goes into the pipeline key (gpu_draw.c; NX_TOPO_CLASS=1: as if not, for testing) */
+    VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3p = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 ppe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &eds3p};
+    vkGetPhysicalDeviceProperties2(vk.phys, &ppe);
+    const char *tc = getenv("NX_TOPO_CLASS");
+    vk.topo_class = !eds3p.dynamicPrimitiveTopologyUnrestricted || (tc && atoi(tc));
+    if (vk.topo_class)
+        hlog(1, "vk: a draw's topology class is its pipeline's%s: points and lines get pipelines of their own",
+             eds3p.dynamicPrimitiveTopologyUnrestricted ? " (NX_TOPO_CLASS)" : "");
     float prio[2] = {1, 1};
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk.family,
                                    .queueCount = family_queues >= 2 ? 2 : 1, .pQueuePriorities = prio};

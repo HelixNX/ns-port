@@ -12,9 +12,9 @@
  * The render thread records (under gpu_cs); guest threads resolve as well, under occ_lock only. */
 #include "gpu_int.h"
 
-#define OCC_MAX 8192                    /* queries per submission */
+#define OCC_MAX 16384                   /* queries per submission (a traced frame has two for each draw) */
 enum { OCC_QUERY, OCC_RESET, OCC_REPORT };
-typedef struct OccEvent { u8 kind, scale; u8 *dst; u64 ts; } OccEvent;
+typedef struct OccEvent { u8 kind, scale; u32 tag; u8 *dst; u64 ts; } OccEvent;    /* tag: occ_draw_begin's, + 1 */
 typedef struct OccSlot { VkQueryPool pool; OccEvent *ev; u32 nev, cap, nq; u64 value; } OccSlot;
 static OccSlot occ[SLOTS];
 static int fifo[SLOTS];                 /* submitted slots with events, oldest first */
@@ -28,7 +28,7 @@ static bool occ_open;                   /* a query is open in the pass being rec
 static void event(u8 kind, u8 *dst) {
     OccSlot *o = &occ[cur];
     if (o->nev == o->cap) o->ev = realloc(o->ev, (o->cap = o->cap * 2 + 256) * sizeof *o->ev);
-    o->ev[o->nev++] = (OccEvent){kind, (u8)(st.rt_scale ? st.rt_scale : 1), dst, kind == OCC_REPORT ? now_ns() : 0};
+    o->ev[o->nev++] = (OccEvent){kind, (u8)(st.rt_scale ? st.rt_scale : 1), 0, dst, kind == OCC_REPORT ? now_ns() : 0};
 }
 
 static void start(void) {
@@ -52,6 +52,37 @@ static void stop(void) {
 /* a pass has begun / is about to end */
 void occ_begin(void) { if (occ_wanted) start(); }
 void occ_end(void) { stop(); }
+
+/* Traced frames (gpu_draw.c query_begin): the draw recorded next gets a query to itself, cut out of the pass's, and
+ * its samples go to query_result(tag) when the submission is resolved; the game's counter gets them as before.
+ * False: the pass has no query open (the caller may open one of its own: two of a type at once are not allowed) */
+void query_result(u32 tag, u64 samples);
+
+bool occ_draw_begin(u32 tag) {
+    if (!occ_open) return false;
+    stop();
+    start();
+    if (!occ_open) return false;        /* out of queries */
+    occ[cur].ev[occ[cur].nev - 1].tag = tag + 1;
+    return true;
+}
+
+void occ_draw_end(void) {
+    if (!occ_open) return;
+    stop();
+    start();
+}
+
+/* a pool is gone (gpu_pool_destroyed, under gpu_cs): reports still to be written into its memory are dropped
+ * (their place was taken as a pointer when they were recorded, and the memory may be unmapped by the time the
+ * submission is done) */
+void occ_forget(const u8 *lo, const u8 *hi) {
+    AcquireSRWLockExclusive(&occ_lock);
+    for (int s = 0; s < SLOTS; s++)
+        for (u32 i = 0; i < occ[s].nev; i++)
+            if (occ[s].ev[i].dst >= lo && occ[s].ev[i].dst < hi) occ[s].ev[i].dst = NULL;
+    ReleaseSRWLockExclusive(&occ_lock);
+}
 
 /* ResetCounter / ReportCounter of counter 1, in the command stream's order. False: not ours (NX_OCCLUSION=0) */
 bool occ_mark(bool report, u64 addr) {
@@ -110,8 +141,9 @@ void occ_resolve(void) {
         for (u32 i = 0; i < o->nev; i++) {
             const OccEvent *e = &o->ev[i];
             if (e->kind == OCC_QUERY) {
-                u64 s2 = (u64)e->scale * e->scale;
-                occ_total += (res[q++] + s2 - 1) / s2;
+                u64 s2 = (u64)e->scale * e->scale, n = res[q++];
+                occ_total += (n + s2 - 1) / s2;
+                if (e->tag) query_result(e->tag - 1, n);
             } else if (e->kind == OCC_RESET) {
                 occ_total = 0;
                 resets++;

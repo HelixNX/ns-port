@@ -2,7 +2,9 @@
  * ASTC specification. HDR endpoint modes, 3D blocks and reserved encodings decode to the error colour
  * (magenta), as the specification asks. */
 #include "astc.h"
+#include <process.h>
 #include <string.h>
+#include <windows.h>
 
 static u32 getbits(const u8 *b, u32 pos, u32 n) {
     u32 v = 0;
@@ -447,15 +449,86 @@ void astc_decode_block(const u8 *blk, u32 bw, u32 bh, bool srgb, u8 *out, u32 pi
         }
 }
 
+/* Big images are decoded by several threads, a few rows of blocks at a time (blocks are independent): the caller
+ * is the render thread, with the GPU lock held, in the frames that stream textures in. One job at a time; a second
+ * caller decodes by itself */
+typedef struct AstcJob {
+    const u8 *blocks;
+    u32 wblocks, hblocks, bw, bh, width, height;
+    bool srgb;
+    u8 *out;
+    volatile LONG next;                 /* the next row of blocks to take */
+} AstcJob;
+#define ASTC_ROWS 4                     /* rows of blocks taken at once */
+#define ASTC_PAR_MIN 16384              /* blocks from which the helpers are woken (512x512 pixels of 4x4 blocks) */
+#define ASTC_HELPERS_MAX 6
+
+static void astc_rows(AstcJob *j) {
+    u8 tmp[12 * 12 * 4];
+    for (;;) {
+        u32 by0 = (u32)InterlockedExchangeAdd(&j->next, ASTC_ROWS);
+        if (by0 >= j->hblocks) return;
+        for (u32 by = by0; by < by0 + ASTC_ROWS && by < j->hblocks; by++)
+            for (u32 bx = 0; bx < j->wblocks; bx++) {
+                astc_decode_block(j->blocks + 16 * ((u64)by * j->wblocks + bx), j->bw, j->bh, j->srgb, tmp, j->bw * 4);
+                for (u32 y = 0; y < j->bh && by * j->bh + y < j->height; y++) {
+                    u32 n = bx * j->bw + j->bw <= j->width ? j->bw : j->width - bx * j->bw;
+                    memcpy(j->out + ((u64)(by * j->bh + y) * j->width + bx * j->bw) * 4, tmp + y * j->bw * 4, n * 4);
+                }
+            }
+    }
+}
+
+static struct {
+    SRWLOCK job_lock, lock;             /* one job at a time / the fields below */
+    CONDITION_VARIABLE go, done;
+    AstcJob *job;
+    u64 gen;                            /* bumped with each job: a helper takes each once */
+    u32 busy;                           /* helpers still to finish (or to see) the current job */
+    u32 helpers;
+    bool started;
+} par = {.job_lock = SRWLOCK_INIT, .lock = SRWLOCK_INIT, .go = CONDITION_VARIABLE_INIT, .done = CONDITION_VARIABLE_INIT};
+
+static unsigned __stdcall astc_helper(void *arg) {
+    (void)arg;
+    u64 seen = 0;
+    AcquireSRWLockExclusive(&par.lock);
+    for (;;) {
+        while (par.gen == seen) SleepConditionVariableSRW(&par.go, &par.lock, INFINITE, 0);
+        seen = par.gen;
+        AstcJob *j = par.job;
+        ReleaseSRWLockExclusive(&par.lock);
+        astc_rows(j);
+        AcquireSRWLockExclusive(&par.lock);
+        if (!--par.busy) WakeAllConditionVariable(&par.done);
+    }
+}
+
 void astc_decode(const u8 *blocks, u32 wblocks, u32 hblocks, u32 bw, u32 bh, bool srgb, u8 *out, u32 width,
                  u32 height) {
-    u8 tmp[12 * 12 * 4];
-    for (u32 by = 0; by < hblocks; by++)
-        for (u32 bx = 0; bx < wblocks; bx++) {
-            astc_decode_block(blocks + 16 * ((u64)by * wblocks + bx), bw, bh, srgb, tmp, bw * 4);
-            for (u32 y = 0; y < bh && by * bh + y < height; y++) {
-                u32 n = bx * bw + bw <= width ? bw : width - bx * bw;
-                memcpy(out + ((u64)(by * bh + y) * width + bx * bw) * 4, tmp + y * bw * 4, n * 4);
-            }
+    AstcJob j = {blocks, wblocks, hblocks, bw, bh, width, height, srgb, out, 0};
+    if ((u64)wblocks * hblocks < ASTC_PAR_MIN || !TryAcquireSRWLockExclusive(&par.job_lock)) {
+        astc_rows(&j);
+        return;
+    }
+    if (!par.started) {                 /* (under job_lock) half the cores, the game's threads keep the rest */
+        par.started = true;
+        DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        u32 want = cpus / 2 > ASTC_HELPERS_MAX ? ASTC_HELPERS_MAX : cpus / 2;
+        for (u32 i = 0; i + 1 < want; i++) {
+            HANDLE t = (HANDLE)_beginthreadex(NULL, 0, astc_helper, NULL, 0, NULL);
+            if (t) { CloseHandle(t); par.helpers++; }
         }
+    }
+    AcquireSRWLockExclusive(&par.lock);
+    par.job = &j;
+    par.busy = par.helpers;
+    par.gen++;
+    ReleaseSRWLockExclusive(&par.lock);
+    WakeAllConditionVariable(&par.go);
+    astc_rows(&j);
+    AcquireSRWLockExclusive(&par.lock);     /* every helper has let go of j (it is on this stack) */
+    while (par.busy) SleepConditionVariableSRW(&par.done, &par.lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&par.lock);
+    ReleaseSRWLockExclusive(&par.job_lock);
 }

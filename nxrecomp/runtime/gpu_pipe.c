@@ -152,7 +152,7 @@ static Pipe *pipe_claim(const PipeKey *k, LONG add, bool *claimed) {
 /* the pipeline for k, `next` chained into its create info (binaries, capture) */
 static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModule vs, VkShaderModule fs, VkPipeline *pipe) {
     VkResult r;
-    if (k->compute) {
+    if (k->compute & 1) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, next,
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                       vk.warp_stages & VK_SHADER_STAGE_COMPUTE_BIT ? &vk_warp : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -173,8 +173,13 @@ static VkResult pipeline_create(const PipeKey *k, const void *next, VkShaderModu
              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main", .pSpecializationInfo = &vspec},
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk.warp_stages & VK_SHADER_STAGE_FRAGMENT_BIT ? &vk_warp : NULL,
              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main", .pSpecializationInfo = &spec}};
+        /* the topology is dynamic; its class is the pipeline's where the device wants that (the key's, vk.topo_class;
+         * else every pipeline is of the triangle class) */
+        static const VkPrimitiveTopology of_class[4] = {   /* (patches: draws with tessellation shaders are skipped) */
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                     .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+                                                     .topology = of_class[k->compute >> 8 & 3]};
         VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {
             VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = k->minus_one};
         VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, &dcc};
@@ -433,7 +438,7 @@ static VkPipeline pipeline_build(const PipeKey *k, VkShaderModule vs, VkShaderMo
     } else r = pipeline_create(k, NULL, vs, fs, &pipe);
     InterlockedIncrement(&pcache_builds);
     if (r != VK_SUCCESS) {
-        hlog(0, "gpu: %s pipeline for %016llx / %016llx failed: %d", k->compute ? "compute" : "graphics", k->vs, k->fs, r);
+        hlog(0, "gpu: %s pipeline for %016llx / %016llx failed: %d", k->compute & 1 ? "compute" : "graphics", k->vs, k->fs, r);
         pipe = NULL;
     }
     return pipe;
@@ -520,7 +525,7 @@ VkPipeline pipeline_get(const PipeKey *k, VkShaderModule vs, VkShaderModule fs, 
         if (p->state == P_READY) return p->pipe;
         p = pipe_claim(k, P_BUILDING, &claimed);    /* the worker gave it back (no SPIR-V on disk): built here */
     }
-    if (env.pipe_log && !k->compute) {
+    if (env.pipe_log && !(k->compute & 1)) {
         char fb[256];
         int fn = 0;
         for (u32 i = 0; i < k->ncolor; i++) {

@@ -118,6 +118,12 @@ void bury(int kind, void *a, const VkAlloc *alloc) {
 
 static VkCommandBuffer cmd(void);
 
+/* staging chunks past a slot's own (staging) that outlived their submission, for the next one that needs more:
+ * each was a 32 MB allocation made and freed again in every submission of a load or an area change */
+#define STAGING_SPARES 2
+static VkBuf spare[STAGING_SPARES];
+static int nspare;
+
 void slot_open(void) {
     static int next;
     Slot *s = &slots[next];
@@ -152,7 +158,10 @@ void slot_open(void) {
         vkResetQueryPool(vk.dev, tl_pool, 2 * next, 2);
     }
     occ_slot_open(next);
-    for (int i = 0; i < s->nextra; i++) vk_buffer_free(&s->extra[i]);
+    for (int i = 0; i < s->nextra; i++) {       /* its last use is done: a couple are kept for the next to need one */
+        if (s->extra[i].size == STAGING_SIZE && nspare < STAGING_SPARES) spare[nspare++] = s->extra[i];
+        else vk_buffer_free(&s->extra[i]);
+    }
     s->nextra = 0;
     s->staging_used = 0;
     VKCHECK(vkResetCommandPool(vk.dev, s->pool, 0));
@@ -188,8 +197,9 @@ void *staging(u64 size, VkBuffer *buf, u64 *off) {
     VkBuf *e = &s->extra[s->nextra++];
     u64 chunk = size > STAGING_SIZE ? size : STAGING_SIZE;
     s->extra_used = size;
-    vk_buffer(chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, e);
+    if (chunk == STAGING_SIZE && nspare) *e = spare[--nspare];
+    else vk_buffer(chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, e);
     *buf = e->buf;
     *off = 0;
     return e->a.map;
@@ -687,7 +697,7 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
         EnterCriticalSection(&gpu_cs);
         u32 i = 0;
         while (i < 15 && prof_sites[i].site && prof_sites[i].site != gpu_wait_site) i++;
-        prof_sites[i].site = gpu_wait_site;
+        if (!prof_sites[i].site) prof_sites[i].site = gpu_wait_site;    /* (past 16 callers: counted with the last) */
         prof_sites[i].ms += ms;
         prof_sites[i].n++;
         LeaveCriticalSection(&gpu_cs);

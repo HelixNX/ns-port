@@ -196,27 +196,71 @@ void descset_fill(VkDescriptorSet set, bool smp, u32 count) {            /* (sto
     }
 }
 
+/* d's entries from `from` on start over as `count` empty ones (the Vulkan set has room for the most a pool can
+ * have) */
+static void descset_entries(DescSet *d, u32 from, u32 count) {
+    u32 max = d->kind == DS_SMP ? SMPPOOL_MAX : TEXPOOL_MAX;
+    if (count > max) count = max;
+    if (!count) count = 1;
+    if (from > count) from = count;
+    d->idx = realloc(d->idx, count * sizeof *d->idx);
+    d->res = realloc(d->res, count);
+    d->img = realloc(d->img, count * sizeof *d->img);
+    d->intv = realloc(d->intv, count);
+    memset(d->idx + from, 0xff, (count - from) * sizeof *d->idx);
+    memset(d->res + from, 0, count - from);
+    memset(d->img + from, 0, (count - from) * sizeof *d->img);
+    memset(d->intv + from, 0, count - from);
+    d->count = count;
+    d->synced = 0;                      /* the guest's entries are read again (descset_sync) */
+    d->gen++;
+    desc_gen++;
+}
+
+/* The game's pool objects are not followed (nothing says when the GPU is done with one), so a set stays with its
+ * address. Past a few sets of a kind, one no draw has used for ten seconds is given to the new pool instead of
+ * making another: each is big (a texture set has 9 x 65536 descriptors), and the pool the sampler and image sets
+ * come from holds 16 and 8 */
+#define DESCSET_IDLE 600
+static DescSet *descset_recycle(u32 kind) {
+    static const u32 keep[3] = {[DS_TEX] = 8, [DS_SMP] = 12, [DS_IMG] = 6};
+    DescSet *old = NULL;
+    u32 n = 0;
+    for (DescSet *d = descsets; d; d = d->next) {
+        if (d->kind != kind) continue;
+        n++;
+        if (d->used + DESCSET_IDLE < frame_no && (!old || d->used < old->used)) old = d;
+    }
+    return n >= keep[kind] ? old : NULL;
+}
+
 DescSet *descset_get(const CmdPool *p, u32 kind) {
     if (!p->addr) return NULL;
-    for (DescSet *d = descsets; d; d = d->next)
-        if (d->addr == p->addr && d->kind == kind) return d;
     bool smp = kind == DS_SMP;
-    DescSet *d = calloc(1, sizeof *d);
+    for (DescSet *d = descsets; d; d = d->next)
+        if (d->addr == p->addr && d->kind == kind) {
+            d->used = frame_no;
+            /* a pool made again at the same place with more entries (the new ones showed the black texture) */
+            if (p->count > d->count && d->count < (smp ? SMPPOOL_MAX : TEXPOOL_MAX)) descset_entries(d, d->count, p->count);
+            return d;
+        }
+    DescSet *d = descset_recycle(kind);
+    if (d) {
+        hlog(1, "gpu: %s pool at %llx takes the set of the one at %llx, unused for %llu frames",
+             smp ? "sampler" : kind == DS_IMG ? "image" : "texture", p->addr, d->addr, frame_no - d->used);
+        if (kind != DS_IMG) descset_fill(d->set, smp, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
+    } else {
+        d = calloc(1, sizeof *d);
+        d->kind = kind;
+        d->set = kind == DS_TEX ? alloc_tex_set() : alloc_set(smp ? set_smp : set_img, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
+        if (kind != DS_IMG) descset_fill(d->set, smp, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
+        d->next = descsets;
+        descsets = d;
+    }
     d->addr = p->addr;
-    d->kind = kind;
-    d->count = p->count > (smp ? SMPPOOL_MAX : TEXPOOL_MAX) ? (smp ? SMPPOOL_MAX : TEXPOOL_MAX) : p->count;
-    if (!d->count) d->count = 1;
-    d->set = kind == DS_TEX ? alloc_tex_set() : alloc_set(smp ? set_smp : set_img, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
-    if (kind != DS_IMG) descset_fill(d->set, smp, smp ? SMPPOOL_MAX : TEXPOOL_MAX);
-    d->idx = malloc(d->count * sizeof *d->idx);
-    memset(d->idx, 0xff, d->count * sizeof *d->idx);
-    d->res = calloc(d->count, 1);
-    d->img = calloc(d->count, sizeof *d->img);
-    d->intv = calloc(d->count, 1);
+    d->used = frame_no;
     d->epoch = ~0ull;
-    d->next = descsets;
-    descsets = d;
-    desc_gen++;
+    descset_entries(d, 0, p->count);
     hlog(1, "gpu: %s pool at %llx: %u entries", smp ? "sampler" : kind == DS_IMG ? "image" : "texture", p->addr, d->count);
     return d;
 }
@@ -319,11 +363,49 @@ static void descset_resolve(DescSet *d, u32 i) {
     d->img[i] = im;
 }
 
+/* Images were destroyed or remade since d last looked: the entries that held one are looked up again at their next
+ * use (images_gone has each one since; past what it keeps, every entry) */
+static void descset_drop_gone(DescSet *d) {
+    u64 n = image_epoch - d->epoch;
+    if (d->pools != pools_gen) {        /* the pools changed: an entry that found no image may find one now */
+        for (u32 i = 0; i < d->count; i++)
+            if (!d->img[i]) d->res[i] = 0;
+        d->pools = pools_gen;
+    }
+    if (d->epoch == image_epoch) {
+        /* (only the pools) */
+    } else if (d->epoch == ~0ull || n > GONE_MAX) {
+        memset(d->res, 0, d->count);
+        memset(d->img, 0, d->count * sizeof *d->img);
+    } else {
+        enum { TAB = 2 * GONE_MAX };    /* the gone ones, hashed by address (open addressing, at most half full) */
+        const Image *tab[TAB] = {0};
+#define GONE_HASH(p) ((u32)(((uintptr_t)(p) >> 4) * 0x9e3779b1u) >> 21 & (TAB - 1))
+        for (u64 e = d->epoch; e != image_epoch; e++) {
+            const Image *im = images_gone[e % GONE_MAX];
+            u32 h = GONE_HASH(im);
+            while (tab[h] && tab[h] != im) h = (h + 1) & (TAB - 1);
+            tab[h] = im;
+        }
+        for (u32 i = 0; i < d->count; i++) {
+            const Image *im = d->img[i];
+            if (!im) continue;
+            for (u32 h = GONE_HASH(im); tab[h]; h = (h + 1) & (TAB - 1))
+                if (tab[h] == im) { d->res[i] = 0; d->img[i] = NULL; break; }
+        }
+#undef GONE_HASH
+    }
+    d->epoch = image_epoch;
+    d->gen++;
+    desc_gen++;
+}
+
 void descset_use(DescSet *d, const u64 *tex, u32 n) {
     if (!d) return;
-    /* draws mostly use the textures the last one did: in the same frame, with the same entries and images, the
-     * images are already touched (n <= 32; one record per handle array: each stage's textures and images) */
-    static struct { const u64 *tex; const DescSet *d; u64 gen, frame, epoch, bind; u64 h[32]; } seen[8];
+    /* draws mostly use the textures the last one did: in the same frame and command buffer, with the same entries
+     * and images, the images are already touched and the linear ones listed for their copy back (n <= 32; one
+     * record per handle array: each stage's textures and images) */
+    static struct { const u64 *tex; const DescSet *d; u64 gen, frame, epoch, bind, serial; u64 h[32]; } seen[8];
     int e = 0;
     while (e < 8 && seen[e].tex && seen[e].tex != tex) e++;
     if (e == 8) e = (int)(((uintptr_t)tex >> 4) & 7);
@@ -332,18 +414,13 @@ void descset_use(DescSet *d, const u64 *tex, u32 n) {
     for (int s = 0; s < ST_COUNT; s++)
         if (tex == st.tex[s] || tex == st.img[s]) bind = bind_gen[s] + 1;
     if (seen[e].tex == tex && seen[e].d == d && seen[e].gen == d->gen && seen[e].frame == frame_no &&
-        seen[e].epoch == image_epoch && n <= 32 &&
+        seen[e].epoch == image_epoch && seen[e].serial == slot_serial && d->pools == pools_gen && n <= 32 &&
         ((bind && seen[e].bind == bind) || !memcmp(seen[e].h, tex, n * sizeof *tex))) {
         seen[e].bind = bind;
         return;
     }
     for (int pass = 0; pass < 4; pass++) {
-        if (d->epoch != image_epoch) {          /* images were destroyed: the pointers may be stale */
-            memset(d->res, 0, d->count);
-            d->epoch = image_epoch;
-            d->gen++;
-            desc_gen++;
-        }
+        if (d->epoch != image_epoch || d->pools != pools_gen) descset_drop_gone(d);    /* some pointers may be stale */
         for (u32 k = 0; k < n; k++) {
             u32 h = (u32)tex[k], id = h & 0xfffff;
             if (!h || id >= d->count) continue;
@@ -361,6 +438,7 @@ void descset_use(DescSet *d, const u64 *tex, u32 n) {
         seen[e].gen = d->gen;
         seen[e].frame = frame_no;
         seen[e].epoch = image_epoch;
+        seen[e].serial = slot_serial;
         seen[e].bind = bind;
         memcpy(seen[e].h, tex, n * sizeof *tex);
     }

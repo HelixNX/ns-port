@@ -61,7 +61,13 @@ static u32 info_hash(const TexInfo *t0) {
     return h % IMAGE_BUCKETS;
 }
 
-u64 image_epoch;                        /* bumped whenever images are destroyed */
+/* Bumped whenever an image is destroyed or remade (image_rescale): what holds Image pointers or views looks again.
+ * images_gone names the image of each bump (epoch % GONE_MAX), so that a descriptor set drops only the entries that
+ * held one (descset_use); every entry of every set was looked up and written again after each eviction or pool
+ * change, in the frames that stream textures in */
+u64 image_epoch;
+const Image *images_gone[GONE_MAX];
+static void image_gone(const Image *im) { images_gone[image_epoch++ % GONE_MAX] = im; }
 
 /* every image by storage address (sub-resource lookups) */
 static Image **byaddr;
@@ -92,7 +98,7 @@ static void byaddr_remove(Image *im) {
 }
 
 static void image_destroy(Image *im) {
-    image_epoch++;
+    image_gone(im);
     if (im->wb_pending)
         for (int i = 0; i < nwb; i++)
             if (wb_list[i] == im) { wb_list[i] = wb_list[--nwb]; break; }
@@ -306,7 +312,10 @@ Image *image_find(const TexInfo *t, u32 *layer, u32 *level) {
     image_key(t, &k);
     for (Image *im = buckets[h]; im; im = im->next) {
         image_key(&im->info, &ki);
-        if (!memcmp(&ki, &k, sizeof k)) return image_get(t);
+        if (memcmp(&ki, &k, sizeof k)) continue;
+        if ((t->levels ? t->levels : 1) > im->levels) return image_get(t);     /* it grows */
+        im->used = frame_no + 1;
+        return im;
     }
     /* inside a bigger image? (scan back over images that start at or below t) */
     int i = byaddr_lower(t->addr + 1);
@@ -565,17 +574,26 @@ u32 view_layers(const Image *im, const ViewInfo *v, u32 kind, u32 *base) {
     return v->num_layers && *base + v->num_layers <= n && !slices ? v->num_layers : n - *base;
 }
 
+/* the format a view of im in guest view v's format gets (an attachment view's own; sampled and storage views go on
+ * from it): v's, or the image's where v's has other aspects or is not in the image's format list (format_list;
+ * *unlisted then says which it was) */
+VkFormat view_format(const Image *im, const ViewInfo *v, VkFormat *unlisted) {
+    VkFormat fmt = usable_format(v->format);
+    if (fmt == VK_FORMAT_UNDEFINED || format_aspects(fmt) != im->aspects) return im->format;
+    if (format_listed(im, fmt)) return fmt;
+    if (unlisted) *unlisted = fmt;
+    return im->format;
+}
+
 VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
     for (int i = 0; i < im->nviews; i++)
         if (im->views[i].kind == kind && !memcmp(&im->views[i].v, v, sizeof *v)) return im->views[i].view;
-    VkFormat fmt = usable_format(v->format);
-    if (fmt == VK_FORMAT_UNDEFINED || format_aspects(fmt) != im->aspects) fmt = im->format;
-    if (!format_listed(im, fmt)) {      /* not in the image's format list (format_list): seen as its own format */
+    VkFormat unlisted = VK_FORMAT_UNDEFINED, fmt = view_format(im, v, &unlisted);
+    if (unlisted != VK_FORMAT_UNDEFINED) {
         static int warned;
         if (warned++ < 16)
             hlog(0, "gpu: view of image vk %d (guest f%u, %ux%u) as vk %d (guest f%u) not in its format list",
-                 im->format, im->info.format, im->info.width, tex_height(&im->info), fmt, v->format);
-        fmt = im->format;
+                 im->format, im->info.format, im->info.width, tex_height(&im->info), unlisted, v->format);
     }
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .format = fmt};
     u32 base_level = v->base_level < im->levels ? v->base_level : im->levels - 1;
@@ -729,7 +747,7 @@ static void blit_levels(VkImage s, u32 ss, VkImage d, u32 ds, VkImageAspectFlags
 }
 
 /* im remade at scale s (its old contents blitted over where the format allows; otherwise cleared). The Image stays
- * (descriptor sets hold it): its views go, and the image epoch makes every set look its entries up again */
+ * (descriptor sets hold it): its views go, and the image epoch makes the sets look its entries up again */
 void image_rescale(Image *im, u32 s) {
     if (im->scale == s) return;
     end_rendering();
@@ -755,7 +773,7 @@ void image_rescale(Image *im, u32 s) {
     for (int i = 0; i < im->nviews; i++) bury(DEAD_VIEW, im->views[i].view, NULL);
     im->nviews = 0;
     bury(DEAD_IMAGE, old, &olda);
-    image_epoch++;
+    image_gone(im);
 }
 
 static bool image_upload_into(Image *im, VkImage target);

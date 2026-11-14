@@ -197,6 +197,8 @@ extern Image *buckets[IMAGE_BUCKETS];
 extern int nimages;
 extern u64 image_bytes;
 extern u64 image_epoch;
+#define GONE_MAX 1024
+extern const Image *images_gone[GONE_MAX];
 void images_drop_range(u64 lo, u64 hi);
 VkFormatFeatureFlags format_features(VkFormat f);
 
@@ -217,6 +219,7 @@ Image *image_find(const TexInfo *t, u32 *layer, u32 *level);
 Image *image_ref(const TexRef *r, ViewInfo *v);
 Image *image_get(const TexInfo *t);
 u32 view_layers(const Image *im, const ViewInfo *v, u32 kind, u32 *base);
+VkFormat view_format(const Image *im, const ViewInfo *v, VkFormat *unlisted);
 VkImageView image_view(Image *im, const ViewInfo *v, u32 kind);
 
 /* a plain 2D (array) image for staging copies into and out of scaled images, in GENERAL layout */
@@ -309,6 +312,9 @@ u64 now_ns(void);
 void occ_begin(void);
 void occ_end(void);
 bool occ_mark(bool report, u64 addr);
+bool occ_draw_begin(u32 tag);
+void occ_draw_end(void);
+void occ_forget(const u8 *lo, const u8 *hi);
 void occ_slot_open(int slot);
 void occ_submitted(int slot, u64 value);
 void occ_resolve(void);
@@ -363,6 +369,8 @@ typedef struct DescSet {
     Image **img;                        /* ... and the image written (NULL: the dummy) */
     u8 *intv;                           /* texture entries: read through integer views (HANDLE_INT) */
     u64 epoch, synced;
+    u64 pools;                          /* pools_gen when the entries without an image were last looked up */
+    u64 used;                          /* the frame a draw or dispatch last asked for it in (descset_recycle) */
     u64 gen;                            /* bumped whenever an entry's image may change (res set or cleared) */
     struct DescSet *next;
 } DescSet;
@@ -406,7 +414,8 @@ typedef struct PipeKey {
     u32 ncolor, samples, minus_one;
     u32 logic_op;                       /* VkLogicOp, only without a dynamic logic op (vk.dyn_logic_op) */
     u32 alpha_func;                     /* NVN's alpha test (1-7; 0 = always passes): the fragment shader's ALPHA_FUNC */
-    u32 compute;
+    u32 compute;                        /* bit 0; a graphics pipeline's topology class in bits 8-9 (0 triangles, 1 points,
+                                         * 2 lines, 3 patches), only where the device ties it to the pipeline (vk.topo_class) */
     /* the vertex layout, only without dynamic vertex input (vk.vi_dynamic; else 0): per location the VkFormat as
      * fetched (bits 0-7, 0: unset), stream (8-12) and offset (13-26); the streams read per instance (vi_inst) */
     u32 vi_inst;
@@ -464,6 +473,7 @@ static inline void rec_forget(void) {
     memset(&rec, 0, sizeof rec);
     rec.serial = slot_serial;
 }
+void query_result(u32 tag, u64 samples);
 void draw(u32 op, const void *payload);
 void dispatch(u32 op, const u8 *pay);
 void dump_image_as(Image *im, const char *name, bool raw, VkFormat fmt);

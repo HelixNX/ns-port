@@ -137,6 +137,10 @@ static bool spv_exists(u64 hash) {
 }
 struct JitQueue jit = {.lock = SRWLOCK_INIT};
 static volatile u64 jit_done;          /* the last request a finished batch covered */
+/* a translation batch is done, or the preload thread has loaded a shader: the render thread may be waiting for it
+ * (shader_load, shader_module_w). It polled with Sleep(1) (to the next timer tick, up to 15.6 ms) and Sleep(0) */
+static SRWLOCK shader_wait_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE shader_wait_cv = CONDITION_VARIABLE_INIT;
 
 static volatile u64 jit_last_request_ms;   /* GetTickCount64 of the last request */
 
@@ -272,7 +276,10 @@ static unsigned __stdcall jit_thread(void *p) {
         }
         free(hs);
         free(ms);
+        AcquireSRWLockExclusive(&shader_wait_lock);
         __atomic_store_n(&jit_done, upto, __ATOMIC_RELEASE);
+        ReleaseSRWLockExclusive(&shader_wait_lock);
+        WakeAllConditionVariable(&shader_wait_cv);
     }
     return 0;
 }
@@ -332,7 +339,10 @@ static unsigned __stdcall preload_thread(void *arg) {
         ReleaseSRWLockExclusive(&preload.lock);
         if (InterlockedCompareExchange(&s->load_state, 1, 0) != 0) continue;    /* a draw has it */
         shader_load(s, true);
+        AcquireSRWLockExclusive(&shader_wait_lock);
         InterlockedExchange(&s->load_state, 2);
+        ReleaseSRWLockExclusive(&shader_wait_lock);
+        WakeAllConditionVariable(&shader_wait_cv);
         if (InterlockedIncrement(&preloaded) % 500 == 0) hlog(1, "gpu: %ld shaders loaded ahead of their draws", preloaded);
     }
 }
@@ -372,7 +382,10 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
         if (!wait && jit_pending(seq)) return NULL;
         if (seq) {
             u64 t0 = GetTickCount64();
-            while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq) Sleep(1);
+            AcquireSRWLockExclusive(&shader_wait_lock);
+            while (__atomic_load_n(&jit_done, __ATOMIC_ACQUIRE) < seq)
+                SleepConditionVariableSRW(&shader_wait_cv, &shader_wait_lock, INFINITE, 0);
+            ReleaseSRWLockExclusive(&shader_wait_lock);
             hlog(1, "gpu: waited %llu ms for shader %016llx", GetTickCount64() - t0, s->hash);
             hf.jit += (double)(GetTickCount64() - t0);
             hf.njit++;
@@ -453,7 +466,9 @@ VkShaderModule shader_module_w(ShaderCode *s, bool wait) {
     double t0 = ms_now();
     VkShaderModule m;
     if (InterlockedCompareExchange(&s->load_state, 1, 0) == 1) {    /* the preload thread is on it: nearly done */
-        while (s->load_state == 1) Sleep(0);
+        AcquireSRWLockExclusive(&shader_wait_lock);
+        while (s->load_state == 1) SleepConditionVariableSRW(&shader_wait_cv, &shader_wait_lock, INFINITE, 0);
+        ReleaseSRWLockExclusive(&shader_wait_lock);
         m = s->module;
     } else {                            /* ours (or loaded and failed before: as it was) */
         m = shader_load(s, wait);

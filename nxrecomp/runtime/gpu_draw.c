@@ -170,7 +170,7 @@ bool begin_rendering(void) {
         st.rt_sub[i].addr = im->info.addr, st.rt_sub[i].size = im->size;
         st.rt_sub[i].level = l, st.rt_sub[i].layer = l0, st.rt_sub[i].nlayers = nl;
         color[i].imageView = v;
-        st.rt_format[i] = usable_format(st.rt[i].v.format) != VK_FORMAT_UNDEFINED ? usable_format(st.rt[i].v.format) : im->format;
+        st.rt_format[i] = view_format(im, &st.rt[i].v, NULL);   /* the view's own: the pipeline's has to be the same */
         st.samples = im->info.samples > 1 ? im->info.samples : 1;
         color[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -294,6 +294,17 @@ static VkPrimitiveTopology topology(u32 mode) {
     case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
     case 14: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;     /* 4, and quads after conversion */
+    }
+}
+
+/* a topology's class, as PipeKey.compute holds it (gpu_pipe.c): 0 triangles, 1 points, 2 lines, 3 patches */
+static u32 topo_class(VkPrimitiveTopology t) {
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 1;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return 2;
+    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return 3;
+    default: return 0;
     }
 }
 
@@ -497,7 +508,7 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
     }
     d.sc = clear_rect();
     if (!d.sc.extent.width || !d.sc.extent.height) d.sc = (VkRect2D){{0, 0}, {1, 1}};
-    d.line_width = st.line_width > 0 ? st.line_width : 1;
+    d.line_width = st.line_width > 0 && vk.features.wideLines ? st.line_width : 1;
     d.bias[0] = st.poly_offset[1]; d.bias[1] = st.poly_offset[2]; d.bias[2] = st.poly_offset[0];
     memcpy(d.blend, st.blend_color, sizeof d.blend);
     d.bounds[0] = st.depth_bounds[0];
@@ -515,7 +526,7 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
     if (debug_rt_hit() && env.debug_rt_bits & 2) d.dtest = 0;
     d.dwrite = (st.ds.flags & 2) != 0;
     d.dcmp = compare_op(st.ds.depth_func);
-    d.dbtest = st.depth_bounds_test;
+    d.dbtest = st.depth_bounds_test && vk.features.depthBounds;
     d.stest = (st.ds.flags & 4) != 0;
     d.sop[0][0] = stencil_op(st.ds.fail & 15); d.sop[0][1] = stencil_op(st.ds.zpass & 15);
     d.sop[0][2] = stencil_op(st.ds.zfail & 15); d.sop[0][3] = compare_op(st.ds.stencil_func & 15);
@@ -920,7 +931,8 @@ static int xfb_hazard_kind(u32 op, const void *payload) {
         if ((streams >> i & 1) &&
             xfb_dirty_overlaps(st.vbuf[i].addr, st.vbuf[i].size ? st.vbuf[i].size : ~0ull - st.vbuf[i].addr)) return 1;
     for (u32 stage = 0; stage < ST_COUNT; stage++) {
-        if (stage != ST_COMPUTE && st.program && !st.program->stage[stage]) continue;
+        /* (not compute's: a draw reads none of them, and buffers left bound there ended passes for nothing) */
+        if (stage == ST_COMPUTE || (st.program && !st.program->stage[stage])) continue;
         for (u32 i = 0; i < 18; i++) if (xfb_dirty_overlaps(st.ubo[stage][i].addr, st.ubo[stage][i].size)) return 2;
         for (u32 i = 0; i < 16; i++) if (xfb_dirty_overlaps(st.ssbo[stage][i].addr, st.ssbo[stage][i].size)) return 3;
     }
@@ -974,16 +986,28 @@ static void dump_after_draw(void) {
 
 /* Traced frames (F12, NX_TRACE): an occlusion query around each Vulkan draw, its samples logged at present: a
  * draw with no samples while its object is in view was culled in its shaders or its geometry collapsed */
-typedef struct QueryLog { u64 draw, vs, fs; } QueryLog;
+typedef struct QueryLog { u64 draw, vs, fs, samples; u32 src; } QueryLog;
+enum { Q_OWN = 1, Q_OCC, Q_OCC_DONE };  /* from query_pool / the pass's occlusion query, cut around the draw / ... resolved */
 #define QUERY_MAX 16384
 static VkQueryPool query_pool;
 static QueryLog query_draw[QUERY_MAX];
 static u32 nqueries;
-static bool query_on;
+static bool query_on, query_occ;
+
+/* gpu_query.c: the samples of the draw occ_draw_begin was given this number for */
+void query_result(u32 i, u64 samples) {
+    if (i >= QUERY_MAX) return;
+    query_draw[i].samples = samples;
+    query_draw[i].src = Q_OCC_DONE;
+}
 
 static void query_begin(VkCommandBuffer c) {
     query_on = trace_frame() && nqueries < QUERY_MAX && st.rendering;
     if (!query_on) return;
+    /* while the game counts samples the pass has an occlusion query open (gpu_query.c), and Vulkan allows one of a
+     * type at a time: that one is cut before and after the draw and its count for the piece comes back through
+     * query_result */
+    if ((query_occ = occ_draw_begin(nqueries))) return;
     if (!query_pool) {
         VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION,
                                     .queryCount = QUERY_MAX};
@@ -995,20 +1019,24 @@ static void query_begin(VkCommandBuffer c) {
 
 static void query_end(VkCommandBuffer c) {
     if (!query_on) return;
-    vkCmdEndQuery(c, query_pool, nqueries);
-    query_draw[nqueries++] = (QueryLog){draws, pipe_vs_hash, pipe_fs_hash};
+    if (query_occ) occ_draw_end();
+    else vkCmdEndQuery(c, query_pool, nqueries);
+    query_draw[nqueries++] = (QueryLog){draws, pipe_vs_hash, pipe_fs_hash, 0, query_occ ? Q_OCC : Q_OWN};
     query_on = false;
 }
 #define QUERIED(stmt) do { query_begin(c); stmt; query_end(c); } while (0)
 
 void draw(u32 op, const void *payload) {
-    if (st.xfb_captured && xfb_hazard(op, payload)) {   /* what was captured is read (or captured into) next */
-        bool in_pass = st.rendering;
-        end_rendering();
-        if (!in_pass) barrier();        /* end_rendering has made one */
-        st.xfb_captured = false;
-        memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
-    nxfb_ranges = 0;
+    /* what was captured is read (or captured into) next: the pass ends, with its barrier, which forgets the
+     * captures (they are made inside a pass, so one is open) */
+    if (st.xfb_captured && xfb_hazard(op, payload)) {
+        if (st.rendering) end_rendering();
+        else {
+            barrier();
+            st.xfb_captured = false;
+            memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
+            nxfb_ranges = 0;
+        }
     }
     draw_one(op, payload);
     label_draw_end();
@@ -1158,12 +1186,27 @@ static void draw_one(u32 op, const void *payload) {
     k.minus_one = depth_mode == 0;
     if (!vk.dyn_logic_op) k.logic_op = st.color.logic_op & 15;
     if (fs && st.color.alpha_test >= 1 && st.color.alpha_test <= 7) k.alpha_func = st.color.alpha_test;
+    /* alpha to coverage on one sample (set_dynamic_state leaves it off there): the pixel is kept from alpha 0.5 up,
+     * as an alpha test (the shader's ALPHA_FUNC is the pipeline's: it has to be in the key). Only with a color
+     * target 0: without one (the G-buffer passes, targets 1-4) its alpha means nothing, and testing it hid whole
+     * objects */
+    bool a2c_test = fs && st.ms.a2c && st.samples <= 1 && (st.color.alpha_test == 0 || st.color.alpha_test == 8) &&
+                    st.nrt && st.rt[0].t.addr;
+    if (a2c_test) k.alpha_func = 7;     /* GEQUAL */
+    /* a device that ties a draw's topology class to its pipeline's (vk.topo_class): the class is part of the key */
+    if (vk.topo_class) k.compute = topo_class(topology(((const CmdDraw *)payload)->mode)) << 8;
     if (!vk.vi_dynamic) vi_key(&k);
     bool pending;
     VkPipeline pipe = pipeline_get(&k, vs, fs, env.async_shaders, &pending);
     if (!pipe) { skip_draw(pending ? "pipeline being built (NX_ASYNC_SHADERS)" : "pipeline creation failed"); return; }
     if (trace_frame()) {
-        const CmdDraw *d = payload;
+        CmdDraw td = {0};               /* an indirect draw's counts are in GPU memory (ind_log_report) */
+        if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) memcpy(&td, payload, sizeof td);
+        else {
+            const CmdDrawIndirect *di = payload;
+            td.mode = di->mode, td.index_type = di->index_type, td.index_addr = di->index_addr;
+        }
+        const CmdDraw *d = &td;
         static char tb[8192];
         int tn = 0;
 #define TP(...) (tn += snprintf(tb + tn, tn < (int)sizeof tb ? sizeof tb - tn : 0, __VA_ARGS__))
@@ -1321,10 +1364,8 @@ static void draw_one(u32 op, const void *payload) {
     struct { u32 func; float ref, point_size; u32 debug, scale; } pc = {st.color.alpha_test, st.alpha_ref,
         st.point_size * (float)rts, (u32)(no_discard && (st.ds.flags & 2)), rs_scale | rts << 8};
     if (debug_rt_hit() && env.debug_rt_bits & 1) pc.debug |= 1;
-    /* only with a color target 0: without one (the G-buffer passes, targets 1-4) its alpha means nothing, and
-     * testing it hid whole objects */
-    if (st.ms.a2c && st.samples <= 1 && (pc.func == 0 || pc.func == 8) && st.nrt && st.rt[0].t.addr) {
-        pc.func = 7;                    /* GEQUAL 0.5: alpha to coverage on one sample */
+    if (a2c_test) {                     /* GEQUAL 0.5: alpha to coverage on one sample (the key's alpha_func) */
+        pc.func = 7;
         pc.ref = 0.5f;
     }
     if (all || memcmp(&pc, rec.pc, PC_SIZE)) {
@@ -1368,6 +1409,11 @@ static void draw_one(u32 op, const void *payload) {
     const CmdDrawIndirect *d = payload;
     VkBuffer buf, ib;
     u64 off, io;
+    /* (their counts are in GPU memory: no index list can be made here, and as triangle lists they drew garbage) */
+    if (d->mode == 7 || d->mode == 2 || d->mode == 8 || d->mode == 9) {
+        skip_draw("indirect draw of quads / line loop / quad strip / polygon");
+        return;
+    }
     if (!gpu_buffer(d->indirect, &buf, &off)) { skip_draw("indirect buffer not GPU memory"); return; }
     if (trace_frame() && nind_log < IND_LOG_MAX)
         ind_log[nind_log++] = (IndLog){draws, pipe_vs_hash, pipe_fs_hash, d->indirect, op == OP_DRAW_ARRAYS_INDIRECT};
@@ -1519,17 +1565,22 @@ void query_report(void) {
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
                               .pValues = &submitted};
     VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
-    u64 *r = malloc(nqueries * sizeof *r);
-    VkResult res = vkGetQueryPoolResults(vk.dev, query_pool, 0, nqueries, nqueries * sizeof *r, r, sizeof *r,
-                                         VK_QUERY_RESULT_64_BIT);
-    u32 none = 0;
-    for (u32 i = 0; res == VK_SUCCESS && i < nqueries; i++) {
-        if (!r[i]) none++;
-        hlog(0, "samples: draw %llu vs %016llx fs %016llx: %llu", query_draw[i].draw, query_draw[i].vs,
-             query_draw[i].fs, r[i]);
+    occ_resolve();                      /* the draws counted by the pass's occlusion query (query_result) */
+    /* our own pool's, each with whether it is there (the numbers not used for a draw never are) */
+    u64 *r = query_pool ? malloc(nqueries * 2 * sizeof *r) : NULL;
+    VkResult res = r ? vkGetQueryPoolResults(vk.dev, query_pool, 0, nqueries, nqueries * 2 * sizeof *r, r, 2 * sizeof *r,
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_SUCCESS;
+    u32 none = 0, missing = 0;
+    for (u32 i = 0; i < nqueries; i++) {
+        const QueryLog *l = &query_draw[i];
+        bool have = l->src == Q_OCC_DONE || (l->src == Q_OWN && r && res == VK_SUCCESS && r[2 * i + 1]);
+        if (!have) { missing++; continue; }
+        u64 n = l->src == Q_OCC_DONE ? l->samples : r[2 * i];
+        if (!n) none++;
+        hlog(0, "samples: draw %llu vs %016llx fs %016llx: %llu", l->draw, l->vs, l->fs, n);
     }
-    hlog(0, "samples: %u draws queried, %u drew nothing%s", nqueries, none, res == VK_SUCCESS ? "" : " (results not ready)");
+    hlog(0, "samples: %u draws queried, %u drew nothing, %u without a result", nqueries, none, missing);
     free(r);
-    vkResetQueryPool(vk.dev, query_pool, 0, nqueries);
+    if (query_pool) vkResetQueryPool(vk.dev, query_pool, 0, nqueries);
     nqueries = 0;
 }

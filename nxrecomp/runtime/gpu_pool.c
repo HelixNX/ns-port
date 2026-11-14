@@ -188,6 +188,8 @@ void gpu_pool_destroyed(Pool *p) {
         if (pools[i].gpu == p->gpu && pools[i].end == p->gpu + p->size) {
             if (pools[i].hb) bury(DEAD_HOSTBUF, pools[i].hb, NULL);
             if (pools[i].mir) bury(DEAD_MIRROR, pools[i].mir, NULL), nmirrors--;
+            if (pools[i].cpu)
+                occ_forget((const u8 *)(uintptr_t)pools[i].cpu, (const u8 *)(uintptr_t)(pools[i].cpu + p->size));
             memmove(&pools[i], &pools[i + 1], (npools - i - 1) * sizeof *pools);
             npools--;
             pools_gen++;

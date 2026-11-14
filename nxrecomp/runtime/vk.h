@@ -86,6 +86,8 @@ typedef struct Vk {
      * widened to 16 bits (gpu_draw.c), without vi_dynamic the vertex layout is part of the pipeline (PipeKey vi) */
     bool u8_indices;                    /* VK_KHR_index_type_uint8 (NX_NO_U8_INDICES=1: as if absent) */
     bool vi_dynamic;                    /* VK_EXT_vertex_input_dynamic_state (NX_NO_VI_DYNAMIC=1: as if absent) */
+    bool topo_class;                    /* no dynamicPrimitiveTopologyUnrestricted: the class is in the pipeline key */
+    VkPhysicalDeviceFeatures features;  /* the core features enabled (those asked for that the device has) */
 } Vk;
 
 /* chained into a pipeline stage that is in vk.warp_stages: 32 lanes like Maxwell's warps where the GPU can (the
