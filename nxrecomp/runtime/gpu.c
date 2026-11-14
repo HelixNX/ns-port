@@ -164,6 +164,7 @@ void slot_open(void) {
     }
     s->nextra = 0;
     s->staging_used = 0;
+    s->pre_begun = false;
     VKCHECK(vkResetCommandPool(vk.dev, s->pool, 0));
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -173,6 +174,19 @@ void slot_open(void) {
     cur = next;
     next = (next + 1) % SLOTS;
     slot_serial++;
+}
+
+VkCommandBuffer pre_cmd(void) {
+    cmd();
+    Slot *s = &slots[cur];
+    if (!s->pre_begun) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VKCHECK(vkBeginCommandBuffer(s->pre, &bi));
+        barrier_in(s->pre);
+        s->pre_begun = true;
+    }
+    return s->pre;
 }
 
 /* host-visible scratch for this submission: uploads and inline data */
@@ -252,7 +266,13 @@ void flush(void) {
     if (cur < 0) return;
     if (nwb) linear_writeback();
     Slot *s = &slots[cur];
-    bool pre = mirror_sync(s->pre);
+    mirror_sync();
+    images_zero();
+    bool pre = s->pre_begun;
+    if (pre) {                          /* what it wrote, before cmd's commands read it */
+        barrier_in(s->pre);
+        VKCHECK(vkEndCommandBuffer(s->pre));
+    }
     prof_mark("(end)");
     if (env.timeline) {
         vkCmdWriteTimestamp2(s->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tl_pool, 2 * cur + 1);
@@ -279,7 +299,7 @@ void flush(void) {
         if (sync < 0) sync = getenv("NX_GPU_SYNC") != NULL;
         if (sync) {
             static u64 ld;
-            hlog(0, "NX_GPU_SYNC: submission %llu: draws %llu-%llu (%llu skipped so far), dispatches to %llu, mirror copy-in %d",
+            hlog(0, "NX_GPU_SYNC: submission %llu: draws %llu-%llu (%llu skipped so far), dispatches to %llu, pre commands %d",
                  s->value, ld + 1, draws, draws_skipped, dispatches, (int)pre);
             ld = draws;
             VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &timeline,
@@ -729,6 +749,50 @@ static void rescale_all(u32 s) {
     hlog(0, "gpu: render scale %ux -> %ux: %d images remade, %llu -> %llu MB", from, s, n, before >> 20, image_bytes >> 20);
 }
 
+/* What the images may hold of video memory (gpu_present evicts above it). With VK_EXT_memory_budget: 90% of what the
+ * driver says this process may use of the heap right now (it shrinks as other programs take video memory), less
+ * what we hold there that is no image (pool mirrors, staging, the swapchain's part), asked again every 30 frames.
+ * Without it, as before: 55% of the heap's size, now less the mirrors (a 367 MB pool's mirror was not counted) */
+static u64 image_budget(void) {
+    static u64 budget, asked, shown;
+    static u32 heap = ~0u;
+    if (heap == ~0u) {
+        heap = 0;
+        for (u32 i = 0; i < vk.mem.memoryHeapCount; i++)
+            if (vk.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT &&
+                (!(vk.mem.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ||
+                 vk.mem.memoryHeaps[i].size > vk.mem.memoryHeaps[heap].size))
+                heap = i;
+    } else if (budget && frame_no - asked < 30) return budget;
+    asked = frame_no;
+    u64 size = vk.mem.memoryHeaps[heap].size;
+    const u64 least = 256ull << 20;     /* evicting below this would only thrash */
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &mb};
+    if (vk.mem_budget) vkGetPhysicalDeviceMemoryProperties2(vk.phys, &mp);
+    u64 may = mb.heapBudget[heap], other;
+    if (may) {
+        u64 ours = mb.heapUsage[heap];
+        other = ours > image_bytes ? ours - image_bytes : 0;
+        may = may / 10 * 9;
+    } else {
+        other = mirror_bytes;
+        may = size / 100 * 55;
+    }
+    budget = may > other + least ? may - other : least;
+    if (budget > shown + shown / 8 || budget + budget / 8 < shown) {    /* at first, then when it moved by an eighth */
+        shown = budget;
+        if (mb.heapBudget[heap])
+            hlog(1, "gpu: images may use %llu MB of video memory (driver: %llu MB of the %llu MB heap are ours to use, "
+                    "%llu MB in use, %llu MB of that images)", budget >> 20, mb.heapBudget[heap] >> 20, size >> 20,
+                 mb.heapUsage[heap] >> 20, image_bytes >> 20);
+        else
+            hlog(1, "gpu: images may use %llu MB of video memory (55%% of the %llu MB heap less %llu MB of pool mirrors; "
+                    "no VK_EXT_memory_budget)", budget >> 20, size >> 20, other >> 20);
+    }
+    return budget;
+}
+
 u64 gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
     double t_present0 = ms_now();
@@ -754,14 +818,7 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     double t_flush = ms_now();
     ind_log_report();
     query_report();
-    static u64 budget;
-    if (!budget) {
-        for (u32 i = 0; i < vk.mem.memoryHeapCount; i++)
-            if (vk.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && vk.mem.memoryHeaps[i].size > budget)
-                budget = vk.mem.memoryHeaps[i].size;
-        budget = budget / 100 * 55;
-        hlog(1, "gpu: images may use %llu MB of video memory", budget >> 20);
-    }
+    u64 budget = image_budget();
     if (image_bytes > budget) images_evict(budget / 4 * 3, false);
     dump_frame(im, frame_no + 1);
     if (capture_frame && frame_no + 1 >= capture_frame) {

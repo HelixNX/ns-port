@@ -38,7 +38,8 @@ extern bool rs_hint;
 typedef struct Slot {
     VkCommandPool pool;
     VkCommandBuffer cmd;
-    VkCommandBuffer pre;                /* runs before cmd: the pool mirrors' copies (mirror_sync) */
+    VkCommandBuffer pre;                /* runs before cmd (pre_cmd): the pool mirrors' copies, new images' set-up */
+    bool pre_begun;
     u64 value;                          /* timeline value that marks it done */
     VkBuf staging;
     u64 staging_used;
@@ -101,6 +102,10 @@ static inline VkCommandBuffer cmd(void) {
     if (cur < 0) slot_open();
     return slots[cur].cmd;
 }
+/* The slot's second command buffer, which the GPU runs before cmd, begun at its first use: for work on things no
+ * command recorded so far names (a pool mirror's copy-in, a new image's layout change, zeroing and first upload).
+ * Recorded there it ends no pass in cmd and needs no barrier of its own; flush closes it with one */
+VkCommandBuffer pre_cmd(void);
 void *staging(u64 size, VkBuffer *buf, u64 *off);
 void barrier_src(VkCommandBuffer c, VkAccessFlags2 src);
 
@@ -139,6 +144,7 @@ typedef struct { u64 lo, hi; } Range;
 typedef struct Mirror { VkBuf b; bool fresh; Range *bad; int nbad, capbad; } Mirror;
 extern double mirror_mb, mirror_ms;
 extern int nmirrors;
+extern u64 mirror_bytes;
 typedef struct PoolEnt { u64 gpu, end, cpu; u32 flags; HostBuffer *hb; Mirror *mir; } PoolEnt;
 extern PoolEnt *pools;
 extern int npools, cappools;
@@ -179,6 +185,8 @@ typedef struct Image {
     u32 scale;                          /* render scale it was made at: its Vulkan size is the guest size times this */
     bool can_scale;                     /* screen-shaped (image_candidate), or drawn with a scaled depth (image_promote) */
     VkImageCreateFlags cflags;
+    u64 fresh;                          /* the slot (slot_serial) its Vulkan image was made in, until its first upload */
+    bool zero_pending;                  /* ... and not zeroed yet (images_zero) */
 } Image;
 
 /* level l's Vulkan size */
@@ -230,6 +238,7 @@ bool scale_blittable(const Image *im);
 void image_rescale(Image *im, u32 s);
 bool image_promote(Image *im);
 void image_upload(Image *im);
+void images_zero(void);
 
 /* ---------------------------------------------------------------------------------------------- state */
 typedef struct State {
@@ -486,6 +495,6 @@ extern double scan_ms, scan_ms_max;
 extern u64 scan_skips;
 void refresh_cpu_textures(void);
 void mirror_scan_start(void);
-bool mirror_sync(VkCommandBuffer pre);
+void mirror_sync(void);
 void ind_log_report(void);
 void query_report(void);

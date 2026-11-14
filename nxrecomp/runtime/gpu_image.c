@@ -97,7 +97,49 @@ static void byaddr_remove(Image *im) {
         }
 }
 
+/* A new image is zeroed (undefined memory can hold NaNs that spread) unless guest memory is uploaded over all of it
+ * in the submission that made it: the zeroing waits for that in zero_list, and what is left goes into the pre
+ * command buffer when the submission is flushed (images_zero), or when the image is remade or destroyed. Compressed
+ * formats cannot be cleared: their data is uploaded before use */
+static Image **zero_list;
+static int nzero, capzero;
+
+static void zero_drop(Image *im) {
+    if (!im->zero_pending) return;
+    im->zero_pending = false;
+    for (int i = 0; i < nzero; i++)
+        if (zero_list[i] == im) { zero_list[i] = zero_list[--nzero]; break; }
+}
+
+static void zero_record(const Image *im) {
+    VkImageSubresourceRange all = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkClearColorValue z = {{0, 0, 0, 0}};
+        vkCmdClearColorImage(pre_cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    } else {
+        VkClearDepthStencilValue z = {1, 0};
+        vkCmdClearDepthStencilImage(pre_cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    }
+}
+
+/* im's Vulkan image is about to be replaced or destroyed: zeroed first if it still waits (commands recorded since
+ * it was made may have copied from it) */
+static void zero_now(Image *im) {
+    if (!im->zero_pending) return;
+    zero_record(im);
+    zero_drop(im);
+}
+
+void images_zero(void) {
+    for (int i = 0; i < nzero; i++) {
+        zero_record(zero_list[i]);
+        zero_list[i]->zero_pending = false;
+    }
+    nzero = 0;
+}
+
 static void image_destroy(Image *im) {
+    zero_now(im);
     image_gone(im);
     if (im->wb_pending)
         for (int i = 0; i < nwb; i++)
@@ -472,7 +514,11 @@ static Image *image_make(const TexInfo *t, u32 h) {
     return im;
 }
 
-/* im's Vulkan image and memory at im->scale, its contents defined (zeros, depth 1) */
+/* im's Vulkan image and memory at im->scale, its contents defined (zeros, depth 1) by the time a command reads
+ * them. Its layout change and zeroing go into the pre command buffer: no command recorded so far names the image,
+ * so they need not end the pass being recorded nor a barrier there (each new texture a draw bound used to end the
+ * pass, clear the image and stall the GPU at two full barriers, then again for its upload: the frames that stream
+ * textures in) */
 static bool image_vk_create(Image *im) {
     const TexInfo *t = &im->info;
     VkFormat fmt = im->format;
@@ -502,7 +548,6 @@ static bool image_vk_create(Image *im) {
     image_bytes += im->alloc.size;
     im->used = frame_no + 1;
     VKCHECK(vkBindImageMemory(vk.dev, im->image, im->alloc.mem, im->alloc.offset));
-    end_rendering();
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -510,20 +555,14 @@ static bool image_vk_create(Image *im) {
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = im->image, .subresourceRange = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
-    vkCmdPipelineBarrier2(cmd(), &d);
-    /* defined contents (zeros) until something writes it: undefined memory can hold NaNs that spread */
-    VkImageSubresourceRange all = {im->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    vkCmdPipelineBarrier2(pre_cmd(), &d);
+    im->fresh = slot_serial;            /* (after pre_cmd: it may have opened the slot) */
     bool compressed = fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
-    if (compressed) {
-        /* not clearable: the CPU's data is uploaded before use */
-    } else if (im->aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
-        VkClearColorValue z = {{0, 0, 0, 0}};
-        vkCmdClearColorImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
-    } else {
-        VkClearDepthStencilValue z = {1, 0};
-        vkCmdClearDepthStencilImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    if (!compressed && !im->zero_pending) {
+        if (nzero == capzero) zero_list = realloc(zero_list, (capzero = capzero * 2 + 64) * sizeof *zero_list);
+        zero_list[nzero++] = im;
+        im->zero_pending = true;
     }
-    barrier();
     return true;
 }
 
@@ -662,8 +701,9 @@ VkImageView image_view(Image *im, const ViewInfo *v, u32 kind) {
 
 /* fill an image from the guest memory under it (block-linear or pitch layout) */
 /* ASTC: deswizzle the blocks, decode them to RGBA8 (the image's format), copy level by level */
-static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
+static void upload_astc(Image *im, const TexLayout *L, const u8 *src, bool pre) {
     bool srgb = im->info.format >= 135;
+    if (!pre) end_rendering();
     VkBufferImageCopy regions[16];
     u32 nr = 0;
     for (u32 l = 0; l < L->levels; l++) {
@@ -697,10 +737,9 @@ static void upload_astc(Image *im, const TexLayout *L, const u8 *src) {
         }
         free(blocks);
         regions[nr++] = (VkBufferImageCopy){off, w, h, {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, L->layers}, {0, 0, 0}, {w, h, 1}};
-        end_rendering();
-        vkCmdCopyBufferToImage(cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &regions[nr - 1]);
+        vkCmdCopyBufferToImage(pre ? pre_cmd() : cmd(), buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &regions[nr - 1]);
     }
-    barrier();
+    if (!pre) barrier();
 }
 bool temp_image(VkFormat f, u32 w, u32 h, u32 levels, u32 layers, Temp *t) {
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
@@ -756,6 +795,7 @@ void image_rescale(Image *im, u32 s) {
     u32 os = im->scale;
     im->scale = s;
     image_bytes -= olda.size;
+    zero_now(im);
     if (!image_vk_create(im)) {
         im->image = old;
         im->alloc = olda;
@@ -776,15 +816,19 @@ void image_rescale(Image *im, u32 s) {
     image_gone(im);
 }
 
-static bool image_upload_into(Image *im, VkImage target);
+static bool image_upload_into(Image *im, VkImage target, bool pre);
 
 static void image_upload_do(Image *im) {
-    if (im->scale <= 1) { image_upload_into(im, im->image); return; }
+    /* the first upload of an image made in this submission, which nothing recorded so far has read or written: into
+     * the pre command buffer, as its layout change (image_vk_create). The pass being recorded goes on */
+    bool pre = im->scale <= 1 && cur >= 0 && im->fresh == slot_serial && !im->gpu_written;
+    im->fresh = 0;
+    if (im->scale <= 1) { image_upload_into(im, im->image, pre); return; }
     im->valid = true;
     if (!scale_blittable(im)) return;
     Temp t;
     if (!temp_image(im->format, im->info.width, tex_height(&im->info), im->levels, im->layers, &t)) return;
-    if (image_upload_into(im, t.image)) {
+    if (image_upload_into(im, t.image, false)) {
         blit_levels(t.image, 1, im->image, im->scale, im->aspects, im->info.width, tex_height(&im->info), im->levels,
                     im->layers, smooth(im->format));
         barrier();
@@ -792,15 +836,20 @@ static void image_upload_do(Image *im) {
     temp_free(&t);
 }
 
-/* false if nothing was copied */
-static bool image_upload_into(Image *im, VkImage target) {
+/* false if nothing was copied; pre: recorded into the pre command buffer (image_upload_do) */
+static bool image_upload_into(Image *im, VkImage target, bool pre) {
     im->valid = true;
     TexLayout L;
     tex_layout(&im->info, &L);
     const u8 *src = gpu_cpu(im->info.addr, L.size);
     if (!src) return false;             /* GPU-only memory: nothing to read */
+    /* in the pre command buffer the upload comes before a zeroing still waiting: none if it writes all of the
+     * image, else the zeroing first */
+    bool whole = L.levels >= im->levels && L.layers >= im->layers;
     if (format_is_astc(im->info.format)) {
-        upload_astc(im, &L, src);       /* (never scaled: compressed) */
+        if (pre && whole) zero_drop(im);
+        else if (pre) zero_now(im);
+        upload_astc(im, &L, src, pre);  /* (never scaled: compressed) */
         return true;
     }
     if (L.bpb != 1 && L.bpb != 2 && L.bpb != 4 && L.bpb != 8 && L.bpb != 16) return false;
@@ -836,6 +885,12 @@ static bool image_upload_into(Image *im, VkImage target) {
         regions[nr++] = (VkBufferImageCopy){off + at, lv->w * L.bw, lv->h * L.bh, {asp, l, 0, L.layers}, {0, 0, 0},
                                             {w, h, d}};
         at += pitch * lv->h * lv->d * L.layers;
+    }
+    if (pre) {
+        if (whole) zero_drop(im);
+        else zero_now(im);
+        vkCmdCopyBufferToImage(pre_cmd(), buf, target, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
+        return true;
     }
     end_rendering();
     vkCmdCopyBufferToImage(cmd(), buf, target, VK_IMAGE_LAYOUT_GENERAL, nr, regions);

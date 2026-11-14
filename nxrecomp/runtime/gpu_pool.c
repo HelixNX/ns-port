@@ -53,6 +53,8 @@ u8 *gpu_cpu(u64 addr, u64 size) {
     return (u8 *)(uintptr_t)(p->cpu + (addr - p->gpu));
 }
 
+u64 mirror_bytes;                       /* device memory the mirrors hold */
+
 static Mirror *mirror_new(u64 size) {
     Mirror *m = calloc(1, sizeof *m);
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
@@ -68,12 +70,14 @@ static Mirror *mirror_new(u64 size) {
     }
     VKCHECK(vkBindBufferMemory(vk.dev, m->b.buf, m->b.a.mem, m->b.a.offset));
     m->b.size = size;
+    mirror_bytes += m->b.a.size;
     m->fresh = true;                    /* copied whole at the next submission */
     return m;
 }
 
 void mirror_free(void *p) {
     Mirror *m = p;
+    mirror_bytes -= m->b.a.size;
     vk_buffer_free(&m->b);
     free(m->bad);
     free(m);
@@ -245,14 +249,14 @@ void mirror_scan_start(void) {
     SetEvent(ms_go);
 }
 
-/* the copies into the mirrors, recorded into `pre`, which runs before the submission's commands and after the work
- * submitted before it (what that read or wrote is done): the pages the last scan found, and new mirrors whole.
- * Images on those pages are uploaded again here: the write watch over them is the scan's */
-bool mirror_sync(VkCommandBuffer pre) {
-    if (!nmirrors) return false;
+/* the copies into the mirrors, recorded into the slot's pre command buffer (pre_cmd), which runs before the
+ * submission's commands and after the work submitted before it (what that read or wrote is done): the pages the
+ * last scan found, and new mirrors whole. Images on those pages are uploaded again here: the write watch over them
+ * is the scan's */
+void mirror_sync(void) {
+    if (!nmirrors) return;
     static VkBufferCopy *rg;
     static size_t caprg;
-    bool begun = false;
     double t0 = ms_now();
     if (ms_running) WaitForSingleObject(ms_done, INFINITE);
     for (int i = 0; i < npools; i++) {
@@ -283,22 +287,10 @@ bool mirror_sync(VkCommandBuffer pre) {
             refresh_pages(pg, sc->n);
         }
         if (!nr) continue;
-        if (!begun) {
-            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-            VKCHECK(vkBeginCommandBuffer(pre, &bi));
-            barrier_in(pre);
-            begun = true;
-        }
         for (size_t k = 0; k < nr; k++) mirror_mb += (double)rg[k].size / (1 << 20);
-        vkCmdCopyBuffer(pre, p->hb->buf, m->b.buf, (u32)nr, rg);
+        vkCmdCopyBuffer(pre_cmd(), p->hb->buf, m->b.buf, (u32)nr, rg);
     }
     ms_running = false;
-    if (begun) {
-        barrier_in(pre);
-        VKCHECK(vkEndCommandBuffer(pre));
-    }
     mirror_ms += ms_now() - t0;
     hf.mirror += ms_now() - t0;
-    return begun;
 }

@@ -456,11 +456,13 @@ void vk_init(void) {
         .shaderDrawParameters = 1};
     /* pipeline binaries (with maintenance5, which they need): compiled pipelines kept between sessions by gpu.c,
      * where the driver's own caches do not keep them (AMD); NX_PIPELINE_BINARY=0 turns them off */
-    const char *exts[sizeof device_exts / sizeof *device_exts + 4];
+    const char *exts[sizeof device_exts / sizeof *device_exts + 5];
     u32 next = 0;
     for (size_t i = 0; i < sizeof device_exts / sizeof *device_exts; i++) exts[next++] = device_exts[i];
     if (vk.u8_indices) exts[next++] = VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME;
     if (vk.vi_dynamic || vi_keep) exts[next++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+    vk.mem_budget = has_ext(dext, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (vk.mem_budget) exts[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     VkPhysicalDevicePipelineBinaryFeaturesKHR hasbin = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR hasm5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &hasbin};
     VkPhysicalDeviceFeatures2 hasf5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hasm5};

@@ -11,6 +11,7 @@
 #define VK_INSTANCE_FNS(X) \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceMemoryProperties) \
+    X(vkGetPhysicalDeviceMemoryProperties2) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateDevice) \
     X(vkEnumerateDeviceExtensionProperties) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR) \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
@@ -82,6 +83,7 @@ typedef struct Vk {
     double pcie_gbps;                   /* the GPU's PCIe link in GB/s per direction (vk_pcie_link), 0 if unknown */
     bool pipeline_binary;               /* VK_KHR_pipeline_binary: gpu.c keeps compiled pipelines itself */
     bool labels;                        /* NX_GPU_LABELS, and the instance has VK_EXT_debug_utils */
+    bool mem_budget;                    /* VK_EXT_memory_budget: what the driver says we may use (gpu.c image_budget) */
     /* optional on older GPUs (AMD's GCN driver has neither; docs/GPUS.md): without u8_indices 8-bit indices are
      * widened to 16 bits (gpu_draw.c), without vi_dynamic the vertex layout is part of the pipeline (PipeKey vi) */
     bool u8_indices;                    /* VK_KHR_index_type_uint8 (NX_NO_U8_INDICES=1: as if absent) */
