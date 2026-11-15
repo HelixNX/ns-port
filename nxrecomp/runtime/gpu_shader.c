@@ -409,6 +409,8 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
     s->tex_dyn = false;
     s->texint_slots = 0;
     u32 texint_id = 0;                  /* the constant decorated SpecId 2 (TEX_INT) */
+    /* where pointers point: the storage class of each pointer type, the type of each pointer-valued result */
+    u32 *ptr_sc = bound ? calloc(bound, sizeof *ptr_sc) : NULL, *type_of = bound ? calloc(bound, sizeof *type_of) : NULL;
     for (long i = 5; i < n / 4;) {      /* what the shader touches: PhysicalStorageBufferAddresses, sampled images */
         u32 op = code[i] & 0xffff, wc = code[i] >> 16;
         if (op == 71 && wc == 4 && code[i + 2] == 1 && code[i + 3] == 2) texint_id = code[i + 1];
@@ -437,6 +439,16 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
                     s->slots_used |= (u16)(1u << (code[i + 3] & 15));
                 }
         if (op == 17 && wc == 2 && code[i + 1] == 5347) s->caps |= SHC_GLOBAL;
+        if (ptr_sc && op == 32 && wc == 4 && code[i + 1] < bound) ptr_sc[code[i + 1]] = code[i + 2] + 1;  /* OpTypePointer */
+        if (type_of && wc >= 3 && code[i + 2] < bound &&      /* variables, access chains, conversions, copies, loads */
+            (op == 59 || op == 65 || op == 66 || op == 67 || op == 120 || op == 124 || op == 83 || op == 61 ||
+             op == 55 || op == 245 || op == 169))
+            type_of[code[i + 2]] = code[i + 1];
+        u32 sp = op == 62 || op == 228 ? code[i + 1] : op >= 227 && op <= 242 && wc >= 4 ? code[i + 3] : 0;
+        if (sp) {                       /* OpStore, OpAtomic*: global memory, or a pointer of unknown kind */
+            u32 t = sp < bound && type_of ? type_of[sp] : 0, sc = t < bound && ptr_sc ? ptr_sc[t] : 0;
+            if (op != 227 && (!sc || sc - 1 == 5349)) s->caps |= SHC_GSTORE;
+        }
         if (op == 17 && wc == 2 && code[i + 1] == 53) s->caps |= SHC_XFB;         /* TransformFeedback */
         if (op == 27) s->caps |= SHC_TEXTURE;
         if (op == 25 && wc >= 9 && code[i + 7] == 1 && (code[i + 3] != 1 || code[i + 5]))
@@ -445,6 +457,8 @@ static VkShaderModule shader_load(ShaderCode *s, bool wait) {
         i += wc ? wc : 1;
     }
     free(cval);
+    free(ptr_sc);
+    free(type_of);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)n, .pCode = code};
     VkShaderModule m;
     VkResult r = vkCreateShaderModule(vk.dev, &ci, NULL, &m);

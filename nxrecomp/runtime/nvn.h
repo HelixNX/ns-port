@@ -147,7 +147,9 @@ typedef struct ShaderCode {
     volatile long load_state;           /* gpu.c: 0 not loaded, 1 someone is loading it (shader_module_w), 2 done */
 } ShaderCode;
 /* the shaders a program has now: interned, so recorded commands stay valid when the program changes */
-enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8, SHC_TEX_NON2D = 16 };
+/* SHC_GSTORE: stores or atomics through a global-memory (PhysicalStorageBuffer) pointer, or through a pointer the
+ * scan could not place; SHC_GLOBAL alone is reads */
+enum { SHC_GLOBAL = 1, SHC_TEXTURE = 2, SHC_IMAGE = 4, SHC_XFB = 8, SHC_TEX_NON2D = 16, SHC_GSTORE = 32 };
 typedef struct Shaders { ShaderCode *stage[ST_COUNT]; u32 mask; u64 key; } Shaders;
 void gpu_shader_created(ShaderCode *s);          /* translate it if it has no SPIR-V (gpu.c) */
 Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]);   /* the one Shaders object for these stages */

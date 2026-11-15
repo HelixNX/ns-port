@@ -36,7 +36,8 @@ u32 npending;
  * once a shader of the pass could store to memory or images (pass_side_writes). Captures are not in that: every
  * draw is checked against them, barrier or not (xfb_hazard). NX_BARRIER_SKIP=0: every barrier ends the pass */
 bool barrier_pending;
-static bool pass_side_writes;
+static bool pass_side_writes, pass_linear;
+static Image *pass_img[9];              /* the pass's targets (8: depth) */     /* (pass_linear: a linear target, written back by flush) */
 static u64 barriers_kept, barriers_skipped;
 
 static bool samples_target(const DescSet *ts) {
@@ -65,6 +66,87 @@ static void barrier_due(const DescSet *ts) {
     else barriers_skipped++;
 }
 
+/* Lazy pass ends (NX_LAZY_BARRIER=1). A pass that wrote only its attachments (no shader stores, captures, linear
+ * targets or buffer updates) ends without its barrier, which is owed: the targets' ranges are kept, and so is
+ * bar_epoch in every image a draw samples (Image.read_epoch). The owed barrier is paid:
+ *   - before any command recorded outside a pass (cmd() while owed_live: copies, clears, dispatches, uploads),
+ *     before a submission ends (flush) and at the game's barriers outside a pass;
+ *   - when a pass begins on a target that an owed pass wrote (two passes' writes to one image are unordered
+ *     without it) or that was sampled since the last barrier (a write after a read);
+ *   - before a draw that samples an owed target, or that could write memory (shader stores to global memory or
+ *     images, captures): the pass ends, then the barrier.
+ * Stand-still at 2x, RX 7800 XT: 6.15 -> 5.95 ms a frame (61 of ~105 pass-end barriers a frame skipped); no barrier
+ * at pass ends at all was 5.98 (an upper bound: wrong). Sync validation: no hazards (with no pass-end barriers: some) */
+#define OWED_MAX 64
+static struct { u64 lo, hi; } owed[OWED_MAX];
+static u32 nowed;                       /* ranges owed */
+static bool owed_any;                   /* a pass end's barrier was skipped since the last barrier */
+bool owed_live;                         /* owed_any and outside a pass: cmd() pays */
+static u64 side_why[5], owed_skipped, owed_paid_cmd, owed_paid_pass_w, owed_paid_pass_r, owed_paid_draw, owed_paid_mem;
+static u32 owed_why;                    /* (for the counts) 0 cmd, 1 pass on an owed target, 2 pass on a read
+                                         * target, 3 draw sampling, 4 draw with memory access */
+
+void owed_clear(void) { nowed = 0; owed_any = owed_live = false; }
+
+void owed_pay(void) {
+    if (!owed_any) { owed_live = false; return; }
+    u64 *c[] = {&owed_paid_cmd, &owed_paid_pass_w, &owed_paid_pass_r, &owed_paid_draw, &owed_paid_mem};
+    (*c[owed_why])++;
+    owed_why = 0;
+    barrier_at(GPU_AT, VK_ACCESS_2_MEMORY_WRITE_BIT);   /* clears it */
+}
+
+static bool owed_hit(u64 lo, u64 hi) {
+    for (u32 i = 0; i < nowed; i++) if (lo < owed[i].hi && owed[i].lo < hi) return true;
+    return false;
+}
+
+/* a draw about to be recorded: its sampled textures and images marked read, and the owed barrier paid first if
+ * it reads an owed target or may touch memory */
+static void owed_draw(const DescSet *ts, const DescSet *is, u32 caps) {
+    bool due = false;
+    /* a draw that writes memory may overwrite what an owed pass's draws read (vertex, index, uniform or storage data).
+     * Reading global memory is no hazard: the targets live in their own Vulkan images, not in guest memory (linear
+     * targets, written back to it, are never lazy) */
+    if (owed_any && (caps & (SHC_GSTORE | SHC_IMAGE) || (st.xfb_active && caps & SHC_XFB))) { due = true; owed_why = 4; }
+    for (u32 stage = ST_VERTEX; stage <= ST_FRAGMENT; stage++) {
+        const ShaderCode *sc = st.program->stage[stage];
+        if (!sc) continue;
+        if (sc->caps & SHC_TEXTURE && ts) {
+            u32 used = sc->tex_dyn ? ~0u : sc->tex_slots;
+            for (u32 k = 0; k < 32; k++) {
+                u32 id = (u32)st.tex[stage][k] & 0xfffff;
+                if (!(used >> k & 1) || !st.tex[stage][k] || id >= ts->count || !ts->img[id]) continue;
+                Image *im = ts->img[id];
+                im->read_epoch = bar_epoch;
+                if (!due && nowed && owed_hit(im->info.addr, im->info.addr + im->size)) { due = true; owed_why = 3; }
+            }
+        }
+        if (sc->caps & SHC_IMAGE && is)
+            for (u32 k = 0; k < 8; k++) {
+                u32 id = (u32)st.img[stage][k] & 0xfffff;
+                if (st.img[stage][k] && id < is->count && is->img[id]) is->img[id]->read_epoch = bar_epoch;
+            }
+    }
+    if (!due || !owed_any) return;
+    u32 why = owed_why;
+    if (st.rendering) end_rendering();  /* (adds this pass to what is owed, or pays) */
+    owed_why = why;
+    owed_pay();
+}
+
+/* a pass about to begin on these targets: the owed barrier first if one was sampled since the last barrier (a write
+ * after a read) or an owed pass drew into it (two passes' writes to one target are unordered without it; an
+ * attachment-to-attachment barrier there instead of the full one gained nothing) */
+static void owed_targets(void) {
+    if (!owed_any) return;
+    for (u32 t = 0; t < 9; t++) {
+        if (!st.rt_sub[t].size) continue;
+        if (pass_img[t] && pass_img[t]->read_epoch == bar_epoch) { owed_why = 2; owed_pay(); return; }
+        if (owed_hit(st.rt_sub[t].addr, st.rt_sub[t].addr + st.rt_sub[t].size)) { owed_why = 1; owed_pay(); return; }
+    }
+}
+
 void end_rendering_at(const char *at) {
     if (!st.rendering) return;
     if (prof_on > 0)
@@ -79,7 +161,9 @@ void end_rendering_at(const char *at) {
         vkCmdEndDebugUtilsLabelEXT(cmd());
     }
     st.rendering = false;
-    barrier_pending = pass_side_writes = false;
+    bool side = pass_side_writes || st.xfb_captured || npending || pass_linear;
+    side_why[pass_side_writes ? 0 : st.xfb_captured ? 1 : npending ? 2 : pass_linear ? 3 : 4]++;
+    barrier_pending = pass_side_writes = pass_linear = false;
     prof_mark("outside passes (copies, clears, barriers)");
     bool full = pass_att_writes || env.full_barriers;
     if (npending) {
@@ -91,7 +175,13 @@ void end_rendering_at(const char *at) {
         npending = 0;
         full = true;                    /* and the updates (transfer writes) */
     }
-    barrier_at(GPU_AT, full ? VK_ACCESS_2_MEMORY_WRITE_BIT : ACCESS_NO_ATTACHMENTS);
+    bool lazy = env.lazy_barrier && !side && nowed + 9 <= OWED_MAX;
+    if (lazy) {
+        for (u32 t = 0; t < 9; t++)
+            if (st.rt_sub[t].size) owed[nowed].lo = st.rt_sub[t].addr, owed[nowed++].hi = st.rt_sub[t].addr + st.rt_sub[t].size;
+        owed_any = owed_live = true;
+        owed_skipped++;
+    } else barrier_at(GPU_AT, full ? VK_ACCESS_2_MEMORY_WRITE_BIT : ACCESS_NO_ATTACHMENTS);
     st.xfb_captured = false;
     memset(st.xfb_dirty, 0, sizeof st.xfb_dirty);
     nxfb_ranges = 0;
@@ -148,6 +238,7 @@ bool begin_rendering(void) {
     u32 w = ~0u, h = ~0u, layers = ~0u;
     memset(st.rt_format, 0, sizeof st.rt_format);
     memset(st.rt_sub, 0, sizeof st.rt_sub);
+    memset(pass_img, 0, sizeof pass_img);
     st.depth_format = st.stencil_format = VK_FORMAT_UNDEFINED;
     st.samples = 1;
     st.rt_scale = 0;
@@ -168,6 +259,7 @@ bool begin_rendering(void) {
         VkImageView v = st.rt[i].t.addr ? rt_view(&st.rt[i], &im, &l, &l0, &nl, promote) : NULL;
         if (!v) continue;
         st.rt_sub[i].addr = im->info.addr, st.rt_sub[i].size = im->size;
+        pass_img[i] = im;
         st.rt_sub[i].level = l, st.rt_sub[i].layer = l0, st.rt_sub[i].nlayers = nl;
         color[i].imageView = v;
         st.rt_format[i] = view_format(im, &st.rt[i].v, NULL);   /* the view's own: the pipeline's has to be the same */
@@ -183,6 +275,7 @@ bool begin_rendering(void) {
         im->valid = true;
         im->rt_frame = frame_no + 1;
         im->gpu_written = true;
+        if (im->info.flags & TEX_FLAG_LINEAR) pass_linear = true;
         linear_wrote(im);
         any = true;
     }
@@ -193,6 +286,7 @@ bool begin_rendering(void) {
         VkImageView v = rt_view(&st.depth, &im, &l, &l0, &nl, false);
         if (v) {
             st.rt_sub[8].addr = im->info.addr, st.rt_sub[8].size = im->size;
+            pass_img[8] = im;
             st.rt_sub[8].level = l, st.rt_sub[8].layer = l0, st.rt_sub[8].nlayers = nl;
             depth.imageView = v;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -215,6 +309,8 @@ bool begin_rendering(void) {
         }
     }
     if (!any) return false;
+    owed_targets();
+    owed_live = false;                  /* (inside the pass draws decide: owed_draw) */
     if (!st.rt_scale) st.rt_scale = 1;
     st.area = (VkRect2D){{0, 0}, {w, h}};
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = st.area, .layerCount = layers,
@@ -859,6 +955,15 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
             hlog(0, "gpu prof: the game's barriers inside passes, per frame: %.1f ended the pass, %.1f did not",
                  barriers_kept / 600.0, barriers_skipped / 600.0);
             barriers_kept = barriers_skipped = 0;
+            if (env.lazy_barrier)
+                hlog(0, "gpu prof: lazy pass ends per frame: %.1f skipped; paid %.1f before other commands, %.1f at a pass "
+                        "on an owed target, %.1f at a pass on a sampled target, %.1f at a draw sampling one, %.1f at a draw "
+                        "with memory access", owed_skipped / 600.0, owed_paid_cmd / 600.0, owed_paid_pass_w / 600.0,
+                     owed_paid_pass_r / 600.0, owed_paid_draw / 600.0, owed_paid_mem / 600.0);
+            hlog(0, "gpu prof: pass ends with a full barrier per frame: %.1f shader stores, %.1f captures, %.1f buffer updates, "
+                    "%.1f linear targets", side_why[0] / 600.0, side_why[1] / 600.0, side_why[2] / 600.0, side_why[3] / 600.0);
+            memset(side_why, 0, sizeof side_why);
+            owed_skipped = owed_paid_cmd = owed_paid_pass_w = owed_paid_pass_r = owed_paid_draw = owed_paid_mem = 0;
             cnt = same_buf = contig = same_bind = same_vs = stored = 0; last_frame = frame_no;
         }
     }
@@ -1167,6 +1272,7 @@ static void draw_one(u32 op, const void *payload) {
         descset_use(is, st.img[ST_VERTEX], 8);
         descset_use(is, st.img[ST_FRAGMENT], 8);
     }
+    if (env.lazy_barrier) owed_draw(ts, is, caps);
     if (barrier_pending) barrier_due(ts);
     if (!begin_rendering()) { skip_draw("no render targets"); return; }
     if (env.feedback_log) feedback_check(ts);
@@ -1374,7 +1480,7 @@ static void draw_one(u32 op, const void *payload) {
     }
     set_vertex_input(c);
     xfb_begin(c, op, payload);
-    if (caps & (SHC_GLOBAL | SHC_IMAGE) && !xfb_stored) pass_side_writes = true;
+    if (caps & (SHC_GSTORE | SHC_IMAGE) && !xfb_stored) pass_side_writes = true;    /* (reads need no barrier after) */
     if (op == OP_DRAW_ARRAYS || op == OP_DRAW_ELEMENTS) {
         const CmdDraw *d = payload;
         bool indexed = op == OP_DRAW_ELEMENTS;

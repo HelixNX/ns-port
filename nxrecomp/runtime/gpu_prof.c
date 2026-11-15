@@ -97,6 +97,10 @@ void prof_report(u64 frames) {
     for (u32 i = 0; i < 64 && prof_ends[i].at; i++)
         if (prof_ends[i].count) hlog(0, "gpu prof: %6.1f passes/frame ended at %s", (double)prof_ends[i].count / frames, prof_ends[i].at);
     for (u32 i = 0; i < 64; i++) prof_ends[i].count = 0;
+    extern struct ProfEnd prof_bars[64];
+    for (u32 i = 0; i < 64 && prof_bars[i].at; i++)
+        if (prof_bars[i].count) hlog(0, "gpu prof: %6.1f barriers/frame at %s", (double)prof_bars[i].count / frames, prof_bars[i].at);
+    for (u32 i = 0; i < 64; i++) prof_bars[i].count = 0;
     for (u32 i = 0; i < nprof_names; i++) prof_names[i].ms = 0, prof_names[i].count = 0;
     prof_slot_wait_ms = prof_guest_wait_ms = 0;
 }

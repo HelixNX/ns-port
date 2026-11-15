@@ -249,11 +249,21 @@ void label_draw_end(void) {
     label_draw_open = false;
 }
 
+u64 bar_epoch;
+
+struct ProfEnd prof_bars[64];           /* NX_GPU_PROF: barriers by where they were asked for */
+
 void barrier_at(const char *at, VkAccessFlags2 src) {
+    owed_live = false;                  /* this barrier is the owed one too */
+    if (prof_on > 0)
+        for (u32 i = 0; i < 64; i++)
+            if (!prof_bars[i].at || !strcmp(prof_bars[i].at, at)) { prof_bars[i].at = at; prof_bars[i].count++; break; }
     VkCommandBuffer c = cmd();
     if (vk.labels) label_begin(c, "barrier %s%s", at, src == VK_ACCESS_2_MEMORY_WRITE_BIT ? "" : " (no attachment writes)");
     barrier_src(c, src);
     if (vk.labels) vkCmdEndDebugUtilsLabelEXT(c);
+    bar_epoch++;
+    owed_clear();
 }
 
 /* the current pass has written colour or depth (a draw that rasterizes, a clear): end_rendering's barrier */
@@ -264,6 +274,7 @@ int nwb;
 void flush(void) {
     end_rendering();
     if (cur < 0) return;
+    owed_pay();                         /* the next submission's commands may start before this one's are done */
     if (nwb) linear_writeback();
     Slot *s = &slots[cur];
     mirror_sync();
@@ -566,6 +577,7 @@ static void run(u64 at, int depth) {
             /* inside a pass the next draw decides (gpu_draw.c barrier_due): Violet has one after every skinning
              * draw, 64 pass ends a frame for draws that read nothing the pass wrote */
             if (env.barrier_skip && st.rendering) { barrier_pending = true; break; }
+            if (!st.rendering) owed_pay();      /* (a pass end's barrier it may be standing in for was skipped) */
             end_rendering();
             break;
         case OP_FENCE_SYNC: {
@@ -839,7 +851,13 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
              scan_skips);
         scan_ms = scan_ms_max = 0;
         scan_skips = 0;
-        if (nmirrors) hlog(1, "gpu: pool mirrors: %.2f MB/frame copied in, render thread %.2f ms/frame on them", mirror_mb / 600, mirror_ms / 600);
+        if (nmirrors) {
+            u32 hot = 0;
+            u32 bad = 0;
+            for (int i = 0; i < npools; i++) if (pools[i].mir) hot += pools[i].mir->nhot, bad += pools[i].mir->nbad;
+            hlog(1, "gpu: pool mirrors: %.2f MB/frame copied in, render thread %.2f ms/frame on them; %u hot pages, %u "
+                    "pages read from host memory", mirror_mb / 600, mirror_ms / 600, hot, bad);
+        }
         mirror_mb = mirror_ms = 0;
         static u64 dropped0;
         u64 dropped = vk_presents_dropped();
@@ -929,6 +947,9 @@ static void env_init(void) {
      * host memory as their own */
     bool slow = vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && (!vk.pcie_gbps || vk.pcie_gbps < 20);
     env.pool_mirror = (e = getenv("NX_POOL_MIRROR")) ? atoi(e) != 0 : slow;
+    env.mirror_hot = (e = getenv("NX_MIRROR_HOT")) ? atoi(e) : 16;
+    env.lazy_barrier = !(e = getenv("NX_LAZY_BARRIER")) || atoi(e);
+    e = getenv("NX_POOL_MIRROR");
     hlog(1, "gpu: pool mirrors %s%s", env.pool_mirror ? "on" : "off", e ? " (NX_POOL_MIRROR)" : "");
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
     env.shader_preload = !(e = getenv("NX_SHADER_PRELOAD")) || atoi(e);

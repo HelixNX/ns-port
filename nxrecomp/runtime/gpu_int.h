@@ -17,7 +17,7 @@ extern bool gpu_ready;
 /* NX_* switches, read once at start (env_init, from gpu_init): none is looked up while translating */
 struct GpuEnv {
     bool dump_astc, ssbo_log, pipe_log, no_discard, refresh_pools, shader_jit, shader_preload, xfb_store, pool_mirror, feedback_log, timeline,
-        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt, occlusion, barrier_skip, flush_busy;
+        view_log, mutable_all, full_barriers, async_shaders, refresh_wait, same_rt, occlusion, barrier_skip, flush_busy; int mirror_hot, lazy_barrier;
     int gpu_skip, flush_draws, flush_first;
     double hitch_ms;
     long trace_lo, trace_hi;
@@ -98,8 +98,15 @@ void tl_collect(int slot);
 void tl_report(u64 frames);
 void slot_open(void);
 
+/* Lazy pass ends (gpu_draw.c, NX_LAZY_BARRIER): a pass that wrote only its attachments ends without a barrier; the
+ * barrier is owed, and paid before the next command recorded outside a pass (owed_live), or when a later pass or draw
+ * touches what the owed passes wrote or read */
+extern bool owed_live;
+void owed_pay(void);
+void owed_clear(void);
 static inline VkCommandBuffer cmd(void) {
     if (cur < 0) slot_open();
+    if (owed_live) owed_pay();
     return slots[cur].cmd;
 }
 /* The slot's second command buffer, which the GPU runs before cmd, begun at its first use: for work on things no
@@ -120,6 +127,7 @@ void label_begin(VkCommandBuffer c, const char *fmt, ...);
 extern bool label_draw_open;
 void label_draw_end(void);
 void barrier_at(const char *at, VkAccessFlags2 src);
+extern u64 bar_epoch;                   /* barriers recorded into cmd so far */
 /* the source line a barrier or pass end comes from ("gpu_draw.c:123"), for debug labels and NX_GPU_PROF */
 #define GPU_STR_(x) #x
 #define GPU_STR(x) GPU_STR_(x)
@@ -141,7 +149,14 @@ void flush(void);
  * from host memory from then on (Mirror.bad). Mirrors are on for slow PCIe links (env_init); NX_POOL_MIRROR=0/1
  * forces them off or on */
 typedef struct { u64 lo, hi; } Range;
-typedef struct Mirror { VkBuf b; bool fresh; Range *bad; int nbad, capbad; } Mirror;
+/* Per page of a mirror (Mirror.page): pages the CPU writes scan after scan (uniforms, particles) are HOT: read from
+ * host memory like a GPU-written range, their write watch left set, so the guest takes no fault on them and no
+ * scan resets them. Pages under a texture are PINned cold: the scan is what sees a texture rewritten */
+#define MP_HOT 1
+#define MP_PIN 2
+typedef struct MirrorPage { u32 last; u8 streak, flags; } MirrorPage;
+typedef struct Mirror { VkBuf b; bool fresh; u64 *bad; u32 nbad; MirrorPage *page; u32 nhot; } Mirror;   /* bad: a bit per page read from host memory */
+void mirror_pin(u64 addr, u64 size);
 extern double mirror_mb, mirror_ms;
 extern int nmirrors;
 extern u64 mirror_bytes;
@@ -175,6 +190,7 @@ typedef struct Image {
     u32 levels, layers;
     bool valid;                         /* contents defined (rendered, copied, cleared or uploaded) */
     u64 rt_frame;                       /* the frame (frame_no + 1) it was last a render target in */
+    u64 read_epoch;                     /* bar_epoch when a draw last sampled it (lazy pass ends) */
     bool gpu_written;                   /* rendered, cleared or copied into: guest memory is not its source */
     u64 size;                           /* bytes of guest memory it covers */
     u64 used;                           /* the frame (frame_no + 1) it was last looked up in */

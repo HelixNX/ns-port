@@ -71,6 +71,8 @@ static Mirror *mirror_new(u64 size) {
     VKCHECK(vkBindBufferMemory(vk.dev, m->b.buf, m->b.a.mem, m->b.a.offset));
     m->b.size = size;
     mirror_bytes += m->b.a.size;
+    m->page = calloc(size >> 12, sizeof *m->page);
+    m->bad = calloc((size >> 18) + 1, sizeof *m->bad);
     m->fresh = true;                    /* copied whole at the next submission */
     return m;
 }
@@ -80,6 +82,7 @@ void mirror_free(void *p) {
     mirror_bytes -= m->b.a.size;
     vk_buffer_free(&m->b);
     free(m->bad);
+    free(m->page);
     free(m);
 }
 
@@ -91,25 +94,55 @@ VkBuffer mirror_at(u64 addr, u64 *off) {
     return p->mir->b.buf;
 }
 
-/* a range the GPU writes through host memory (storage buffers, transform feedback): read from there from now on */
+/* does any page of [first, last] have its bit set */
+static bool bits_any(const u64 *b, u64 first, u64 last) {
+    u64 fw = first >> 6, lw = last >> 6, fm = ~0ull << (first & 63), lm = ~0ull >> (63 - (last & 63));
+    if (fw == lw) return (b[fw] & fm & lm) != 0;
+    if (b[fw] & fm || b[lw] & lm) return true;
+    for (u64 w = fw + 1; w < lw; w++) if (b[w]) return true;
+    return false;
+}
+
+/* a range the GPU writes through host memory (storage buffers, transform feedback), or pages the CPU keeps writing
+ * (mirror_sync): read from there from now on. Kept per page: draws ask for every buffer they bind */
 void mirror_bad(u64 addr, u64 size) {
     PoolEnt *p = addr && size ? pool_find(addr) : NULL;
     if (!p || !p->mir) return;
     Mirror *m = p->mir;
-    u64 lo = addr, hi = size < p->end - addr ? addr + size : p->end;
-    for (int i = 0; i < m->nbad; i++)
-        if (m->bad[i].lo <= lo && hi <= m->bad[i].hi) return;
-    for (int i = 0; i < m->nbad;) {    /* merge what it touches */
-        if (m->bad[i].lo <= hi && lo <= m->bad[i].hi) {
-            if (m->bad[i].lo < lo) lo = m->bad[i].lo;
-            if (m->bad[i].hi > hi) hi = m->bad[i].hi;
-            m->bad[i] = m->bad[--m->nbad];
-        } else i++;
+    u64 hi = size < p->end - addr ? addr + size : p->end;
+    u64 first = (addr - p->gpu) >> 12, last = (hi - 1 - p->gpu) >> 12;
+    bool any = false;
+    for (u64 w = first >> 6; w <= last >> 6; w++) {
+        u64 mask = ~0ull;
+        if (w == first >> 6) mask &= ~0ull << (first & 63);
+        if (w == last >> 6) mask &= ~0ull >> (63 - (last & 63));
+        u64 add = mask & ~m->bad[w];
+        if (!add) continue;
+        m->bad[w] |= add;
+        m->nbad += (u32)__builtin_popcountll(add);
+        any = true;
     }
-    if (m->nbad == m->capbad) m->bad = realloc(m->bad, (m->capbad = m->capbad * 2 + 16) * sizeof *m->bad);
-    m->bad[m->nbad++] = (Range){lo, hi};
+    if (!any) return;
     bad_gen++;
-    hlog(2, "gpu: pool mirror: %llx+%llx is written by the GPU (%d ranges)", lo, hi - lo, m->nbad);
+    hlog(2, "gpu: pool mirror: %llx+%llx is read from host memory (%u pages)", addr, hi - addr, m->nbad);
+}
+
+/* a texture lies in [addr, addr + size): its pages stay cold, so that the scan reports a rewrite */
+void mirror_pin(u64 addr, u64 size) {
+    PoolEnt *p = addr && size && nmirrors ? pool_find(addr) : NULL;
+    if (!p || !p->mir || !p->cpu) return;
+    Mirror *m = p->mir;
+    u64 hi = addr + size < p->end ? addr + size : p->end;
+    for (u64 i = (addr - p->gpu) >> 12; i <= (hi - 1 - p->gpu) >> 12; i++) {
+        MirrorPage *g = &m->page[i];
+        if (g->flags & MP_HOT) {        /* (it stays among the ranges read from host memory) */
+            g->flags &= ~MP_HOT;
+            g->streak = 0;
+            m->nhot--;
+            ResetWriteWatch((void *)(uintptr_t)(p->cpu + (i << 12)), 4096);
+        }
+        g->flags |= MP_PIN;
+    }
 }
 
 /* the storage buffers a stage's shader may write (it uses global memory) */
@@ -144,13 +177,14 @@ bool gpu_buffer_ro(u64 addr, u64 size, VkBuffer *buf, u64 *off) {
     Mirror *m = p->mir;
     if (m) {
         u64 hi = size && size < p->end - addr ? addr + size : p->end;
-        bool bad = false;
-        for (int i = 0; i < m->nbad && !bad; i++) bad = m->bad[i].lo < hi && addr < m->bad[i].hi;
-        if (!bad) *buf = m->b.buf;
+        if (!bits_any(m->bad, (addr - p->gpu) >> 12, (hi - 1 - p->gpu) >> 12)) *buf = m->b.buf;
     }
     memo[slot].buf = *buf;
     return true;
 }
+
+static HANDLE ms_go, ms_done;         /* the mirrors' page scan (below) */
+static bool ms_running;
 
 void gpu_pool_created(Pool *p) {
     if (!gpu_ready) return;
@@ -191,6 +225,10 @@ void gpu_pool_destroyed(Pool *p) {
     for (int i = 0; i < npools; i++)
         if (pools[i].gpu == p->gpu && pools[i].end == p->gpu + p->size) {
             if (pools[i].hb) bury(DEAD_HOSTBUF, pools[i].hb, NULL);
+            if (pools[i].mir && ms_running) {      /* the scan reads its pages; its results stay for mirror_sync */
+                WaitForSingleObject(ms_done, INFINITE);
+                SetEvent(ms_done);
+            }
             if (pools[i].mir) bury(DEAD_MIRROR, pools[i].mir, NULL), nmirrors--;
             if (pools[i].cpu)
                 occ_forget((const u8 *)(uintptr_t)pools[i].cpu, (const u8 *)(uintptr_t)(pools[i].cpu + p->size));
@@ -208,23 +246,52 @@ void gpu_pool_destroyed(Pool *p) {
  * written), started when the guest submits (mirror_scan_start) and awaited at the first submission after it, while
  * the render thread translates. Only the guest's submissions start one: the data their commands read was written
  * before they were submitted, as on the console (where the GPU may start on them at once) */
-typedef struct { u64 lo, hi; size_t first, n; } MScan;
+typedef struct { u64 lo, hi; size_t first, n; const MirrorPage *page; } MScan;
 static MScan *msr;
 static int nmsr, capmsr;
 static u64 *ms_pages;
 static size_t ms_cap;
-static HANDLE ms_go, ms_done;
-static bool ms_running;
+static u32 ms_no;                       /* scans started */
+/* a page is hot when written in env.mirror_hot scans (NX_MIRROR_HOT, 0: never), none more than HOT_GAP after the one
+ * before */
+#define HOT_GAP 4
+
+/* the pages written in [lo, hi) that are not hot, appended to pages[]; their write watch is reset, the hot pages'
+ * is not. Only pages this call reports are reset (a write between the question and the reset is to a page whose
+ * copy is still to come) */
+static size_t cold_written_pages(u64 lo, u64 hi, const MirrorPage *page, u64 **pages, size_t *cap, size_t n) {
+    ULONG_PTR count;
+    for (;;) {
+        if (*cap - n < 4096) *pages = realloc(*pages, (*cap = *cap * 2 + 65536) * sizeof **pages);
+        count = *cap - n;
+        ULONG gran;
+        if (GetWriteWatch(0, (void *)(uintptr_t)lo, hi - lo, (void **)(*pages + n), &count, &gran) != 0) return n;
+        if (count < *cap - n) break;
+        *cap = *cap * 2;                /* more than fit: asked again whole */
+        *pages = realloc(*pages, *cap * sizeof **pages);
+    }
+    u64 *pg = *pages + n, run = 0, len = 0;
+    size_t k = 0;
+    for (size_t j = 0; j < count; j++) {
+        u64 a = pg[j];
+        if (page[(a - lo) >> 12].flags & MP_HOT) continue;
+        pg[k++] = a;
+        if (len && run + len == a) { len += 4096; continue; }
+        if (len) ResetWriteWatch((void *)(uintptr_t)run, len);
+        run = a, len = 4096;
+    }
+    if (len) ResetWriteWatch((void *)(uintptr_t)run, len);
+    return n + k;
+}
 
 static unsigned __stdcall mirror_scan_thread(void *arg) {
     (void)arg;
     for (;;) {
         WaitForSingleObject(ms_go, INFINITE);
         size_t n = 0;
-        double mb = 0;
         for (int i = 0; i < nmsr; i++) {
             msr[i].first = n;
-            n = written_pages(msr[i].lo, msr[i].hi, &ms_pages, &ms_cap, n, &mb);
+            n = cold_written_pages(msr[i].lo, msr[i].hi, msr[i].page, &ms_pages, &ms_cap, n);
             msr[i].n = n - msr[i].first;
         }
         SetEvent(ms_done);
@@ -242,9 +309,10 @@ void mirror_scan_start(void) {
     for (int i = 0; i < npools; i++) {
         if (!pools[i].mir || pools[i].mir->fresh) continue;
         if (nmsr == capmsr) msr = realloc(msr, (capmsr = capmsr * 2 + 8) * sizeof *msr);
-        msr[nmsr++] = (MScan){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu)};
+        msr[nmsr++] = (MScan){pools[i].cpu, pools[i].cpu + (pools[i].end - pools[i].gpu), 0, 0, pools[i].mir->page};
     }
     if (!nmsr) return;
+    ms_no++;
     ms_running = true;
     SetEvent(ms_go);
 }
@@ -280,6 +348,14 @@ void mirror_sync(void) {
             const u64 *pg = ms_pages + sc->first;
             for (size_t k = 0; k < sc->n; k++) {
                 u64 o = pg[k] - p->cpu;
+                MirrorPage *g = &m->page[o >> 12];
+                g->streak = g->last && ms_no - g->last <= HOT_GAP ? (u8)(g->streak < 255 ? g->streak + 1 : 255) : 1;
+                g->last = ms_no;
+                if (env.mirror_hot && g->streak >= env.mirror_hot && !(g->flags & MP_PIN)) {  /* (copied this once more: draws recorded) */
+                    g->flags |= MP_HOT;
+                    m->nhot++;
+                    mirror_bad(p->gpu + o, 4096);
+                }
                 if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == o) { rg[nr - 1].size += 4096; continue; }
                 if (nr == caprg) rg = realloc(rg, (caprg = caprg * 2 + 1024) * sizeof *rg);
                 rg[nr++] = (VkBufferCopy){o, o, 4096};

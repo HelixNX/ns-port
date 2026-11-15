@@ -508,6 +508,7 @@ static Image *image_make(const TexInfo *t, u32 h) {
     im->next = buckets[h];
     buckets[h] = im;
     byaddr_add(im);
+    mirror_pin(im->info.addr, im->size);
     if (++nimages % 500 == 0) hlog(1, "gpu: %d images", nimages);
     hlog(2, "gpu: image %ux%ux%u fmt %u target %u levels %u at %llx%s", t->width, t->height, t->depth, t->format,
          t->target, t->levels, t->addr, im->scale > 1 ? " (scaled)" : "");
