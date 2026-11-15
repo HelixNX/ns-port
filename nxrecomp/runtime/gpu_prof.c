@@ -141,6 +141,7 @@ void tl_collect(int slot) {
     double per = vk.props.limits.timestampPeriod / 1e6;
     tl_recs[tl_n++] = (TlRec){tl_submit[slot], (double)t[0] * per, (double)t[1] * per, tl_first[slot], tl_rec_woke[slot],
                               tl_rec_core[slot], tl_rec_entry[slot]};
+    if (trace_wants_gpu()) trace_gpu(tl_submit[slot], (double)t[0] * per, (double)t[1] * per, tl_first[slot]);
 }
 
 void tl_report(u64 frames) {

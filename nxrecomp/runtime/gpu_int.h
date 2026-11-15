@@ -4,6 +4,7 @@
 
 #include "tex.h"
 #include "astc.h"
+#include "trace.h"
 #include "game_config.h"
 #include <process.h>
 #include <stdlib.h>

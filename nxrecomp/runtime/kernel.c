@@ -17,6 +17,7 @@
  * core of the lowest-priority owner. If that owner is in lifted code it is suspended there on the spot (lifted code
  * never holds host locks); otherwise it is asked to give the core up at the end of its current SVC. */
 #include "hos.h"
+#include "trace.h"
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
@@ -96,7 +97,8 @@ static void end_wait(KThread *t, u32 result) {
     t->woken = true;
     t->wait_result = result;
     t->wait = W_NONE;
-    if (t == waitprof_thread) {
+    t->waker = cur_thread;
+    if (t == waitprof_thread || trace_live) {
         LARGE_INTEGER q;
         QueryPerformanceCounter(&q);
         t->wake_qpc = q.QuadPart;
@@ -174,7 +176,33 @@ static u64 ready_seq;
 u64 lifted_lo, lifted_hi;
 
 static u64 qpc_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (u64)q.QuadPart; }
-static void hold_end(KThread *t) { if (t->hold_since) t->hold_qpc += qpc_now() - t->hold_since; t->hold_since = 0; }
+/* NX_TRACE: a hold's start for its share of host CPU (the host thread's cycles over TSC ticks: below 100% the
+ * thread held the core without running, e.g. not yet woken, or Windows ran something else) */
+static void hold_mark(KThread *t) {
+    ULONG64 c = 0;
+    t->tr_tsc = trace_live && t->host && QueryThreadCycleTime((HANDLE)t->host, &c) ? __rdtsc() : 0;
+    t->tr_cyc = c;
+}
+/* a hold that ends at now: its span, with the host share in per mille (0: unknown) */
+static void hold_trace(KThread *t, u64 now, int core) {
+    if (!trace_live) return;
+    ULONG64 c = 0;
+    u64 pm = 0;
+    if (t->tr_tsc && QueryThreadCycleTime((HANDLE)t->host, &c)) {
+        u64 dt = __rdtsc() - t->tr_tsc;
+        pm = dt ? (c - t->tr_cyc) * 1000 / dt : 0;
+        if (!pm) pm = 1;
+    }
+    trace_span(t, false, TR_RUN, t->hold_since, now, (u64)core, pm);
+}
+static void hold_end(KThread *t, int core) {
+    if (t->hold_since) {
+        u64 now = qpc_now();
+        t->hold_qpc += now - t->hold_since;
+        hold_trace(t, now, core);
+    }
+    t->hold_since = 0;
+}
 
 /* Before sleeping on its condition variable, a thread whose wait is likely short polls for its end a while with klk
  * released: an OS wake costs several us (more from a deep C-state), and the game's threads hand work to each other
@@ -210,6 +238,7 @@ static void core_assign(KThread *t, int c) {
     core_owner[c] = t;
     t->cur_core = c;
     t->hold_since = qpc_now();
+    hold_mark(t);
     t->ready = false;
     if (t->preempted) {
         t->preempted = false;
@@ -271,7 +300,7 @@ static void core_release(KThread *t) {
     if (c < 0) return;
     t->cur_core = -1;
     t->preempt_req = false;
-    hold_end(t);
+    hold_end(t, c);
     core_owner[c] = NULL;
     KThread *n = next_for_core(c);
     if (n) { core_assign(n, c); return; }
@@ -327,7 +356,7 @@ static int core_try_place(KThread *t) {
         return -1;
     }
     o->preempted = true;
-    hold_end(o);
+    hold_end(o, v);
     core_owner[v] = NULL;
     core_assign(t, v);
     return 1;
@@ -362,6 +391,7 @@ static void core_acquire(KThread *t) {
     t->acq[how]++;
     QueryPerformanceCounter(&q1);
     t->ready_qpc += q1.QuadPart - q0.QuadPart;
+    if (trace_live && q1.QuadPart - q0.QuadPart > 10) trace_span(t, false, TR_READY, (u64)q0.QuadPart, (u64)q1.QuadPart, 0, 0);
     t->ready = false;
 }
 
@@ -524,7 +554,8 @@ static u32 block(KThread *t, s64 timeout_ns) {
     core_release(t);
     LARGE_INTEGER q0, q1, qf;
     int kind = t->wait;                 /* end_wait clears it */
-    if (t == waitprof_thread) QueryPerformanceCounter(&q0);
+    bool tr = trace_live;
+    if (t == waitprof_thread || tr) QueryPerformanceCounter(&q0);
     u32 r;
     bool spun = false;
     for (;;) {
@@ -548,9 +579,21 @@ static u32 block(KThread *t, s64 timeout_ns) {
         }
         ksleep(t, ms);
     }
-    if (t == waitprof_thread) {
+    if (t == waitprof_thread || tr) {
         QueryPerformanceCounter(&q1);
         QueryPerformanceFrequency(&qf);
+    }
+    if (tr) {                           /* the guest's callers (x30, then its frame records), who ended the wait, when */
+        const Ctx *c = t->ctx;
+        u64 chain[TR_CHAIN] = {c->x[30]}, fp = c->x[29];
+        for (int i = 1; i < TR_CHAIN; i++) {
+            if (!fp || fp & 15 || fp < c->x[31] || fp + 16 > t->stack_top) break;
+            chain[i] = *(const u64 *)(uintptr_t)(fp + 8);
+            fp = *(const u64 *)(uintptr_t)fp;
+        }
+        bool ended = r != R_TIMED_OUT && t->wake_qpc;
+        trace_block(t, kind >= W_SYNC && kind <= W_SLEEP ? TR_SYNC + kind - W_SYNC : TR_SYNC, (u64)q0.QuadPart,
+                    (u64)q1.QuadPart, chain, ended ? t->waker : NULL, ended ? (u64)t->wake_qpc : 0);
     }
     core_acquire(t);
     if (t == waitprof_thread) {
@@ -560,8 +603,8 @@ static u32 block(KThread *t, s64 timeout_ns) {
         bool ended = r != R_TIMED_OUT && t->wake_qpc;
         waitprof_add(t, kind, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart,
                      ended ? (double)(q1.QuadPart - t->wake_qpc) * us : -1, (double)(q2.QuadPart - q1.QuadPart) * us);
-        t->wake_qpc = 0;
     }
+    t->wake_qpc = 0;
     return r;
 }
 
@@ -921,6 +964,7 @@ void thread_sleep(s64 ns) {
     do { _mm_pause(); QueryPerformanceCounter(&q1); } while ((u64)q1.QuadPart < deadline);
     t->sleep_qpc += q1.QuadPart - q0.QuadPart;
     t->sleeps++;
+    if (trace_live) trace_span(t, false, TR_SLEEP, (u64)q0.QuadPart, (u64)q1.QuadPart, t->ctx->x[30], 0);
     klock();
     t->wait = W_NONE;
     core_acquire(t);
@@ -966,7 +1010,12 @@ void kernel_frame_threads(bool report, char *out, size_t n) {
     klock();
     u64 now = qpc_now();
     for (KThread *t = threads; t; t = t->next)          /* holders so far: count up to now */
-        if (t->hold_since) { t->hold_qpc += now - t->hold_since; t->hold_since = now; }
+        if (t->hold_since) {
+            t->hold_qpc += now - t->hold_since;
+            hold_trace(t, now, t->cur_core);
+            t->hold_since = now;
+            hold_mark(t);
+        }
     for (KThread *t = threads; t; t = t->next) {
         FILETIME c0, e0, k, u;
         if (!t->host || !GetThreadTimes(t->host, &c0, &e0, &k, &u)) continue;

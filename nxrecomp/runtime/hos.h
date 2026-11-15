@@ -128,6 +128,7 @@ typedef struct KThread {
     u64 acq[4];                         /* core_acquire: placed at once, by preempting, after 1 ms retries, after a release */
     u64 ready_qpc, sleep_qpc, sleeps;   /* time waiting for a core and asleep (SleepThread), for the CPU report */
     u64 hold_qpc, hold_since;           /* time holding a core (kernel_frame_threads), since when (under klock) */
+    u64 tr_tsc, tr_cyc;                 /* NX_TRACE: TSC and the host thread's cycles when the hold began */
     u32 handle;                     /* the handle the creator got (used as the mutex tag by the SDK) */
     void *host;                     /* Windows thread handle */
     u32 host_id;
@@ -140,7 +141,8 @@ typedef struct KThread {
     u64 wait_addr, cv_key;
     u32 tag;
     KObj *wake_obj;
-    s64 wake_qpc;                   /* when its wait was ended (NX_PROFILE's thread only) */
+    s64 wake_qpc;                   /* when its wait was ended (NX_PROFILE's thread, and all while NX_TRACE records) */
+    struct KThread *waker;          /* the thread that ended it (NULL: a timeout, a host thread) */
     void *cv;                       /* CONDITION_VARIABLE */
     struct KThread *next;           /* all threads */
     char name[32];

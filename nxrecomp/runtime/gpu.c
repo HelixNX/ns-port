@@ -139,7 +139,9 @@ void slot_open(void) {
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                   .pSemaphores = &timeline, .pValues = &s->value};
         double t0 = ms_now();
+        u64 q0 = trace_live ? trace_qpc() : 0;
         VKCHECK(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX));
+        if (q0) trace_span(cur_thread, true, TR_SLOT_WAIT, q0, trace_qpc(), 0, 0);
         hf.slot += ms_now() - t0;
         if (prof_on) prof_slot_wait_ms += ms_now() - t0;
     }
@@ -301,7 +303,9 @@ void flush(void) {
                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cmd}};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pre ? 2 : 1, .pCommandBufferInfos = cbi + !pre,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    u64 q_sub = trace_live ? trace_qpc() : 0;
     VkResult r = vk_submit(&si, NULL);
+    if (q_sub) trace_span(cur_thread, true, TR_FLUSH, q_sub, trace_qpc(), s->value, 0);
     if (r < 0) fatal("vkQueueSubmit2: %d (device lost?)", r);
     occ_submitted(cur, s->value);
     { /* NX_GPU_SYNC=1: waits for each submission and logs what it held; a hang or lost device names the last draw
@@ -661,6 +665,7 @@ static void run(u64 at, int depth) {
 void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     (void)queue;
     double t0 = ms_now();
+    u64 q0 = trace_live ? trace_qpc() : 0;
     EnterCriticalSection(&gpu_cs);
     mirror_scan_start();
     submit_serial++;
@@ -674,6 +679,7 @@ void gpu_submit(u64 queue, u32 count, const u64 *handles) {
     if (++submits == 1) hlog(1, "gpu: first submission");
     t_submit_ms += ms_now() - t0;
     hf.submit += ms_now() - t0;
+    if (q0) trace_span(cur_thread, true, TR_SUBMIT, q0, trace_qpc(), submit_serial, 0);
     LeaveCriticalSection(&gpu_cs);
 }
 
@@ -715,7 +721,9 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
     double t0 = prof_on > 0 ? ms_now() : 0;
     u64 back = submitted - value;
     double tw = ms_now();
+    u64 q0 = trace_live ? trace_qpc() : 0;
     VkResult r = vkWaitSemaphores(vk.dev, &wi, timeout_ns);
+    if (q0) trace_span(cur_thread, true, TR_GPU_WAIT, q0, trace_qpc(), value, back);
     occ_resolve();
     if (env.timeline) tl_woke = ms_now();
     t_wait_ms += ms_now() - tw;
@@ -808,6 +816,7 @@ static u64 image_budget(void) {
 u64 gpu_present(u64 queue, Window *w, u32 index) {
     (void)queue;
     double t_present0 = ms_now();
+    u64 q_present0 = trace_live ? trace_qpc() : 0;
     EnterCriticalSection(&gpu_cs);
     double t_cs = ms_now();             /* the steps' times for the slow-frame line (NX_HITCH_MS) */
     refresh_cpu_textures();
@@ -918,6 +927,8 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     }
     memset(&hf, 0, sizeof hf);
     last_end = t_end;
+    if (q_present0) trace_span(cur_thread, true, TR_PRESENT, q_present0, trace_qpc(), frames, 0);
+    trace_present(frames);
     LeaveCriticalSection(&gpu_cs);
     return v;
 }
@@ -948,7 +959,8 @@ static void env_init(void) {
     bool slow = vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && (!vk.pcie_gbps || vk.pcie_gbps < 20);
     env.pool_mirror = (e = getenv("NX_POOL_MIRROR")) ? atoi(e) != 0 : slow;
     env.mirror_hot = (e = getenv("NX_MIRROR_HOT")) ? atoi(e) : 16;
-    env.lazy_barrier = !(e = getenv("NX_LAZY_BARRIER")) || atoi(e);
+    /* off by default: in play (2026-11-15, RX 7800 XT) shadow-like squares and colour flashes, not seen stand-still */
+    env.lazy_barrier = (e = getenv("NX_LAZY_BARRIER")) && atoi(e);
     e = getenv("NX_POOL_MIRROR");
     hlog(1, "gpu: pool mirrors %s%s", env.pool_mirror ? "on" : "off", e ? " (NX_POOL_MIRROR)" : "");
     env.shader_jit = !(e = getenv("NX_SHADER_JIT")) || atoi(e);
@@ -975,7 +987,7 @@ static void env_init(void) {
     env.view_log = getenv("NX_VIEW_LOG") != NULL;
     env.mutable_all = getenv("NX_MUTABLE_ALL") != NULL;
     env.full_barriers = getenv("NX_FULL_BARRIERS") != NULL;
-    env.timeline = getenv("NX_GPU_TIMELINE") != NULL;
+    env.timeline = getenv("NX_GPU_TIMELINE") != NULL || trace_enabled();     /* NX_TRACE needs its timestamps */
     e = getenv("NX_TRACE");
     env.trace_lo = e ? atol(e) : -1;
     env.trace_hi = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : env.trace_lo;

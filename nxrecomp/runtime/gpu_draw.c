@@ -66,7 +66,7 @@ static void barrier_due(const DescSet *ts) {
     else barriers_skipped++;
 }
 
-/* Lazy pass ends (NX_LAZY_BARRIER=1). A pass that wrote only its attachments (no shader stores, captures, linear
+/* Lazy pass ends (NX_LAZY_BARRIER=1; off by default: broken in play, see gpu.c env_init). A pass that wrote only its attachments (no shader stores, captures, linear
  * targets or buffer updates) ends without its barrier, which is owed: the targets' ranges are kept, and so is
  * bar_epoch in every image a draw samples (Image.read_epoch). The owed barrier is paid:
  *   - before any command recorded outside a pass (cmd() while owed_live: copies, clears, dispatches, uploads),
