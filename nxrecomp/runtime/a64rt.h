@@ -40,10 +40,18 @@ typedef struct Ctx {
 } Ctx;
 
 typedef void (*GuestFn)(Ctx *);
-typedef struct { u64 addr; GuestFn fn; } FnEntry;
+typedef struct { u64 addr; GuestFn fn; u64 csr; } FnEntry;      /* csr: 1 if it reads x19-x28 from its caller */
 typedef struct { const char *name; u64 base, text_end, size; const FnEntry *entries; } ModInfo;
 
 #define MUSTTAIL __attribute__((musttail))
+
+/* The store before a BL to f (a64lift.py call): SAVEC if f reads x19-x28 from its caller (funcs.h defines CSR_f as
+ * "~, 1," for those, from the lifter's csr_flow), else SAVECN, which leaves them out. NX_CSR_(CSR_f) is 1 when the
+ * name expands to that list and 0 when it stays a plain identifier; the branch folds at compile time. */
+#define NX_CSR_N(x, n, ...) n
+#define NX_CSR_(...) NX_CSR_N(__VA_ARGS__, 0, )
+#define NX_CSR(f) NX_CSR_(CSR_##f)
+#define SAVE_FOR(f) do { if (NX_CSR(f)) SAVEC; else SAVECNC; } while (0)
 
 /* provided by the runtime */
 void call_ind(Ctx *c, u64 addr);         /* BLR: call the lifted function at addr */
@@ -53,19 +61,24 @@ void jump_ind(Ctx *c);                   /* BR (tail position): jump to c->pc */
  * lifted code looks targets up here first and leaves host calls and bad addresses to call_ind / jump_ind */
 extern GuestFn *fn_flat;
 extern u64 fn_flat_base, fn_flat_span;
+/* fn_flat's entries carry FnEntry.csr in bit 0 (lifted functions are 16-byte aligned): a BLR stores x19-x28 only
+ * for those (a64lift.py call_ind: SAVEC, else SAVECN), and notes them once (csr_ind_note) */
+#define FN_UNTAG(f) ((GuestFn)((uintptr_t)(f) & ~(uintptr_t)1))
+#define FN_CSR(f) ((uintptr_t)(f) & 1)
 static inline GuestFn guest_fn_fast(u64 a) {
     u64 off = a - fn_flat_base;
     return off < fn_flat_span && !(off & 3) ? fn_flat[off / 4] : NULL;
 }
-static inline void call_ind_fast(Ctx *c, u64 a) {
-    GuestFn f = guest_fn_fast(a);
+void csr_ind_note(u64 a);
+static inline void call_ind_with(Ctx *c, u64 a, GuestFn f) {
     c->pc = a;
-    if (f) f(c);
+    if (f) FN_UNTAG(f)(c);
     else call_ind(c, a);
 }
+static inline void call_ind_fast(Ctx *c, u64 a) { call_ind_with(c, a, guest_fn_fast(a)); }
 static inline void jump_ind_fast(Ctx *c) {
     GuestFn f = guest_fn_fast(c->pc);
-    if (f) MUSTTAIL return f(c);
+    if (f) MUSTTAIL return FN_UNTAG(f)(c);
     MUSTTAIL return jump_ind(c);
 }
 void guest_trap(Ctx *c, const char *what, u64 pc);

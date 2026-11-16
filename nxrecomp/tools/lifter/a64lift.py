@@ -508,6 +508,9 @@ class Program:
 SETJMP = {'setjmp', '_setjmp', '__setjmp'}
 # the LOAD statements of registers a call leaves as they were (see emit)
 KEPT_ACROSS_CALLS = re.compile(r'(X(19|2\d|30) = c->x\[|SP = c->x\[|V(8|9|1[0-5]) = c->v\[)')
+# the SAVE statements of x19-x28 (left out of SAVECN)
+CALLEE_SAVED_X = re.compile(r'c->x\[(19|2[0-8])\] = ')
+CSR = sum(1 << n for n in range(19, 29))
 
 
 def mangle(sym):
@@ -591,12 +594,13 @@ class Fn:
         name = self.env.callee(target)
         if name.startswith('h_'):                      # host replacements may set any register
             return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, name)
-        return 'X30 = 0x%xull; SAVEC; %s(c); LOADC;' % (ret_addr, name)
+        return 'X30 = 0x%xull; SAVE_FOR(%s); %s(c); LOADC;' % (ret_addr, name, name)
 
     def call_ind(self, expr, ret_addr):
         self.wx.add(30)
         self.fk = None
-        return '{ u64 t = %s; X30 = 0x%xull; SAVEC; call_ind_fast(c, t); LOADC; }' % (expr, ret_addr)
+        return ('{ u64 t = %s; X30 = 0x%xull; GuestFn F_ = guest_fn_fast(t); if (FN_CSR(F_)) { SAVEC; csr_ind_note(t); } '
+                'else SAVECNI; call_ind_with(c, t, F_); LOADC; }') % (expr, ret_addr)
 
     def jump(self, target):
         """Unconditional direct branch."""
@@ -621,6 +625,9 @@ class Fn:
         return '{ c->pc = %s; SAVE; MUSTTAIL return jump_ind_fast(c); }' % expr
 
     def ret(self, expr):
+        # SAVEC, not SAVECN: for x19-x28 a function never touches, the Ctx slot is the live value (it has no local),
+        # so a callee that used one must put its caller's value back: a caller that does not track x23 may tail-jump
+        # next to code that reads it (the Lua VM's handlers and luaV_execute's re-entries)
         return '{ SAVEC; return; }'
 
     def svc(self, n):
@@ -636,6 +643,7 @@ class Env:
         self.extra = set()                 # absolute addresses lifted as secondary entries of this module
         self.ext_callees = set()           # names of functions defined elsewhere (other modules, host)
         self.unresolved = collections.Counter()
+        self.csr = {}                      # 'f_<owner>' -> (local mask, [(callee name, mask)], [entry names]): csr_flow
 
     def callee(self, target):
         """C function name for a direct call or tail call to absolute address `target`."""
@@ -780,6 +788,7 @@ def lift_function(env, owner, secondary=(), stats=None):
     bt |= set(entries)
     fn.labels.update(entries)
     lines = []
+    recs = []
     prev = None
     noreturn_prev = False
 
@@ -794,8 +803,10 @@ def lift_function(env, owner, secondary=(), stats=None):
             fn.fk = None
             fn.labels.add(pc)
         w = mod.word(pc - mod.base)
+        rx0, wx0 = fn.rx, fn.wx                    # this instruction's own reads and writes, for csr_flow
+        fn.rx, fn.wx = set(), set()
+        patch = env.prog.patches.get(pc)
         try:
-            patch = env.prog.patches.get(pc)
             stmt = lift_patched(fn, w, pc, patch) if patch else lift_insn(fn, w, pc)
             if stats is not None:
                 stats['ok'] += 1
@@ -805,6 +816,8 @@ def lift_function(env, owner, secondary=(), stats=None):
             if stats is not None:
                 stats['bad'][str(e)] += 1
                 stats['example'].setdefault(str(e), (pc, w))
+        recs.append((pc, w, regmask(fn.rx), regmask(fn.wx), bool(patch and patch[1] in ('call', 'after'))))
+        fn.rx, fn.wx = rx0 | fn.rx, wx0 | fn.wx
         lines.append((pc, stmt))
         noreturn_prev = not falls_through(stmt)
         prev = pc
@@ -812,7 +825,141 @@ def lift_function(env, owner, secondary=(), stats=None):
         nxt = prev + 4
         lines.append((None, fn.jump(nxt) if (nxt in fn.addrs or env_is_entry(env, nxt))
                       else 'guest_trap(c, "ran past the end of a function", 0x%xull); return;' % nxt))
+    env.csr.update(csr_flow(fn, env, recs, entries))
     return emit(fn, lines, entries)
+
+
+def regmask(regs):
+    """x19-x28 of a register set, as bits"""
+    return sum(1 << n for n in regs if 19 <= n <= 28)
+
+
+def spill_mask(w):
+    """x19-x28 that an STP / STR (64-bit, SP or X29 based) stores: a prologue spill, not a use of the value"""
+    base = (w >> 5) & 31
+    if base not in (31, 29):
+        return 0
+    if w & 0xffc00000 in (0xa9000000, 0xa9800000, 0xa8800000):           # STP Xt, Xt2 (offset, pre, post)
+        return regmask((w & 31, (w >> 10) & 31))
+    if w & 0xffc00000 == 0xf9000000 or w & 0xffe00c00 in (0xf8000c00, 0xf8000400, 0xf8000000):  # STR / STUR Xt
+        return regmask((w & 31,))
+    return 0
+
+
+def store_mask(w):
+    """x19-x28 that an STP / STR (64-bit, any base) stores"""
+    if w & 0xffc00000 in (0xa9000000, 0xa9800000, 0xa8800000):
+        return regmask((w & 31, (w >> 10) & 31))
+    if w & 0xffc00000 == 0xf9000000 or w & 0xffe00c00 in (0xf8000c00, 0xf8000400, 0xf8000000):
+        return regmask((w & 31,))
+    return 0
+
+
+def csr_flow(fn, env, recs, entries):
+    """Which of x19-x28 each entry of the function may read before writing them (its caller's values): what a BL to
+    it must store (SAVE_FOR). Must-written sets over its control flow from that entry; a prologue's STP / STR of
+    one is no use. Returns {entry name: (mask used, [(callee name, mask not yet written there)] for calls and tail
+    jumps, whose needs become this entry's (cmd_lift's fixpoint), [entry name])}; its own reads leave out what it
+    spilled on every path. Hook sites (patches.txt call / after: SAVE, host code, LOAD) add nothing: every hook
+    reads only x19-x28 its function wrote by then (wild.c / raidgem.c x19 after "mov x19, x0", lua.c x23, gfx.c
+    x28, fps.c x20; a new hook reading a caller's value would need it). setjmp passes nothing on: a longjmp
+    restores them into this function, which does not use the ones it never wrote, and its callers keep theirs in
+    locals. BLR and indirect tail jumps are taken to follow the AAPCS (callees read none; a BLR to an entry that
+    does stores them and says so, dispatch.c csr_ind_note)."""
+    mod, base = fn.mod, fn.mod.base
+    succ = collections.defaultdict(list)
+    sites = []                               # (pc, callee name, or '*' for all)
+
+    def name_of(t):
+        try:
+            return env.callee(t)
+        except Unimpl:
+            return None
+
+    for pc, w, r, wr, hook in recs:
+        ft = True
+        if w & 0x7c000000 == 0x14000000:                                   # B, BL
+            t = pc + (sext26(w) << 2)
+            if w & 0x80000000:
+                if mod.plt.get(t - base) not in SETJMP:      # setjmp keeps the registers for this function only
+                    sites.append((pc, name_of(t)))
+            else:
+                ft = False
+                if t in fn.addrs:
+                    succ[pc].append(t)
+                else:
+                    sites.append((pc, name_of(t)))
+        elif w & 0xff000010 == 0x54000000 or w & 0x7e000000 in (0x34000000, 0x36000000):   # B.cond, CBZ, TBZ
+            t = branch_targets(w, pc)[0]
+            if t in fn.addrs:
+                succ[pc].append(t)
+            else:
+                sites.append((pc, name_of(t)))
+        elif w & 0xfffffc1f == 0xd65f0000:                                 # RET
+            ft = False
+        elif w & 0xfffffc1f == 0xd61f0000:                                 # BR: switch cases, else a tail call
+            ft = False
+            for t in mod.switches.get(pc - base, ()):
+                if base + t in fn.addrs:
+                    succ[pc].append(base + t)
+        elif w & 0xffe0001f == 0xd4200000 or w & 0xffff0000 == 0:          # BRK, UDF
+            ft = False
+        if ft:
+            if pc + 4 in fn.addrs:
+                succ[pc].append(pc + 4)
+            elif env_is_entry(env, pc + 4):
+                sites.append((pc, name_of(pc + 4)))
+    rec = {pc: (w, r, wr) for pc, w, r, wr, _ in recs}
+    # Two must-sets over the control flow from every entry (entries: nothing): written on every path to pc, and
+    # spilled (an STP / STR of it to the stack) on every path to pc. A register spilled on every path is one the
+    # function keeps for its caller: compiled AAPCS code never uses the caller's value of it, so a read of it "before
+    # the write" is on a path that does not happen (branches on the same condition: main+b43b2c reads x21-x28 after
+    # a static-init path that skips the writes). Per path, not per function: a secondary entry skips the prologue
+    # (luaV_execute main+41150 spills them all, but its re-entries main+411a0 / 411a4 read x21, x24, x25 from the
+    # Ctx); only such entries and code that does not spill one can need it (outlined sequences, thunks)
+    # A register-context capture (libunwind's unw_getcontext, sdk+55fc30, under _Unwind_RaiseException): it
+    # stores all of x19-x28 to memory and reads them for nothing else. Only unwinding a C++ exception would use the
+    # values, and a throw cannot land here anyway (landing pads have no entries); counting it put 25,000 callers of
+    # __cxa_throw / libc++'s __throw_* among the functions that need them
+    stored = other = 0
+    for pc, (w, r, wr) in rec.items():
+        sm = store_mask(w)
+        stored |= r & sm
+        other |= r & ~sm
+    capture = stored == CSR and not other & CSR
+    out = {}
+    for entry in entries:                    # per entry: a caller of one entry passes nothing another one needs
+        inn = {pc: CSR for pc in rec}
+        sinn = {pc: CSR for pc in rec}
+        inn[entry] = sinn[entry] = 0
+        changed = True
+        while changed:
+            changed = False
+            for pc in fn.order:
+                w, r, wr = rec[pc]
+                o, so = inn[pc] | wr, sinn[pc] | spill_mask(w)
+                for t in succ[pc]:
+                    if inn[t] & o != inn[t] or sinn[t] & so != sinn[t]:
+                        inn[t] &= o
+                        sinn[t] &= so
+                        changed = True
+        local = 0
+        debug = os.environ.get('NX_CSR_DEBUG')
+        for pc, (w, r, wr) in rec.items():
+            u = 0 if capture else r & ~inn[pc] & ~sinn[pc] & ~spill_mask(w)
+            if u and debug:
+                print('csr_flow: f_%x: %x (%08x) reads %x before writing it' % (entry, pc, w, u))
+            local |= u
+        edges = []
+        for pc, name in sites:
+            # what reaches a callee or tail-jump target that does need them: passed on even when this function spills
+            # them (Violet's Lua VM keeps its state in x19-x28 across its own calls: main+26c60 needs x23-x27, calls
+            # main+27da0, which spills them, writes none and calls into luaV_execute)
+            m = CSR & ~inn[pc]
+            if name and m:
+                edges.append((name, m))
+        out['f_%x' % entry] = (local, edges, ['f_%x' % entry])
+    return out
 
 
 def lift_patched(fn, w, pc, patch):
@@ -868,6 +1015,20 @@ def emit(fn, lines, entries=None):
     # and LOADC reloads only what a call may change. Every register still goes to the Ctx before a call, so a
     # callee that spills one (and anything reading those spills) sees the current value.
     savec, loadc = list(save), [s for s in load if not KEPT_ACROSS_CALLS.match(s)]
+    # SAVECN: SAVEC without x19-x28. A callee that keeps the AAPCS spills and restores them but never uses the
+    # caller's values, and the caller keeps its own in locals (no LOADC of them), so their Ctx slots may be stale
+    # meanwhile: the callee loads the stale ones, restores them and writes them back at its return (SAVEC there).
+    # Used at BLR, and BL to callees that csr_flow found not to read them (SAVE_FOR, funcs.h CSR_<name>)
+    savecn = [s for s in save if not CALLEE_SAVED_X.match(s)]
+    # SAVECNC / SAVECNI: SAVECN at a BL / BLR. A debug lift (NX_CSR_POISON=1) stores 0xdead..NN in the slots left
+    # out, so that a callee using one crashes on it
+    keep = os.environ.get('NX_CSR_KEEP', '')       # debug: full stores at 'bl', 'blr', 'ret' (comma-separated)
+    savecnc = list(savec) if 'bl' in keep.split(',') else list(savecn)
+    savecni = list(savec) if 'blr' in keep.split(',') else list(savecn)
+    if os.environ.get('NX_CSR_POISON'):     # only the slots a call leaves out (the others hold live values)
+        poison = ['c->x[%d] = 0xdead0000000000%02xull;' % (n, n) for n in sorted(fn.wx) if 19 <= n <= 28]
+        savecnc += poison
+        savecni += poison
     if fn.flags:
         save.append('c->nf = NF; c->zf = ZF; c->cf = CF; c->vf = VF;')
         load.append('NF = c->nf; ZF = c->zf; CF = c->cf; VF = c->vf;')
@@ -875,6 +1036,9 @@ def emit(fn, lines, entries=None):
     out.append('#define LOAD do { %s } while (0)' % ' '.join(load))
     out.append('#define SAVEC do { %s } while (0)' % ' '.join(savec))
     out.append('#define LOADC do { %s } while (0)' % ' '.join(loadc))
+    out.append('#define SAVECN do { %s } while (0)' % ' '.join(savecn))
+    out.append('#define SAVECNC do { %s } while (0)' % ' '.join(savecnc))
+    out.append('#define SAVECNI do { %s } while (0)' % ' '.join(savecni))
     if multi:
         out.append('  switch (c->entry) { %s}' % ''.join('case %d: goto L_%x; ' % (i, e) for i, e in enumerate(entries)
                                                           if i or fn.order[0] != e))
@@ -893,6 +1057,9 @@ def emit(fn, lines, entries=None):
     out.append('#undef LOAD')
     out.append('#undef SAVEC')
     out.append('#undef LOADC')
+    out.append('#undef SAVECN')
+    out.append('#undef SAVECNC')
+    out.append('#undef SAVECNI')
     out.append('}')
     if multi:
         for i, e in enumerate(entries):
@@ -961,7 +1128,7 @@ def _lift_chunk(job, prog=None):
     env = Env(prog, prog.mods[n])
     stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
     srcs = [lift_function(env, off, sec.get(off, ()), stats) for off in offs]
-    return srcs, env.extra, env.ext_callees, env.unresolved, stats
+    return srcs, env.extra, env.ext_callees, env.unresolved, stats, env.csr
 
 
 def cmd_lift(outdir, only=None, per_file=40000):
@@ -978,6 +1145,8 @@ def cmd_lift(outdir, only=None, per_file=40000):
     all_files = []
     ext = set()
     unresolved = {}                          # u_<mangled> -> symbol
+    csr = {}                                 # csr_flow's results, all modules
+    taken = set()                            # names of entries whose address is taken (relocations, ADR)
     for n in MODULES:
         mod = prog.mods[n]
         env = Env(prog, mod)
@@ -1000,7 +1169,9 @@ def cmd_lift(outdir, only=None, per_file=40000):
         jobs = [(n, todo[i:i + LIFT_CHUNK], {o: sec[o] for o in todo[i:i + LIFT_CHUNK] if o in sec})
                 for i in range(0, len(todo), LIFT_CHUNK)]
         results = pool.map(_lift_chunk, jobs) if pool else (_lift_chunk(j, prog) for j in jobs)
-        for job, (srcs, extra, callees, unres, st) in zip(jobs, results):
+        taken.update('f_%x' % (mod.base + t) for t in set(mod.m.code_seeds()) | mod.addr_refs)
+        for job, (srcs, extra, callees, unres, st, cs) in zip(jobs, results):
+            csr.update(cs)
             env.extra |= extra
             env.ext_callees |= callees
             env.unresolved.update(unres)
@@ -1032,18 +1203,22 @@ def cmd_lift(outdir, only=None, per_file=40000):
     if pool:
         pool.shutdown()
     defined = {'f_%x' % e for es in all_entries.values() for e in es}
+    needy = csr_needs(csr, taken)
     with Out(os.path.join(outdir, 'funcs.h')) as f:
         f.write('/* generated by a64lift.py */\n#pragma once\n')
         for e in sorted(defined):
             f.write('void %s(Ctx *c);\n' % e)
         for e in sorted(ext - defined):
             f.write('void %s(Ctx *c);\n' % e)
+        f.write('/* entries that read x19-x28 from their caller (csr_flow): a BL to them stores those (SAVE_FOR) */\n')
+        for e in sorted(needy):
+            f.write('#define CSR_%s ~, 1,\n' % e)
     with Out(os.path.join(outdir, 'table.c')) as f:
         f.write('/* generated by a64lift.py: lifted entry points, per module, for the indirect-branch tables */\n')
         f.write('#include "a64rt.h"\n#include "funcs.h"\n')
         for n, es in all_entries.items():
             f.write('const FnEntry fn_entries_%s[] = {\n' % n)
-            f.writelines('  {0x%xull, f_%x},\n' % (e, e) for e in es)
+            f.writelines('  {0x%xull, f_%x%s},\n' % (e, e, ', 1' if 'f_%x' % e in needy else '') for e in es)
             f.write('  {0, 0}\n};\n')
         f.write('const ModInfo lifted_modules[] = {\n')
         for n, es in all_entries.items():
@@ -1063,6 +1238,55 @@ def cmd_lift(outdir, only=None, per_file=40000):
             print('removed stale', name)
     total = stats['ok'] + sum(stats['bad'].values())
     print('instructions %d, not translated %d' % (total, total - stats['ok']))
+
+
+def csr_needs(csr, taken):
+    """The entries whose function needs x19-x28 from its caller: csr_flow's own uses, then through calls and tail
+    jumps to such entries before the function wrote them (a fixpoint). Prints how many, and those whose address is
+    taken (a BLR to them would get stale values: SAVECN assumes the AAPCS there)."""
+    owner = {}
+    for k, (_, _, names) in csr.items():
+        for n in names:
+            owner[n] = k
+    need = {k: v[0] for k, v in csr.items()}
+    if os.environ.get('NX_CSR_DEBUG'):
+        roots = sorted(k for k, v in need.items() if v)
+        print('csr_needs: %d functions use them themselves: %s' % (len(roots), ' '.join(
+            '%s:%x' % (k, need[k]) for k in roots[:200])))
+    callers = collections.defaultdict(list)          # owner -> [(caller owner, mask)]
+    for k, (_, edges, _) in csr.items():
+        for name, m in edges:
+            t = owner.get(name)
+            if t is not None:
+                callers[t].append((k, m))
+    work = [k for k, v in need.items() if v]
+    while work:
+        t = work.pop()
+        for k, m in callers[t]:
+            n = need[k] | (need[t] & m)
+            if n != need[k]:
+                need[k] = n
+                work.append(k)
+    if os.environ.get('NX_CSR_DEBUG'):                # how far each root's need spreads alone
+        spread = []
+        for r in (k for k, v in csr.items() if v[0]):
+            seen = {r: csr[r][0]}
+            work = [r]
+            while work:
+                t = work.pop()
+                for k, m in callers[t]:
+                    n = seen.get(k, 0) | (seen[t] & m)
+                    if n != seen.get(k, 0):
+                        seen[k] = n
+                        work.append(k)
+            spread.append((len(seen), r))
+        spread.sort(reverse=True)
+        print('csr_needs: spread by root: %s' % ' '.join('%s:%d' % (r, n) for n, r in spread[:25]))
+    needy = {n for k, (_, _, names) in csr.items() if need[k] for n in names}
+    bad = sorted(needy & taken)
+    print('x19-x28: %d of %d functions read them from their caller; %d of those entries are address-taken%s'
+          % (sum(1 for v in need.values() if v), len(need), len(bad), (': ' + ' '.join(bad[:12])) if bad else ''))
+    return needy
 
 
 def write_if_changed(path, text):

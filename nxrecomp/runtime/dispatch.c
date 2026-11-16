@@ -42,7 +42,8 @@ void dispatch_init(void) {
         t->name = m->name;
         t->tab = fn_flat + (m->base - fn_flat_base) / 4;
         for (const FnEntry *e = m->entries; e->fn; e++) {
-            t->tab[(e->addr - m->base) / 4] = e->fn;
+            if ((uintptr_t)e->fn & 1) fatal("lifted function %llx at an odd host address", (unsigned long long)e->addr);
+            t->tab[(e->addr - m->base) / 4] = (GuestFn)((uintptr_t)e->fn | (e->csr & 1));
             u64 h = (u64)(uintptr_t)e->fn;
             if (!lifted_lo || h < lifted_lo) lifted_lo = h;
             if (h > lifted_hi) lifted_hi = h;
@@ -62,6 +63,19 @@ void dispatch_init(void) {
         }
 }
 
+/* a BLR to a function that reads x19-x28 from its caller (a64lift.py csr_flow: Lua opcode handlers, IDA-split
+ * chunks; meant to be entered by jumps): the call stored them (SAVEC), but its caller may not hold its own caller's
+ * values. Logged once per target, to find where that assumption is wrong */
+void csr_ind_note(u64 a) {
+    static u64 seen[64];
+    static LONG n;
+    for (LONG i = 0; i < n && i < 64; i++) if (seen[i] == a) return;
+    LONG i = InterlockedIncrement(&n) - 1;
+    if (i < 64) seen[i] = a;
+    char b[160];
+    hlog(0, "dispatch: BLR to %s, which reads x19-x28 from its caller", describe_addr(a, b, sizeof b));
+}
+
 u64 hostcall_register(const char *name, GuestFn fn) {
     if (nhostcalls == HOSTCALL_MAX) fatal("too many host calls");
     hostcalls[nhostcalls].name = name;
@@ -72,7 +86,7 @@ u64 hostcall_register(const char *name, GuestFn fn) {
 GuestFn guest_fn(u64 addr) {
     for (int i = 0; i < ntables; i++) {
         u64 off = addr - tables[i].base;
-        if (off < tables[i].span) return off & 3 ? NULL : tables[i].tab[off / 4];
+        if (off < tables[i].span) return off & 3 ? NULL : FN_UNTAG(tables[i].tab[off / 4]);
     }
     u64 off = addr - HOSTCALL_BASE;
     if (off < 4 * (u64)nhostcalls && !(off & 3)) return hostcalls[off / 4].fn;
