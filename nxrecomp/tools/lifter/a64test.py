@@ -83,7 +83,11 @@ def lift_test(env, words, pc, name):
     fn = TestFn(env, env.mod, pc, [])
     fn.order = [pc + 4 * i for i in range(len(words))]
     fn.addrs = set(fn.order[1:])
-    lines = [(pc + 4 * i, lift_insn(fn, w, pc + 4 * i)) for i, w in enumerate(words)]
+    lines = []
+    for i, w in enumerate(words):
+        fn.cur_pc = pc + 4 * i                   # call / exit placeholders: no call_masks here, so all of x0-x17
+        fn.cur = 'D%x' % fn.cur_pc
+        lines.append((fn.cur_pc, lift_insn(fn, w, fn.cur_pc)))
     fn.labels |= fn.addrs
     lines.append((None, '{ SAVE; if (!c->branched) c->pc = 0x%xull; return; }' % (pc + 4 * len(words))))
     src = emit(fn, lines)

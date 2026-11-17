@@ -43,7 +43,8 @@ References (`ref/`, `deps/suyu`) are for behaviour only: our own implementation,
 - **clang-cl 19+** in MSVC mode with MSVC `link.exe`. `nxrecomp/tools/vcenv.bat` finds Visual Studio (vswhere) and
   clang-cl (VS "C++ Clang tools", else MSYS2); `NX_VCVARS` / `NX_CC` override. Never hard-code a machine's paths in
   anything committed.
-- Flags: `-O1 -ffp-contract=off -fno-strict-aliasing`; a file that compiles too slowly goes to -O0 or is split.
+- Flags: lifted code `-O3 -ffp-contract=off -fno-strict-aliasing` (`NX_LIFT_OPT`, -O3 since 2026-11-16), all
+  else -O3 too; a file that compiles too slowly goes to -O0 or is split.
 - Build: Python generates C; CMake + Ninja build from the root `CMakeLists.txt`, one game per tree (`NX_GAME`,
   `<project>/build/cmake`). `build.bat violet|mk8 [ninja args]`; in a vcenv shell `cmake --preset violet` / `cmake
   --build --preset violet`. A new game: `game.json`, `game.cmake`, a line in `CMakeLists.txt`, a preset. Libraries:

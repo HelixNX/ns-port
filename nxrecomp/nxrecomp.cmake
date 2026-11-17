@@ -55,8 +55,16 @@ message(STATUS "nxrecomp: Vulkan headers ${NX_VULKAN_INCLUDE}, SDL3 ${NX_SDL3_IN
 set(CMAKE_C_FLAGS_RELEASE "/MD" CACHE STRING "" FORCE)
 
 # lifted code: no FP contraction (the guest fuses only where it says so), no strict aliasing (guest memory is
-# untyped); -O1 keeps compile time reasonable for the very large generated functions (NX_LIFT_OPT to compare)
-set(NX_LIFT_OPT "-O1" CACHE STRING "clang optimization level for lifted code")
+# untyped); -O3 (Violet 1x, 2026-11-16: ~1.5% over -O1, build 4.4 vs 4.0 min; NX_LIFT_OPT to compare)
+set(NX_LIFT_OPT "-O3" CACHE STRING "clang optimization level for lifted code")
+# trees configured while -O1 was the default keep it in their cache: move them once (a -O1 set on purpose after
+# this stays)
+if(NOT NX_LIFT_OPT_O3_DEFAULT)
+    if(NX_LIFT_OPT STREQUAL "-O1")
+        set(NX_LIFT_OPT "-O3" CACHE STRING "clang optimization level for lifted code" FORCE)
+    endif()
+    set(NX_LIFT_OPT_O3_DEFAULT ON CACHE INTERNAL "")
+endif()
 set(NX_LIFT_FLAGS /clang:${NX_LIFT_OPT} /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-march=haswell
                   /clang:-fbracket-depth=1024 /clang:-Wno-everything
                   /clang:-gline-tables-only /clang:-gcodeview)   # lines = guest offsets (a64lift #line)
@@ -124,7 +132,7 @@ function(nx_netplay_libs)
                                ${_e}/peer.c ${_e}/protocol.c ${_e}/win32.c)
     target_include_directories(nx_enet BEFORE PUBLIC "${_e}/include")
     target_compile_definitions(nx_enet PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(nx_enet PRIVATE /clang:-O2 /clang:-Wno-everything)
+    target_compile_options(nx_enet PRIVATE /clang:-O3 /clang:-Wno-everything)
     target_link_libraries(nx_enet PUBLIC ws2_32 winmm)
     set(_z "${NX_DEPS}/zstd/lib")
     file(GLOB _zsrc "${_z}/common/*.c" "${_z}/compress/*.c" "${_z}/decompress/*.c")
@@ -132,7 +140,7 @@ function(nx_netplay_libs)
     # ahead of the SDL3 / Vulkan include folders: a vcpkg one may have its own zstd.h, which imports zstd from a DLL
     target_include_directories(nx_zstd BEFORE PUBLIC "${_z}")
     target_compile_definitions(nx_zstd PRIVATE ZSTD_DISABLE_ASM)
-    target_compile_options(nx_zstd PRIVATE /clang:-O2 /clang:-Wno-everything)
+    target_compile_options(nx_zstd PRIVATE /clang:-O3 /clang:-Wno-everything)
 endfunction()
 
 # libopus for hwopus (services/hwopus.c): vcpkg (x64-windows: `vcpkg install opus`), in the vcpkg tree SDL3 came
@@ -242,10 +250,14 @@ function(nx_game)
     # each compile of a ~2 MB generated file takes 1-2 GB: limit parallel jobs so a 16 GB machine does not page
     set(LIFT_JOBS 0 CACHE STRING "parallel compiles of lifted code (0: by cores and memory)")
     set(lift_jobs ${LIFT_JOBS})
-    if(lift_jobs LESS 1)                # a lifted file takes up to ~1.3 GB to compile: 2 GB each
+    if(lift_jobs LESS 1)                # a lifted file takes up to ~1.3 GB to compile at -O1: 2 GB each, 3 GB above
         cmake_host_system_information(RESULT cores QUERY NUMBER_OF_LOGICAL_CORES)
         cmake_host_system_information(RESULT mem_mb QUERY TOTAL_PHYSICAL_MEMORY)
-        math(EXPR lift_jobs "${mem_mb} / 2048")
+        if(NX_LIFT_OPT MATCHES "^-O[01]$")
+            math(EXPR lift_jobs "${mem_mb} / 2048")
+        else()
+            math(EXPR lift_jobs "${mem_mb} / 3072")
+        endif()
         if(lift_jobs GREATER cores)
             set(lift_jobs ${cores})
         endif()
@@ -261,16 +273,21 @@ function(nx_game)
     target_include_directories(a64rt PUBLIC "${NX_ROOT}/runtime")
     target_compile_options(a64rt PRIVATE ${NX_LIFT_FLAGS})
 
-    # the package's copies at -O3 (best speed for players; a second full compile of the lifted code, made only when
-    # the package is built)
-    string(REPLACE "/clang:${NX_LIFT_OPT}" "/clang:-O3" lift_o3 "${NX_LIFT_FLAGS}")
-    add_library(lifted_o3 STATIC EXCLUDE_FROM_ALL ${lifted_sources})
-    target_include_directories(lifted_o3 PRIVATE "${NX_ROOT}/runtime" "${LIFTED_DIR}")
-    target_compile_options(lifted_o3 PRIVATE ${lift_o3})
-    set_property(TARGET lifted_o3 PROPERTY JOB_POOL_COMPILE lift_pool)
-    add_library(a64rt_o3 STATIC EXCLUDE_FROM_ALL "${NX_ROOT}/runtime/a64rt.c")
-    target_include_directories(a64rt_o3 PUBLIC "${NX_ROOT}/runtime")
-    target_compile_options(a64rt_o3 PRIVATE ${lift_o3})
+    # the package's lifted code is always -O3 (best speed for players): the same libraries at the default, else
+    # a second full compile at -O3, made only when the package is built
+    if(NX_LIFT_OPT STREQUAL "-O3")
+        set(NX_PKG_LIBS lifted a64rt)     # nx_game_exe, called below, sees it
+    else()
+        string(REPLACE "/clang:${NX_LIFT_OPT}" "/clang:-O3" lift_o3 "${NX_LIFT_FLAGS}")
+        add_library(lifted_o3 STATIC EXCLUDE_FROM_ALL ${lifted_sources})
+        target_include_directories(lifted_o3 PRIVATE "${NX_ROOT}/runtime" "${LIFTED_DIR}")
+        target_compile_options(lifted_o3 PRIVATE ${lift_o3})
+        set_property(TARGET lifted_o3 PROPERTY JOB_POOL_COMPILE lift_pool)
+        add_library(a64rt_o3 STATIC EXCLUDE_FROM_ALL "${NX_ROOT}/runtime/a64rt.c")
+        target_include_directories(a64rt_o3 PUBLIC "${NX_ROOT}/runtime")
+        target_compile_options(a64rt_o3 PRIVATE ${lift_o3})
+        set(NX_PKG_LIBS lifted_o3 a64rt_o3)
+    endif()
 
     # zstd: the shader pack (gpu.c) in every build, netplay's compression; ENet with it
     nx_netplay_libs()
@@ -278,7 +295,7 @@ function(nx_game)
     # the shader packer (tools/shader/pack.c): translate.py --spv's output in one file for players
     add_executable(nxshpack "${NX_ROOT}/tools/shader/pack.c")
     target_link_libraries(nxshpack PRIVATE nx_zstd)
-    target_compile_options(nxshpack PRIVATE /clang:-O2)
+    target_compile_options(nxshpack PRIVATE /clang:-O3)
     foreach(_dll ${NX_NETPLAY_DLLS})
         add_custom_command(TARGET nxshpack POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                            "${_dll}" "$<TARGET_FILE_DIR:nxshpack>")
@@ -298,13 +315,11 @@ endfunction()
 function(nx_game_exe target package)
     add_executable(${target} ${NX_RUNTIME_SOURCES} ${G_SOURCES})
     if(package)
-        set(opt /clang:-O3)
-        set(libs lifted_o3 a64rt_o3)
+        set(libs ${NX_PKG_LIBS})
     else()
-        set(opt /clang:-O2)
         set(libs lifted a64rt)
     endif()
-    target_compile_options(${target} PRIVATE ${opt} /clang:-march=haswell /W3 /clang:-Wno-unused-parameter
+    target_compile_options(${target} PRIVATE /clang:-O3 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter
                                               /clang:-Wno-bitwise-op-parentheses /clang:-fno-strict-aliasing
                                               /clang:-gline-tables-only /clang:-gcodeview)   # static functions named in profiles
     target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
@@ -376,7 +391,7 @@ function(nx_ui_dll)
     target_include_directories(nxui PRIVATE "${NX_VULKAN_INCLUDE}" "${NX_ROOT}/runtime" "${NX_SDL3_INCLUDE}"
                                "${NX_IMGUI_BASE}/include")
     target_compile_definitions(nxui PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(nxui PRIVATE /clang:-O2 /W3)
+    target_compile_options(nxui PRIVATE /clang:-O3 /W3)
     target_link_libraries(nxui PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_IMGUI_BASE}/lib/vulkan-1.lib"
                           "${NX_SDL3_LIB}")
     set_target_properties(nxui PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -403,7 +418,7 @@ function(nx_mod name)
     target_include_directories(${name} PRIVATE "${NX_VULKAN_INCLUDE}" "${NX_ROOT}/runtime" "${NX_ROOT}/modkit"
                                "${NX_SDL3_INCLUDE}" "${NX_IMGUI_BASE}/include")
     target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(${name} PRIVATE /clang:-O2 /W3)
+    target_compile_options(${name} PRIVATE /clang:-O3 /W3)
     # ImGui's Vulkan backend was built with prototypes: vulkan-1.lib (the loader the runtime uses too)
     target_link_libraries(${name} PRIVATE "${NX_IMGUI_BASE}/lib/imgui.lib" "${NX_SDL3_LIB}")
     set_target_properties(${name} PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mods"

@@ -511,6 +511,15 @@ KEPT_ACROSS_CALLS = re.compile(r'(X(19|2\d|30) = c->x\[|SP = c->x\[|V(8|9|1[0-5]
 # the SAVE statements of x19-x28 (left out of SAVECN)
 CALLEE_SAVED_X = re.compile(r'c->x\[(19|2[0-8])\] = ')
 CSR = sum(1 << n for n in range(19, 29))
+CSR_POISON = bool(os.environ.get('NX_CSR_POISON'))   # debug lift: poison what calls leave out (a64lift.py emit)
+# x0-x17 (call_masks): stored before a call or at an exit only when written since the last call (else the Ctx slot
+# holds the value already: the entry's, or what the last callee left), reloaded after a call only when read (or
+# stored) before the next write or call. x18, x29-x30, SP, the V registers and the flags as before
+MX = sum(1 << n for n in range(0, 18))
+MANAGED_SAVE = re.compile(r'c->x\[(\d|1[0-7])\] = ')
+MANAGED_LOAD = re.compile(r'X(\d|1[0-7]) = c->x\[')
+FULL_SAVE = re.compile(r'(?<![A-Z_])SAVE;')     # SAVE / LOAD around host code, svc, traps: reads every local
+PLACE = re.compile(r'@([DLOP][0-9a-f]+)@')    # per-site masks, filled in by emit from call_masks
 
 
 def mangle(sym):
@@ -533,6 +542,10 @@ class Fn:
         self.temps = set()                        # extra function-scope locals ('FA', 'FB', 'JT')
         self.fk = None                            # what the flags were last computed from (see a64insn.cond)
         self.extra_decls = []
+        self.cur_pc = None                        # the instruction being lifted
+        self.cur = None                           # its exit key: 'D<pc>' (before it), 'O<pc>' (a fall-through after)
+        self.callsites = set()                    # pcs of BL / BLR to lifted code (call_masks)
+        self.masks = {}                           # call_masks' result
 
     # ---- registers
     def x(self, n, sp=False):
@@ -594,20 +607,27 @@ class Fn:
         name = self.env.callee(target)
         if name.startswith('h_'):                      # host replacements may set any register
             return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, name)
-        return 'X30 = 0x%xull; SAVE_FOR(%s); %s(c); LOADC;' % (ret_addr, name, name)
+        p = self.cur_pc
+        self.callsites.add(p)
+        post = ' LOADX(@L%x@);' % p + (' POISONL(@P%x@);' % p if CSR_POISON else '')
+        return 'X30 = 0x%xull; SAVEX(@D%x@); SAVE_FOR(%s); %s(c); LOADC;%s' % (ret_addr, p, name, name, post)
 
     def call_ind(self, expr, ret_addr):
         self.wx.add(30)
         self.fk = None
-        return ('{ u64 t = %s; X30 = 0x%xull; GuestFn F_ = guest_fn_fast(t); if (FN_CSR(F_)) { SAVEC; csr_ind_note(t); } '
-                'else SAVECNI; call_ind_with(c, t, F_); LOADC; }') % (expr, ret_addr)
+        p = self.cur_pc
+        self.callsites.add(p)
+        post = ' LOADX(@L%x@);' % p + (' POISONL(@P%x@);' % p if CSR_POISON else '')
+        return ('{ u64 t = %s; X30 = 0x%xull; GuestFn F_ = guest_fn_fast(t); SAVEX(@D%x@); '
+                'if (FN_CSR(F_)) { SAVEC; csr_ind_note(t); } else SAVECNI; call_ind_with(c, t, F_); LOADC;%s }'
+                ) % (expr, ret_addr, p, post)
 
     def jump(self, target):
         """Unconditional direct branch."""
         if target in self.addrs:
             self.labels.add(target)
             return 'goto L_%x;' % target
-        return '{ SAVE; MUSTTAIL return %s(c); }' % self.env.callee(target)
+        return '{ SAVEX(@%s@); SAVET; MUSTTAIL return %s(c); }' % (self.cur, self.env.callee(target))
 
     def jump_ind(self, expr, at):
         """BR Xn: a resolved switch becomes gotos; anything else is an indirect tail call."""
@@ -620,15 +640,16 @@ class Fn:
                 if ta in self.addrs:
                     self.labels.add(ta)
                     out.append('case 0x%xull: goto L_%x;' % (ta, ta))
-            out.append('default: c->pc = JT; SAVE; MUSTTAIL return jump_ind_fast(c); } }')
+            out.append('default: c->pc = JT; SAVEX(@%s@); SAVET; MUSTTAIL return jump_ind_fast(c); } }' % self.cur)
             return ' '.join(out)
-        return '{ c->pc = %s; SAVE; MUSTTAIL return jump_ind_fast(c); }' % expr
+        return '{ c->pc = %s; SAVEX(@%s@); SAVET; MUSTTAIL return jump_ind_fast(c); }' % (expr, self.cur)
 
     def ret(self, expr):
         # SAVEC, not SAVECN: for x19-x28 a function never touches, the Ctx slot is the live value (it has no local),
         # so a callee that used one must put its caller's value back: a caller that does not track x23 may tail-jump
-        # next to code that reads it (the Lua VM's handlers and luaV_execute's re-entries)
-        return '{ SAVEC; return; }'
+        # next to code that reads it (the Lua VM's handlers and luaV_execute's re-entries). x0-x17: SAVEX, only
+        # those written since the last call
+        return '{ SAVEX(@%s@); SAVEC; return; }' % self.cur
 
     def svc(self, n):
         self.fk = None
@@ -797,12 +818,14 @@ def lift_function(env, owner, secondary=(), stats=None):
 
     for pc in fn.order:
         if prev is not None and pc != prev + 4 and not noreturn_prev:
+            fn.cur = 'O%x' % prev
             lines.append((None, fn.jump(prev + 4) if (prev + 4 in fn.addrs or env_is_entry(env, prev + 4))
                           else 'guest_trap(c, "ran past the end of a chunk", 0x%xull); return;' % (prev + 4)))
         if pc in bt:
             fn.fk = None
             fn.labels.add(pc)
         w = mod.word(pc - mod.base)
+        fn.cur_pc, fn.cur = pc, 'D%x' % pc
         rx0, wx0 = fn.rx, fn.wx                    # this instruction's own reads and writes, for csr_flow
         fn.rx, fn.wx = set(), set()
         patch = env.prog.patches.get(pc)
@@ -823,15 +846,18 @@ def lift_function(env, owner, secondary=(), stats=None):
         prev = pc
     if not noreturn_prev:
         nxt = prev + 4
+        fn.cur = 'O%x' % prev
         lines.append((None, fn.jump(nxt) if (nxt in fn.addrs or env_is_entry(env, nxt))
                       else 'guest_trap(c, "ran past the end of a function", 0x%xull); return;' % nxt))
-    env.csr.update(csr_flow(fn, env, recs, entries))
+    succ, sites = fn_cfg(fn, env, recs)
+    env.csr.update(csr_flow(fn, recs, entries, succ, sites))
+    fn.masks = call_masks(fn, recs, lines, succ)
     return emit(fn, lines, entries)
 
 
 def regmask(regs):
-    """x19-x28 of a register set, as bits"""
-    return sum(1 << n for n in regs if 19 <= n <= 28)
+    """x0-x30 of a register set, as bits"""
+    return sum(1 << n for n in regs if n < 31)
 
 
 def spill_mask(w):
@@ -840,35 +866,27 @@ def spill_mask(w):
     if base not in (31, 29):
         return 0
     if w & 0xffc00000 in (0xa9000000, 0xa9800000, 0xa8800000):           # STP Xt, Xt2 (offset, pre, post)
-        return regmask((w & 31, (w >> 10) & 31))
+        return regmask((w & 31, (w >> 10) & 31)) & CSR
     if w & 0xffc00000 == 0xf9000000 or w & 0xffe00c00 in (0xf8000c00, 0xf8000400, 0xf8000000):  # STR / STUR Xt
-        return regmask((w & 31,))
+        return regmask((w & 31,)) & CSR
     return 0
 
 
 def store_mask(w):
     """x19-x28 that an STP / STR (64-bit, any base) stores"""
     if w & 0xffc00000 in (0xa9000000, 0xa9800000, 0xa8800000):
-        return regmask((w & 31, (w >> 10) & 31))
+        return regmask((w & 31, (w >> 10) & 31)) & CSR
     if w & 0xffc00000 == 0xf9000000 or w & 0xffe00c00 in (0xf8000c00, 0xf8000400, 0xf8000000):
-        return regmask((w & 31,))
+        return regmask((w & 31,)) & CSR
     return 0
 
 
-def csr_flow(fn, env, recs, entries):
-    """Which of x19-x28 each entry of the function may read before writing them (its caller's values): what a BL to
-    it must store (SAVE_FOR). Must-written sets over its control flow from that entry; a prologue's STP / STR of
-    one is no use. Returns {entry name: (mask used, [(callee name, mask not yet written there)] for calls and tail
-    jumps, whose needs become this entry's (cmd_lift's fixpoint), [entry name])}; its own reads leave out what it
-    spilled on every path. Hook sites (patches.txt call / after: SAVE, host code, LOAD) add nothing: every hook
-    reads only x19-x28 its function wrote by then (wild.c / raidgem.c x19 after "mov x19, x0", lua.c x23, gfx.c
-    x28, fps.c x20; a new hook reading a caller's value would need it). setjmp passes nothing on: a longjmp
-    restores them into this function, which does not use the ones it never wrote, and its callers keep theirs in
-    locals. BLR and indirect tail jumps are taken to follow the AAPCS (callees read none; a BLR to an entry that
-    does stores them and says so, dispatch.c csr_ind_note)."""
+def fn_cfg(fn, env, recs):
+    """The function's control flow: successors of each pc inside it, and the calls and tail jumps out of it as
+    (pc, callee name or None)."""
     mod, base = fn.mod, fn.mod.base
     succ = collections.defaultdict(list)
-    sites = []                               # (pc, callee name, or '*' for all)
+    sites = []
 
     def name_of(t):
         try:
@@ -909,6 +927,86 @@ def csr_flow(fn, env, recs, entries):
                 succ[pc].append(pc + 4)
             elif env_is_entry(env, pc + 4):
                 sites.append((pc, name_of(pc + 4)))
+    return succ, sites
+
+
+def call_masks(fn, recs, lines, succ):
+    """Per call site and exit, which of x0-x17 to store and reload (the MX comment), as the values of emit's
+    placeholders: D<pc> / O<pc> the ones written since the last call before / after pc (stored at an exit or a call),
+    L<pc> the ones reloaded after a call, P<pc> the locals a call leaves stale (NX_CSR_POISON). Exact, no calling
+    convention assumed: a register not stored still has its value in its Ctx slot (the entry's, or what the last
+    callee left there), and a local not reloaded is never read or stored again.
+    Written since the last call: a may-set forward, emptied by every call (all of it is stored there). Read after a
+    call: liveness backward, where a call defines all of x0-x17 and every store reads its local: a call or exit
+    reads what is written since the last call (a register written on one path into a join is stored on the other
+    path too, so that path reloads it after its call), a full SAVE (svc, host code, hooks, traps) reads them all.
+    NX_CSR_KEEP=x stores and reloads them all, as before."""
+    calls = fn.callsites
+    stmts = collections.defaultdict(str)
+    ft_exit = set()                          # pcs followed by a fall-through tail jump (an O<pc> store)
+    for pc, st in lines:
+        if pc is not None:
+            stmts[pc] += st
+        for k in PLACE.findall(st):
+            if k[0] == 'O':
+                ft_exit.add(int(k[1:], 16))
+    full = {pc for pc, st in stmts.items() if FULL_SAVE.search(st)}
+    exits = {pc for pc, st in stmts.items() if '@D%x@' % pc in st and pc not in calls}
+    rec = {pc: (r, wr) for pc, w, r, wr, _ in recs}
+    order = fn.order
+    din, dout = dict.fromkeys(order, 0), dict.fromkeys(order, 0)
+    changed = True
+    while changed:
+        changed = False
+        for pc in order:
+            o = 0 if pc in calls else din[pc] | (rec[pc][1] & MX)
+            dout[pc] = o
+            for t in succ[pc]:
+                if din[t] | o != din[t]:
+                    din[t] |= o
+                    changed = True
+    lin, lout = dict.fromkeys(order, 0), dict.fromkeys(order, 0)
+    changed = True
+    while changed:
+        changed = False
+        for pc in reversed(order):
+            r, wr = rec[pc]
+            lo = dout[pc] if pc in ft_exit else 0
+            for t in succ[pc]:
+                lo |= lin[t]
+            lout[pc] = lo
+            if pc in full:
+                li = MX
+            elif pc in calls:
+                li = (r | din[pc]) & MX              # BLR's target register, and the stores
+            else:
+                li = (r & MX) | (din[pc] if pc in exits else 0) | (lo & ~(wr & MX))
+            if li != lin[pc]:
+                lin[pc] = li
+                changed = True
+    keep = 'x' in os.environ.get('NX_CSR_KEEP', '').split(',')
+    out = {}
+    for pc in order:
+        out['D%x' % pc] = MX if keep else din[pc]
+        out['O%x' % pc] = MX if keep else dout[pc]
+        if pc in calls:
+            lo = lout[pc]
+            out['L%x' % pc] = MX if keep else lo & MX
+            out['P%x' % pc] = 0 if keep else MX & ~lo
+    return out
+
+
+def csr_flow(fn, recs, entries, succ, sites):
+    """Which of x19-x28 each entry of the function may read before writing them (its caller's values): what a BL to
+    it must store (SAVE_FOR). Must-written sets over its control flow from that entry; a prologue's STP / STR of
+    one is no use. Returns {entry name: (mask used, [(callee name, mask not yet written there)] for calls and tail
+    jumps, whose needs become this entry's (cmd_lift's fixpoint), [entry name])}; its own reads leave out what it
+    spilled on every path. Hook sites (patches.txt call / after: SAVE, host code, LOAD) add nothing: every hook
+    reads only x19-x28 its function wrote by then (wild.c / raidgem.c x19 after "mov x19, x0", lua.c x23, gfx.c
+    x28, fps.c x20; a new hook reading a caller's value would need it). setjmp passes nothing on: a longjmp
+    restores them into this function, which does not use the ones it never wrote, and its callers keep theirs in
+    locals. BLR and indirect tail jumps are taken to follow the AAPCS (callees read none; a BLR to an entry that
+    does stores them and says so, dispatch.c csr_ind_note)."""
     rec = {pc: (w, r, wr) for pc, w, r, wr, _ in recs}
     # Two must-sets over the control flow from every entry (entries: nothing): written on every path to pc, and
     # spilled (an STP / STR of it to the stack) on every path to pc. A register spilled on every path is one the
@@ -946,7 +1044,7 @@ def csr_flow(fn, env, recs, entries):
         local = 0
         debug = os.environ.get('NX_CSR_DEBUG')
         for pc, (w, r, wr) in rec.items():
-            u = 0 if capture else r & ~inn[pc] & ~sinn[pc] & ~spill_mask(w)
+            u = 0 if capture else r & CSR & ~inn[pc] & ~sinn[pc] & ~spill_mask(w)
             if u and debug:
                 print('csr_flow: f_%x: %x (%08x) reads %x before writing it' % (entry, pc, w, u))
             local |= u
@@ -1014,24 +1112,31 @@ def emit(fn, lines, entries=None):
     # and the low halves of v8-v15 (the caller's own values are kept in its locals), so SAVEC leaves the flags out
     # and LOADC reloads only what a call may change. Every register still goes to the Ctx before a call, so a
     # callee that spills one (and anything reading those spills) sees the current value.
-    savec, loadc = list(save), [s for s in load if not KEPT_ACROSS_CALLS.match(s)]
+    savec = [s for s in save if not MANAGED_SAVE.match(s)]
+    loadc = [s for s in load if not KEPT_ACROSS_CALLS.match(s) and not MANAGED_LOAD.match(s)]
     # SAVECN: SAVEC without x19-x28. A callee that keeps the AAPCS spills and restores them but never uses the
     # caller's values, and the caller keeps its own in locals (no LOADC of them), so their Ctx slots may be stale
     # meanwhile: the callee loads the stale ones, restores them and writes them back at its return (SAVEC there).
     # Used at BLR, and BL to callees that csr_flow found not to read them (SAVE_FOR, funcs.h CSR_<name>)
-    savecn = [s for s in save if not CALLEE_SAVED_X.match(s)]
+    savecn = [s for s in savec if not CALLEE_SAVED_X.match(s)]
     # SAVECNC / SAVECNI: SAVECN at a BL / BLR. A debug lift (NX_CSR_POISON=1) stores 0xdead..NN in the slots left
     # out, so that a callee using one crashes on it
     keep = os.environ.get('NX_CSR_KEEP', '')       # debug: full stores at 'bl', 'blr', 'ret' (comma-separated)
     savecnc = list(savec) if 'bl' in keep.split(',') else list(savecn)
     savecni = list(savec) if 'blr' in keep.split(',') else list(savecn)
-    if os.environ.get('NX_CSR_POISON'):     # only the slots a call leaves out (the others hold live values)
+    if CSR_POISON:                          # only the slots a call leaves out (the others hold live values)
         poison = ['c->x[%d] = 0xdead0000000000%02xull;' % (n, n) for n in sorted(fn.wx) if 19 <= n <= 28]
         savecnc += poison
         savecni += poison
     if fn.flags:
         save.append('c->nf = NF; c->zf = ZF; c->cf = CF; c->vf = VF;')
         load.append('NF = c->nf; ZF = c->zf; CF = c->cf; VF = c->vf;')
+    # x0-x17 by a mask (call_masks, constant at each site): SAVEX stores, LOADX reloads; SAVET is SAVE without them
+    # (the rest at an exit). POISONL (NX_CSR_POISON): 0xdeadbeef..NN in the locals a call leaves stale, so that a
+    # read or store of one shows
+    savet = [s for s in save if not MANAGED_SAVE.match(s)]
+    savex = ['if ((m) & 0x%x) c->x[%d] = X%d;' % (1 << n, n, n) for n in sorted(fn.wx) if n < 18]
+    loadx = ['if ((m) & 0x%x) X%d = c->x[%d];' % (1 << n, n, n) for n in used_x if n < 18]
     out.append('#define SAVE do { %s } while (0)' % ' '.join(save))
     out.append('#define LOAD do { %s } while (0)' % ' '.join(load))
     out.append('#define SAVEC do { %s } while (0)' % ' '.join(savec))
@@ -1039,6 +1144,12 @@ def emit(fn, lines, entries=None):
     out.append('#define SAVECN do { %s } while (0)' % ' '.join(savecn))
     out.append('#define SAVECNC do { %s } while (0)' % ' '.join(savecnc))
     out.append('#define SAVECNI do { %s } while (0)' % ' '.join(savecni))
+    out.append('#define SAVET do { %s } while (0)' % ' '.join(savet))
+    out.append('#define SAVEX(m) do { %s } while (0)' % ' '.join(savex))
+    out.append('#define LOADX(m) do { %s } while (0)' % ' '.join(loadx))
+    if CSR_POISON:
+        out.append('#define POISONL(m) do { %s } while (0)' % ' '.join(
+            'if ((m) & 0x%x) X%d = 0xdeadbeef000000%02xull;' % (1 << n, n, n) for n in used_x if n < 18))
     if multi:
         out.append('  switch (c->entry) { %s}' % ''.join('case %d: goto L_%x; ' % (i, e) for i, e in enumerate(entries)
                                                           if i or fn.order[0] != e))
@@ -1046,7 +1157,13 @@ def emit(fn, lines, entries=None):
         out.append('  goto L_%x;' % fn.entry)
     base = fn.mod.base
     out.append('#line %d "%s"' % (fn.order[0] - base, fn.mod.name))
+    masks = fn.masks
+
+    def fill(m):                                  # a key call_masks did not reach (none expected): all of them
+        k = m.group(1)
+        return '0x%x' % masks.get(k, 0 if k[0] == 'P' else MX)
     for pc, stmt in lines:
+        stmt = PLACE.sub(fill, stmt)
         if pc is not None and LINE_INFO:
             out.append('#line %d' % (pc - base))       # guest offset as the line number: crash reports name it
         if pc is not None and pc in fn.labels:
@@ -1060,6 +1177,11 @@ def emit(fn, lines, entries=None):
     out.append('#undef SAVECN')
     out.append('#undef SAVECNC')
     out.append('#undef SAVECNI')
+    out.append('#undef SAVET')
+    out.append('#undef SAVEX')
+    out.append('#undef LOADX')
+    if CSR_POISON:
+        out.append('#undef POISONL')
     out.append('}')
     if multi:
         for i, e in enumerate(entries):
@@ -1111,7 +1233,8 @@ def lift_procs():
         ms = MemStatus(len=ctypes.sizeof(MemStatus))
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
             avail_gb = ms.avail / 2**30
-    return max(1, min(8, os.cpu_count() or 1, int((avail_gb - 4) / 3)))   # 4 GB: this process and its results
+    # 8 GB left: this process and its results (~4), and the rest of the machine (8 workers on 28 GB free filled it)
+    return max(1, min(8, os.cpu_count() or 1, int((avail_gb - 8) / 3)))
 
 
 def _lift_worker_init(overrides):
