@@ -39,7 +39,20 @@ typedef struct Ctx {
     void *host;                 /* the host thread that owns this context */
 } Ctx;
 
-typedef void (*GuestFn)(Ctx *);
+/* The calling convention of lifted functions and everything they call or jump to as one (GuestFn: host functions in
+ * the dispatch tables, the shared overrides.txt replacements, call_ind / jump_ind). Win64 by default; nxrecomp.cmake
+ * NX_LIFT_CC picks another to compare: preserve_none (no callee-saved registers but rbp: no prologue pushes or
+ * xmm6-15 saves, but values live across a call are spilled at every call site) or sysv_abi (rbx, rbp, r12-r15
+ * callee-saved, all xmm caller-saved). A host function with this signature that is not NXCC is a compile error
+ * where it meets a GuestFn; patches.txt hooks are called as plain C (a64lift.py lift_patched) and stay Win64. */
+#if defined(NX_LIFT_CC_PRESERVE_NONE)
+#define NXCC __attribute__((preserve_none))
+#elif defined(NX_LIFT_CC_SYSV)
+#define NXCC __attribute__((sysv_abi))
+#else
+#define NXCC
+#endif
+typedef void (NXCC *GuestFn)(Ctx *);
 typedef struct { u64 addr; GuestFn fn; u64 csr; } FnEntry;      /* csr: 1 if it reads x19-x28 from its caller */
 typedef struct { const char *name; u64 base, text_end, size; const FnEntry *entries; } ModInfo;
 
@@ -54,8 +67,8 @@ typedef struct { const char *name; u64 base, text_end, size; const FnEntry *entr
 #define SAVE_FOR(f) do { if (NX_CSR(f)) SAVEC; else SAVECNC; } while (0)
 
 /* provided by the runtime */
-void call_ind(Ctx *c, u64 addr);         /* BLR: call the lifted function at addr */
-void jump_ind(Ctx *c);                   /* BR (tail position): jump to c->pc */
+NXCC void call_ind(Ctx *c, u64 addr);    /* BLR: call the lifted function at addr */
+NXCC void jump_ind(Ctx *c);              /* BR (tail position): jump to c->pc */
 
 /* the lifted function at a guest text address, from one table over all modules (dispatch.c), or NULL; the
  * lifted code looks targets up here first and leaves host calls and bad addresses to call_ind / jump_ind */
@@ -76,7 +89,7 @@ static inline void call_ind_with(Ctx *c, u64 a, GuestFn f) {
     else call_ind(c, a);
 }
 static inline void call_ind_fast(Ctx *c, u64 a) { call_ind_with(c, a, guest_fn_fast(a)); }
-static inline void jump_ind_fast(Ctx *c) {
+static inline NXCC void jump_ind_fast(Ctx *c) {
     GuestFn f = guest_fn_fast(c->pc);
     if (f) MUSTTAIL return FN_UNTAG(f)(c);
     MUSTTAIL return jump_ind(c);
