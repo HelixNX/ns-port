@@ -53,12 +53,12 @@ typedef struct Ctx {
 #define NXCC
 #endif
 typedef void (NXCC *GuestFn)(Ctx *);
-typedef struct { u64 addr; GuestFn fn; u64 csr; } FnEntry;      /* csr: 1 if it reads x19-x28 from its caller */
+typedef struct { u64 addr; GuestFn fn; u64 csr; } FnEntry;      /* csr: 1 if it reads x19-x29 from its caller */
 typedef struct { const char *name; u64 base, text_end, size; const FnEntry *entries; } ModInfo;
 
 #define MUSTTAIL __attribute__((musttail))
 
-/* The store before a BL to f (a64lift.py call): SAVEC if f reads x19-x28 from its caller (funcs.h defines CSR_f as
+/* The store before a BL to f (a64lift.py call): SAVEC if f reads x19-x29 from its caller (funcs.h defines CSR_f as
  * "~, 1," for those, from the lifter's csr_flow), else SAVECN, which leaves them out. NX_CSR_(CSR_f) is 1 when the
  * name expands to that list and 0 when it stays a plain identifier; the branch folds at compile time. */
 #define NX_CSR_N(x, n, ...) n
@@ -74,7 +74,7 @@ NXCC void jump_ind(Ctx *c);              /* BR (tail position): jump to c->pc */
  * lifted code looks targets up here first and leaves host calls and bad addresses to call_ind / jump_ind */
 extern GuestFn *fn_flat;
 extern u64 fn_flat_base, fn_flat_span;
-/* fn_flat's entries carry FnEntry.csr in bit 0 (lifted functions are 16-byte aligned): a BLR stores x19-x28 only
+/* fn_flat's entries carry FnEntry.csr in bit 0 (lifted functions are 16-byte aligned): a BLR stores x19-x29 only
  * for those (a64lift.py call_ind: SAVEC, else SAVECN), and notes them once (csr_ind_note) */
 #define FN_UNTAG(f) ((GuestFn)((uintptr_t)(f) & ~(uintptr_t)1))
 #define FN_CSR(f) ((uintptr_t)(f) & 1)

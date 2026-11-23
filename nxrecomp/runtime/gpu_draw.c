@@ -287,6 +287,7 @@ bool begin_rendering(void) {
         if (v) {
             st.rt_sub[8].addr = im->info.addr, st.rt_sub[8].size = im->size;
             pass_img[8] = im;
+            taa_pass_depth(im);
             st.rt_sub[8].level = l, st.rt_sub[8].layer = l0, st.rt_sub[8].nlayers = nl;
             depth.imageView = v;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -595,6 +596,10 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
         d.vp.x = 0; d.vp.y = 0;
         d.vp.width = (float)st.area.extent.width;
         d.vp.height = (float)st.area.extent.height;
+    }
+    if (taa_draw_jitter) {              /* FSR 2's sub-pixel jitter (gpu_taa.c), in render pixels */
+        d.vp.x += taa_jit[0];
+        d.vp.y += taa_jit[1];
     }
     if (window_origin == 1) {
         /* NVN's upper-left origin puts NDC y = +1 at row 0, Vulkan puts -1 there: flip, so that every render
@@ -1143,8 +1148,11 @@ void draw(u32 op, const void *payload) {
             nxfb_ranges = 0;
         }
     }
+    taa_note_draw(op, payload);
+    u64 skipped = draws_skipped;
     draw_one(op, payload);
     label_draw_end();
+    if (draws_skipped == skipped) taa_after_draw(pipe_fs_hash, pass_img[0]);
     dump_after_draw();
     if (xfb_capturing) {
         vkCmdEndTransformFeedbackEXT(cmd(), 0, 0, NULL, NULL);

@@ -176,6 +176,81 @@ static u64 ready_seq;
 u64 lifted_lo, lifted_hi;
 
 static u64 qpc_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (u64)q.QuadPart; }
+
+/* Host CPUs for the guest's cores (NX_HOST_CORES=1; unset or 0: Windows places the threads anywhere, as before).
+ * The three guest cores run their owners at the same time; on an SMT CPU two of them may land on one physical
+ * core's two logical processors, which share its execution units (Savage Wind: +4-10% with one emulated core per
+ * physical core). With the switch, each guest core is one physical core (its logical processors as a CPU set) and
+ * a thread that takes core c runs only there: the fastest class (EfficiencyClass: a hybrid CPU's performance cores),
+ * not the one with logical processor 0 (interrupts, DPCs) when there are enough. Set when the core a thread holds
+ * changes (SetThreadSelectedCpuSets on its handle, under klock), not at every hand-off; a thread keeps its set while
+ * it waits. The runtime's own host threads (presents, shader builds, audio) stay anywhere. */
+static int host_cores = -1;                     /* -1: not read yet (the first core_assign) */
+static ULONG hc_ids[NCORES][8], hc_n[NCORES];
+
+static void host_cores_init(void) {
+    host_cores = 0;
+    const char *e = getenv("NX_HOST_CORES");
+    if (!e || !atoi(e)) return;
+    ULONG len = 0;
+    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+    SYSTEM_CPU_SET_INFORMATION *info = len ? malloc(len) : NULL;
+    if (!info || !GetSystemCpuSetInformation(info, len, &len, GetCurrentProcess(), 0)) {
+        free(info);
+        hlog(0, "kernel: NX_HOST_CORES: no CPU set information (%lu): off", GetLastError());
+        return;
+    }
+    enum { MAXPC = 256 };
+    static struct { WORD group; BYTE core, cls; bool lp0; ULONG ids[8], n; } pc[MAXPC];
+    int npc = 0;
+    BYTE top = 0;
+    for (char *p = (char *)info; p < (char *)info + len; p += ((SYSTEM_CPU_SET_INFORMATION *)p)->Size) {
+        const SYSTEM_CPU_SET_INFORMATION *s = (const SYSTEM_CPU_SET_INFORMATION *)p;
+        if (s->Type != CpuSetInformation) continue;
+        int i = 0;
+        while (i < npc && !(pc[i].group == s->CpuSet.Group && pc[i].core == s->CpuSet.CoreIndex)) i++;
+        if (i == npc) {
+            if (npc == MAXPC) continue;
+            memset(&pc[npc], 0, sizeof pc[0]);
+            pc[npc].group = s->CpuSet.Group;
+            pc[npc].core = s->CpuSet.CoreIndex;
+            npc++;
+        }
+        if (s->CpuSet.EfficiencyClass > pc[i].cls) pc[i].cls = s->CpuSet.EfficiencyClass;
+        if (s->CpuSet.EfficiencyClass > top) top = s->CpuSet.EfficiencyClass;
+        if (s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex == 0) pc[i].lp0 = true;
+        if (pc[i].n < 8) pc[i].ids[pc[i].n++] = s->CpuSet.Id;
+    }
+    free(info);
+    int fast = 0;
+    for (int i = 0; i < npc; i++) fast += pc[i].cls == top;
+    int got = 0;
+    char desc[128];
+    int at = 0;
+    desc[0] = 0;
+    for (int i = 0; i < npc && got < NCORES; i++) {
+        if (pc[i].cls != top || (pc[i].lp0 && fast > NCORES)) continue;
+        memcpy(hc_ids[got], pc[i].ids, sizeof pc[i].ids);
+        hc_n[got] = pc[i].n;
+        at += snprintf(desc + at, sizeof desc - (size_t)at, " %u (%lu)", pc[i].core, pc[i].n);
+        got++;
+    }
+    if (got < NCORES) {
+        hlog(0, "kernel: NX_HOST_CORES: %d physical cores of the fastest class, %d needed: off", fast, NCORES);
+        return;
+    }
+    host_cores = 1;
+    hlog(0, "kernel: NX_HOST_CORES: guest cores 0-%d on the physical cores (by first logical processor, logical "
+            "processors each)%s", NCORES - 1, desc);
+}
+
+/* t now holds guest core c: its host CPU set follows (NX_HOST_CORES) */
+static void host_core_follow(KThread *t, int c) {
+    if (host_cores < 0) host_cores_init();
+    if (!host_cores || t->host_core == c + 1 || !t->host) return;
+    if (SetThreadSelectedCpuSets((HANDLE)t->host, hc_ids[c], hc_n[c])) t->host_core = c + 1;
+}
+
 /* NX_TRACE: a hold's start for its share of host CPU (the host thread's cycles over TSC ticks: below 100% the
  * thread held the core without running, e.g. not yet woken, or Windows ran something else) */
 static void hold_mark(KThread *t) {
@@ -237,6 +312,7 @@ static bool kspin(KThread *t, bool for_core) {
 static void core_assign(KThread *t, int c) {
     core_owner[c] = t;
     t->cur_core = c;
+    host_core_follow(t, c);
     t->hold_since = qpc_now();
     hold_mark(t);
     t->ready = false;
@@ -284,6 +360,7 @@ static void core_move(int from, int to) {
     core_owner[to] = o;
     core_owner[from] = NULL;
     o->cur_core = to;
+    host_core_follow(o, to);
     core_migrations++;
 }
 

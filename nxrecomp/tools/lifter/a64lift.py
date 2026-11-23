@@ -583,9 +583,14 @@ class Program:
 SETJMP = {'setjmp', '_setjmp', '__setjmp'}
 # the LOAD statements of registers a call leaves as they were (see emit)
 KEPT_ACROSS_CALLS = re.compile(r'(X(19|2\d|30) = c->x\[|SP = c->x\[|V(8|9|1[0-5]) = c->v\[)')
-# the SAVE statements of x19-x28 (left out of SAVECN)
-CALLEE_SAVED_X = re.compile(r'c->x\[(19|2[0-8])\] = ')
-CSR = sum(1 << n for n in range(19, 29))
+# x19-x29 (left out of SAVECN): the callee-saved registers a callee reads only if csr_flow says so. x29 too
+# (2026-11-20): a callee spills it in its prologue and sets its own; only frame-pointer walks (the runtime's
+# NX_TRACE callers, crash dumps, the game's own backtraces) read the caller's value, and through the frame records
+# they may now find a stale one past the first frame or two. A debug lift NX_CSR_KEEP=fp stores x29 as before
+CSR_KEEP_FP = 'fp' in os.environ.get('NX_CSR_KEEP', '').split(',')
+CSR_HI = 29 if CSR_KEEP_FP else 30
+CALLEE_SAVED_X = re.compile(r'c->x\[(19|2[0-8])\] = ' if CSR_KEEP_FP else r'c->x\[(19|2\d)\] = ')
+CSR = sum(1 << n for n in range(19, CSR_HI))
 CSR_POISON = bool(os.environ.get('NX_CSR_POISON'))   # debug lift: poison what calls leave out (a64lift.py emit)
 # x0-x17 (call_masks): stored before a call or at an exit only when written since the last call (else the Ctx slot
 # holds the value already: the entry's, or what the last callee left), reloaded after a call only when read (or
@@ -720,7 +725,7 @@ class Fn:
         return '{ c->pc = %s; SAVEX(@%s@); SAVET; MUSTTAIL return jump_ind_fast(c); }' % (expr, self.cur)
 
     def ret(self, expr):
-        # SAVEC, not SAVECN: for x19-x28 a function never touches, the Ctx slot is the live value (it has no local),
+        # SAVEC, not SAVECN: for x19-x29 a function never touches, the Ctx slot is the live value (it has no local),
         # so a callee that used one must put its caller's value back: a caller that does not track x23 may tail-jump
         # next to code that reads it (the Lua VM's handlers and luaV_execute's re-entries). x0-x17: SAVEX, only
         # those written since the last call
@@ -863,6 +868,118 @@ def sext26(w):
     return v - (1 << 26) if v & (1 << 25) else v
 
 
+# Exclusive loops fused into one host atomic (2026-11-20; NX_EXCL_FUSE=0 lifts them one instruction at a time):
+#   L: LD(A)XR Rt, [Xn]; <data processing, conditional branches out>; ST(L)XR Ws, Rv, [Xn]; CBNZ Ws, L
+# (100k of the 130k exclusive loads in Violet's modules: atomic add / sub / exchange, lock and flag updates, CAS).
+# Lifted one by one, each LDXR stores the monitor (address, size, value) to the Ctx and each STXR checks it, then
+# compares and swaps; fused, the loop is one block that never touches the monitor: an exchange (no ops between) is
+# __atomic_exchange_n, a single ADD(S) / SUB(S) of Rt into Rv is __atomic_fetch_add / _sub (Rt the old value, then the
+# ADD / SUB as lifted: its result and flags), anything else a CAS loop around
+# the instructions between (retried on failure, as the guest's CBNZ does). A branch out leaves the monitor as it was
+# (compiled code clears it with CLREX or loads again; it never stores without loading). Nothing may branch into the
+# sequence but to L, Xn must not change in it, and no instruction in it may carry a patches.txt hook.
+EXCL_FUSE = os.environ.get('NX_EXCL_FUSE', '1') != '0'
+
+
+def excl_fusions(fn, env, bt):
+    """{pc: (role, head pc, info)} for the fused exclusive loops of the function: role 'head' at the LDXR (info: kind,
+    size, rt, rn, rv, rs, and for 'add' the operation), 'mid' for the instructions between (lifted as they are: in
+    the CAS loop, or after the fetch-and-add), 'stx' at the STXR, 'cbnz' at the CBNZ (left out: Ws is 0 after)."""
+    out = {}
+    if not EXCL_FUSE:
+        return out
+    mod, base, patches = fn.mod, fn.mod.base, env.prog.patches
+    for L in fn.order:
+        w = mod.word(L - base)
+        if w & 0x3fe00000 != 0x08400000 or L in patches:          # LDXR / LDAXR (pairs and LDAR excluded)
+            continue
+        size, rn, rt = w >> 30, (w >> 5) & 31, w & 31
+        if rt == rn or rt == 31:
+            continue
+        mids, stx = [], None
+        pc = L + 4
+        while pc in fn.addrs and pc not in bt and pc not in patches and len(mids) < 8:
+            w2 = mod.word(pc - base)
+            if w2 & 0x3fe00000 == 0x08000000:                         # STXR / STLXR
+                if w2 >> 30 == size and (w2 >> 5) & 31 == rn:
+                    stx = (pc, w2)
+                break
+            if w2 & 0x1c000000 == 0x10000000 or w2 & 0x0e000000 == 0x0a000000:      # data processing
+                if rn in Mod._writes(w2):
+                    break
+            elif not (w2 & 0xff000010 == 0x54000000 or w2 & 0x7e000000 in (0x34000000, 0x36000000)):
+                break                                                   # B.cond, CB(N)Z, TB(N)Z: out (checked below)
+            mids.append((pc, w2))
+            pc += 4
+        if stx is None:
+            continue
+        S, ws = stx
+        rs, rv = (ws >> 16) & 31, ws & 31
+        B = S + 4
+        if B not in fn.addrs or B in bt or B in patches or rs in (rn, rv, 31):
+            continue
+        wb = mod.word(B - base)
+        if wb & 0x7f00001f != 0x35000000 | rs or branch_targets(wb, B)[0] != L:    # CBNZ Ws, L
+            continue
+        if any(L <= t <= B for p, w2 in mids for t in branch_targets(w2, p)):
+            continue                                                    # a branch between must leave the sequence
+        scratch = Fn(env, mod, fn.entry, [])                   # the instructions between must lift
+        try:
+            for p, w2 in mids:
+                lift_insn(scratch, w2, p)
+        except Unimpl:
+            continue
+        sf = size == 3
+        kind, op = 'cas', None
+        if not mids and rv != rt:
+            kind = 'xchg'
+        elif len(mids) == 1 and size >= 2:
+            p, m = mids[0]
+            msf, rd, mn = m >> 31, m & 31, (m >> 5) & 31
+            if msf == sf and mn == rt and rd == rv and rd != 31:
+                if m & 0x1f800000 == 0x11000000:                          # ADD(S) / SUB(S) (immediate)
+                    imm = ((m >> 10) & 0xfff) << (12 if m & 0x400000 else 0)
+                    op = ('sub' if m & 0x40000000 else 'add', 'imm', imm)
+                elif m & 0x1f20fc00 == 0x0b000000 and not m & 0xc00000:  # ADD(S) / SUB(S) (register), LSL #0
+                    rm = (m >> 16) & 31
+                    if rm != rt:
+                        op = ('sub' if m & 0x40000000 else 'add', 'reg', rm)
+                if op:
+                    kind = 'add'
+        info = (kind, size, rt, rn, rv, rs, op)
+        out[L] = ('head', L, info)
+        for p, _ in mids:
+            out[p] = ('mid', L, info)
+        out[S] = ('stx', L, info)
+        out[B] = ('cbnz', L, info)
+    return out
+
+
+def excl_stmt(fn, role, info, w, pc):
+    """The statement of one instruction of a fused exclusive loop (excl_fusions)."""
+    kind, size, rt, rn, rv, rs, op = info
+    bits, sf = 8 << size, size == 3
+    if role == 'head':
+        a = fn.x(rn, sp=True)
+        if kind == 'xchg':
+            return '{ u64 EA_ = %s; %s }' % (a, fn.setr(rt, sf, '__atomic_exchange_n((u%d *)(uintptr_t)EA_, (u%d)%s, '
+                                                              '__ATOMIC_SEQ_CST)' % (bits, bits, fn.r(rv, sf))))
+        if kind == 'add':
+            name, form, v = op
+            val = hex(v) if form == 'imm' else fn.r(v, sf)
+            return '{ u64 EA_ = %s; u%d O_ = __atomic_fetch_%s((u%d *)(uintptr_t)EA_, (u%d)%s, __ATOMIC_SEQ_CST); ' \
+                   '%s }' % (a, bits, name, bits, bits, val, fn.setr(rt, sf, 'O_'))
+        return '{ u64 EA_ = %s; u%d EO_; do { EO_ = LD%d(EA_); %s' % (a, bits, bits, fn.setr(rt, sf, 'EO_'))
+    if role == 'mid':                    # add: the ADD / SUB as it is, from Rt = the old value (result and flags)
+        return lift_insn(fn, w, pc)
+    if role == 'stx':
+        if kind == 'cas':
+            return '} while (!__sync_bool_compare_and_swap((u%d *)(uintptr_t)EA_, EO_, (u%d)%s)); %s }' % (
+                bits, bits, fn.r(rv, sf), fn.setw(rs, '0'))
+        return fn.setw(rs, '0')
+    return ''                                                       # the CBNZ: Ws is 0
+
+
 def lift_function(env, owner, secondary=(), stats=None):
     """C source of the function starting at offset `owner`, with its secondary entries (offsets)."""
     mod = env.mod
@@ -887,6 +1004,11 @@ def lift_function(env, owner, secondary=(), stats=None):
     bt |= sw_targets
     bt |= set(entries)
     fn.labels.update(entries)
+    fused = excl_fusions(fn, env, bt)
+    if stats is not None:
+        for role, _, info in fused.values():
+            if role == 'head':
+                stats['fused'][info[0]] += 1
     lines = []
     recs = []
     prev = None
@@ -909,7 +1031,11 @@ def lift_function(env, owner, secondary=(), stats=None):
         fn.rx, fn.wx = set(), set()
         patch = env.prog.patches.get(pc)
         try:
-            stmt = lift_patched(fn, w, pc, patch) if patch else lift_insn(fn, w, pc)
+            fu = fused.get(pc)
+            if fu:
+                stmt = excl_stmt(fn, fu[0], fu[2], w, pc)
+            else:
+                stmt = lift_patched(fn, w, pc, patch) if patch else lift_insn(fn, w, pc)
             if stats is not None:
                 stats['ok'] += 1
         except Unimpl as e:
@@ -947,7 +1073,7 @@ def regmask(regs):
 
 
 def spill_mask(w):
-    """x19-x28 that an STP / STR (64-bit, SP or X29 based) stores: a prologue spill, not a use of the value"""
+    """x19-x29 (CSR) that an STP / STR (64-bit, SP or X29 based) stores: a prologue spill, not a use of the value"""
     base = (w >> 5) & 31
     if base not in (31, 29):
         return 0
@@ -959,7 +1085,7 @@ def spill_mask(w):
 
 
 def store_mask(w):
-    """x19-x28 that an STP / STR (64-bit, any base) stores"""
+    """x19-x29 (CSR) that an STP / STR (64-bit, any base) stores"""
     if w & 0xffc00000 in (0xa9000000, 0xa9800000, 0xa8800000):
         return regmask((w & 31, (w >> 10) & 31)) & CSR
     if w & 0xffc00000 == 0xf9000000 or w & 0xffe00c00 in (0xf8000c00, 0xf8000400, 0xf8000000):
@@ -1083,17 +1209,22 @@ def call_masks(fn, recs, lines, succ):
 
 
 def csr_flow(fn, recs, entries, succ, sites):
-    """Which of x19-x28 each entry of the function may read before writing them (its caller's values): what a BL to
+    """Which of x19-x29 (CSR) each entry of the function may read before writing them (its caller's values): what a BL to
     it must store (SAVE_FOR). Must-written sets over its control flow from that entry; a prologue's STP / STR of
     one is no use. Returns {entry name: (mask used, [(callee name, mask not yet written there)] for calls and tail
     jumps, whose needs become this entry's (cmd_lift's fixpoint), [entry name])}; its own reads leave out what it
-    spilled on every path. Hook sites (patches.txt call / after: SAVE, host code, LOAD) add nothing: every hook
-    reads only x19-x28 its function wrote by then (wild.c / raidgem.c x19 after "mov x19, x0", lua.c x23, gfx.c
-    x28, fps.c x20; a new hook reading a caller's value would need it). setjmp passes nothing on: a longjmp
+    spilled on every path. A hook site (patches.txt call / after: SAVE, host code, LOAD) reads x29 if its function
+    has not written it on every path by then: host code walks or reads frame records (lua.c h_gc_fullgc reads the
+    caller's x29 at luaC_fullgc's first instruction; with x29 left out of the caller's stores it read a stale 0 and
+    crashed, 2026-11-21). Of x19-x28 every hook reads only what its function wrote by then (wild.c / raidgem.c x19
+    after "mov x19, x0", lua.c x23, gfx.c x28, fps.c x20; a new hook reading a caller's value would need it):
+    counting them all at hooks made 20,063 entries needy, not 3,963 (needs pass up through callers). setjmp
+    passes nothing on: a longjmp
     restores them into this function, which does not use the ones it never wrote, and its callers keep theirs in
     locals. BLR and indirect tail jumps are taken to follow the AAPCS (callees read none; a BLR to an entry that
     does stores them and says so, dispatch.c csr_ind_note)."""
     rec = {pc: (w, r, wr) for pc, w, r, wr, _ in recs}
+    hooks = {pc for pc, _, _, _, hook in recs if hook}
     # Two must-sets over the control flow from every entry (entries: nothing): written on every path to pc, and
     # spilled (an STP / STR of it to the stack) on every path to pc. A register spilled on every path is one the
     # function keeps for its caller: compiled AAPCS code never uses the caller's value of it, so a read of it "before
@@ -1131,6 +1262,8 @@ def csr_flow(fn, recs, entries, succ, sites):
         debug = os.environ.get('NX_CSR_DEBUG')
         for pc, (w, r, wr) in rec.items():
             u = 0 if capture else r & CSR & ~inn[pc] & ~sinn[pc] & ~spill_mask(w)
+            if pc in hooks:
+                u |= CSR & (1 << 29) & ~(inn[pc] | wr)
             if u and debug:
                 print('csr_flow: f_%x: %x (%08x) reads %x before writing it' % (entry, pc, w, u))
             local |= u
@@ -1200,7 +1333,7 @@ def emit(fn, lines, entries=None):
     # callee that spills one (and anything reading those spills) sees the current value.
     savec = [s for s in save if not MANAGED_SAVE.match(s)]
     loadc = [s for s in load if not KEPT_ACROSS_CALLS.match(s) and not MANAGED_LOAD.match(s)]
-    # SAVECN: SAVEC without x19-x28. A callee that keeps the AAPCS spills and restores them but never uses the
+    # SAVECN: SAVEC without x19-x29 (CSR). A callee that keeps the AAPCS spills and restores them but never uses the
     # caller's values, and the caller keeps its own in locals (no LOADC of them), so their Ctx slots may be stale
     # meanwhile: the callee loads the stale ones, restores them and writes them back at its return (SAVEC there).
     # Used at BLR, and BL to callees that csr_flow found not to read them (SAVE_FOR, funcs.h CSR_<name>)
@@ -1211,7 +1344,7 @@ def emit(fn, lines, entries=None):
     savecnc = list(savec) if 'bl' in keep.split(',') else list(savecn)
     savecni = list(savec) if 'blr' in keep.split(',') else list(savecn)
     if CSR_POISON:                          # only the slots a call leaves out (the others hold live values)
-        poison = ['c->x[%d] = 0xdead0000000000%02xull;' % (n, n) for n in sorted(fn.wx) if 19 <= n <= 28]
+        poison = ['c->x[%d] = 0xdead0000000000%02xull;' % (n, n) for n in sorted(fn.wx) if 19 <= n < CSR_HI]
         savecnc += poison
         savecni += poison
     if fn.flags:
@@ -1281,8 +1414,9 @@ def cmd_cover(names):
     for n in names:
         mod = prog.mods[n]
         env = Env(prog, mod)
-        stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
+        stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}, 'fused': collections.Counter()}
         sec = mod.sec
+
         nf = 0
         for off in sorted(mod.funcs):
             if off in mod.plt:
@@ -1337,7 +1471,7 @@ def _lift_chunk(job, prog=None):
     n, offs, sec = job
     prog = prog or _worker_prog
     env = Env(prog, prog.mods[n])
-    stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
+    stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}, 'fused': collections.Counter()}
     srcs = [lift_function(env, off, sec.get(off, ()), stats) for off in offs]
     return srcs, env.extra, env.ext_callees, env.unresolved, stats, env.csr
 
@@ -1351,7 +1485,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
         print('lifting in %d processes' % procs)
         pool = concurrent.futures.ProcessPoolExecutor(procs, initializer=_lift_worker_init, initargs=(overrides,))
     os.makedirs(outdir, exist_ok=True)
-    stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
+    stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}, 'fused': collections.Counter()}
     all_entries = {}
     all_files = []
     ext = set()
@@ -1394,6 +1528,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
             env.unresolved.update(unres)
             stats['ok'] += st['ok']
             stats['bad'].update(st['bad'])
+            stats['fused'].update(st['fused'])
             for k, v in st['example'].items():
                 stats['example'].setdefault(k, v)
             for off, src in zip(job[1], srcs):
@@ -1427,7 +1562,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
             f.write('NXCC void %s(Ctx *c);\n' % e)
         for e in sorted(ext - defined):
             f.write('NXCC void %s(Ctx *c);\n' % e)
-        f.write('/* entries that read x19-x28 from their caller (csr_flow): a BL to them stores those (SAVE_FOR) */\n')
+        f.write('/* entries that read x19-x29 from their caller (csr_flow): a BL to them stores those (SAVE_FOR) */\n')
         for e in sorted(needy):
             f.write('#define CSR_%s ~, 1,\n' % e)
     with Out(os.path.join(outdir, 'table.c')) as f:
@@ -1455,10 +1590,12 @@ def cmd_lift(outdir, only=None, per_file=40000):
             print('removed stale', name)
     total = stats['ok'] + sum(stats['bad'].values())
     print('instructions %d, not translated %d' % (total, total - stats['ok']))
+    print('exclusive loops fused: %s' % (', '.join('%s %d' % kv for kv in stats['fused'].most_common()) if EXCL_FUSE
+                                         else 'off (NX_EXCL_FUSE=0)'))
 
 
 def csr_needs(csr, taken):
-    """The entries whose function needs x19-x28 from its caller: csr_flow's own uses, then through calls and tail
+    """The entries whose function needs x19-x29 from its caller: csr_flow's own uses, then through calls and tail
     jumps to such entries before the function wrote them (a fixpoint). Prints how many, and those whose address is
     taken (a BLR to them would get stale values: SAVECN assumes the AAPCS there)."""
     owner = {}
@@ -1501,8 +1638,8 @@ def csr_needs(csr, taken):
         print('csr_needs: spread by root: %s' % ' '.join('%s:%d' % (r, n) for n, r in spread[:25]))
     needy = {n for k, (_, _, names) in csr.items() if need[k] for n in names}
     bad = sorted(needy & taken)
-    print('x19-x28: %d of %d functions read them from their caller; %d of those entries are address-taken%s'
-          % (sum(1 for v in need.values() if v), len(need), len(bad), (': ' + ' '.join(bad[:12])) if bad else ''))
+    print('x19-x%d: %d of %d functions read them from their caller; %d of those entries are address-taken%s'
+          % (CSR_HI - 1, sum(1 for v in need.values() if v), len(need), len(bad), (': ' + ' '.join(bad[:12])) if bad else ''))
     return needy
 
 

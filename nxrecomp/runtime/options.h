@@ -25,6 +25,17 @@ void options_set_fps_counter(bool on);
 bool options_fullscreen(void);
 void options_set_fullscreen(bool on);
 void options_toggle_fullscreen(void);       /* window thread */
+/* anti-aliasing (gpu_taa.c, any thread; taken at the next frame, saved as "taa" / "taa_sharpness"). Available:
+ * a build with FSR 2 and a game.json "taa"; failed: FSR 2 or our part of it could not be set up (the log says) */
+enum { TAA_OFF, TAA_NATIVE };
+bool taa_available(void);
+bool taa_failed(void);
+int taa_mode(void);                         /* TAA_* */
+void taa_set_mode(int m);
+float taa_sharpness(void);                  /* 0-1: FSR 2's sharpening (RCAS), 0 none */
+void taa_set_sharpness(float s);
+bool taa_jitter(void);                      /* the sub-pixel jitter (off: to compare; development builds) */
+void taa_set_jitter(bool on);
 
 /* mouse (input.c reads these every poll) */
 float options_mouse_sens(void);             /* 0.25-4: the right stick's scale */

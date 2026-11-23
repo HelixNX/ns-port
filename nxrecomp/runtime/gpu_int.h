@@ -371,6 +371,13 @@ extern VkPipelineLayout layout_gfx;
 extern VkDescriptorSet empty_tex, empty_smp, empty_img;
 extern u64 submit_serial;
 extern u32 window_origin, depth_mode;
+/* temporal anti-aliasing, FSR 2 (gpu_taa.c; the menu's switches are in options.h) */
+void taa_init(void);
+void taa_note_draw(u32 op, const void *payload);
+void taa_pass_depth(Image *d);
+void taa_after_draw(u64 fs_hash, Image *pic);
+extern bool taa_draw_jitter;
+extern float taa_jit[2];
 
 /* a file in the build folder (the executable's parent folder) */
 static inline void build_file(char *path, size_t size, const char *name) {

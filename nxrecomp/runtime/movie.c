@@ -527,7 +527,7 @@ static void extractor_call(Ctx *c, int slot, Stream *s) {
     }
 }
 
-static void m_call(Ctx *c) {
+static NXCC void m_call(Ctx *c) {
     int slot = -1;
     bool dec = false;
     for (int i = 2; i < 21 && slot < 0; i++) {
@@ -577,7 +577,7 @@ static void new_decoder(Ctx *c) {
     construct(c, decoder_vt, d);
 }
 
-void h__ZN5movie9ExtractorC1ENS_13ContainerTypeE(Ctx *c) { new_extractor(c); }
-void h__ZN5movie9ExtractorC2ENS_13ContainerTypeE(Ctx *c) { new_extractor(c); }
-void h__ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c) { new_decoder(c); }
-void h__ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c) { new_decoder(c); }
+NXCC void h__ZN5movie9ExtractorC1ENS_13ContainerTypeE(Ctx *c) { new_extractor(c); }
+NXCC void h__ZN5movie9ExtractorC2ENS_13ContainerTypeE(Ctx *c) { new_extractor(c); }
+NXCC void h__ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c) { new_decoder(c); }
+NXCC void h__ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c) { new_decoder(c); }

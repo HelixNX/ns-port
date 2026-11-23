@@ -58,10 +58,10 @@ static unsigned __stdcall dump_thread(void *p) {
     fatal("stopped after %d seconds", dump_after);
 }
 
-static void h_rtld_initialized(Ctx *c) { (void)c; }
+static NXCC void h_rtld_initialized(Ctx *c) { (void)c; }
 
 /* rtld walks its module list from the front, where each module it found was inserted: sdk, subsdk0, main */
-static void h_rtld_run_dt_init(Ctx *c) {
+static NXCC void h_rtld_run_dt_init(Ctx *c) {
     for (int i = num_loaded_mods - 1; i >= 0; i--) {
         LoadedMod *m = &loaded_mods[i];
         if (!m->dt_init) continue;
@@ -71,7 +71,7 @@ static void h_rtld_run_dt_init(Ctx *c) {
 }
 
 /* finalisers in the opposite order: main, subsdk0, sdk */
-static void h_rtld_run_dt_fini(Ctx *c) {
+static NXCC void h_rtld_run_dt_fini(Ctx *c) {
     for (int i = 0; i < num_loaded_mods; i++) {
         LoadedMod *m = &loaded_mods[i];
         if (!m->dt_fini) continue;
@@ -149,6 +149,31 @@ static void nsp_open(void) {
     }
 }
 
+#ifdef NX_PGO_GEN
+/* NX_PGO=gen (nxrecomp.cmake): clang's profile runtime writes the counters at exit, but benches and crashes end the
+ * process without one, so they are also written every 30 s, on this thread (Violet's file is ~6 GB: names and
+ * value-profiling data; merged ~280 MB). One file per run,
+ * pgo-<pid>.profraw next to the exe (NX_PGO_RAW: another folder), merged with llvm-profdata. */
+int __llvm_profile_write_file(void);
+void __llvm_profile_set_filename(const char *name);
+static DWORD WINAPI pgo_writer(void *arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(30000);
+        __llvm_profile_write_file();
+    }
+}
+static void pgo_init(void) {
+    static char name[MAX_PATH + 32];
+    const char *dir = getenv("NX_PGO_RAW");
+    if (dir) snprintf(name, sizeof name, "%s\\pgo-%%p.profraw", dir);
+    else exe_relative(name, sizeof name, "pgo-%p.profraw");
+    __llvm_profile_set_filename(name);
+    CloseHandle(CreateThread(NULL, 0, pgo_writer, NULL, 0, NULL));
+    hlog(0, "pgo: counters built in, written every 30 s and at exit to %s", name);
+}
+#endif
+
 typedef struct Npdm { u8 prio, core; u32 stack_size, system_resource_size; } Npdm;
 
 static Npdm read_npdm(void) {
@@ -186,6 +211,9 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: " NX_NAME " [--game DIR] [--image DIR] [--save DIR] [--log 0-2] [--dump-after SECONDS]\n"); return 2; }
     }
     diag_init();
+#ifdef NX_PGO_GEN
+    pgo_init();
+#endif
     /* 1 ms timer resolution for the whole run: guest waits sleep in ms (kernel.c ksleep) and would otherwise round up
      * to the 15.6 ms tick. Netplay builds got it from ENet's init; now every build has it */
     timeBeginPeriod(1);

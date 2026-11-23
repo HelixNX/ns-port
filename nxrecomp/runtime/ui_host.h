@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define NXUI_VERSION 3
+#define NXUI_VERSION 4
 
 typedef struct UiHost {
     uint32_t version;                       /* NXUI_VERSION */
@@ -82,6 +82,15 @@ typedef struct UiHost {
     int (*lobby)(UiRoom *out, int max, bool *loading, char *err, size_t errn);
     void (*nickname)(char *out, size_t n);
     bool (*set_nickname)(const char *nick); /* false: not 4-20 of letters, digits, space . _ - */
+    /* version 4: anti-aliasing (options.h taa_*; taa_available false: no FSR 2 in this build or game) */
+    bool taa_available;
+    bool (*taa_failed)(void);
+    int (*taa_mode)(void);                  /* 0 off, 1 FSR 2 at the render size */
+    void (*set_taa_mode)(int m);
+    float (*taa_sharpness)(void);           /* 0-1 */
+    void (*set_taa_sharpness)(float s);
+    bool (*taa_jitter)(void);               /* development builds: the jitter on / off, to compare */
+    void (*set_taa_jitter)(bool on);
 } UiHost;
 
 /* nxui.dll's exports */

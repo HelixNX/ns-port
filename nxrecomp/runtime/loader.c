@@ -85,7 +85,7 @@ const char *sym_name(u64 addr, u64 *offset) {
 }
 
 /* rtld's nn::ro hooks: LookupGlobalAuto(name) -> address of the first definition in load order */
-static void h_lookup_global_auto(Ctx *c) {
+static NXCC void h_lookup_global_auto(Ctx *c) {
     const char *name = (const char *)(uintptr_t)c->x[0];
     c->x[0] = sym_lookup(name);
     hlog(1, "rtld lookup %s -> %llx", name, c->x[0]);

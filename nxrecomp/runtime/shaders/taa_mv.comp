@@ -1,0 +1,28 @@
+#version 450
+// Camera motion vectors for FSR 2 (gpu_taa.c): each pixel's depth back through this frame's view-projection and
+// forward through the last frame's, as one matrix (reproj = last VP x inverse of this VP, made on the CPU: a point at
+// infinite depth, the reversed-Z sky, needs no division on the way). Out: RG16F, render pixels, current -> previous.
+// Objects that move on their own get the camera's motion only (FSR 2's own rejection handles the rest).
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D depth_tex;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform PC {
+    mat4 reproj;
+    vec2 size;          // render size in pixels
+    float flip;         // 1: NVN upper-left origin (row 0 is NDC y = +1)
+    float zminus1;      // 1: NVN depth mode "near at -w" (NDC z = 2 d - 1)
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    float d = texelFetch(depth_tex, p, 0).r;
+    vec2 uv = (vec2(p) + 0.5) / pc.size;
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, pc.flip > 0.5 ? 1.0 - uv.y * 2.0 : uv.y * 2.0 - 1.0);
+    float z = pc.zminus1 > 0.5 ? d * 2.0 - 1.0 : d;
+    vec4 q = pc.reproj * vec4(ndc, z, 1.0);
+    vec2 pn = q.w != 0.0 ? q.xy / q.w : ndc;
+    vec2 puv = vec2(pn.x * 0.5 + 0.5, pc.flip > 0.5 ? 0.5 - pn.y * 0.5 : pn.y * 0.5 + 0.5);
+    imageStore(mv_out, p, vec4((puv - uv) * pc.size, 0.0, 0.0));
+}

@@ -121,6 +121,7 @@ typedef struct KThread {
     u64 affinity;
     /* core ownership, under klock (see kernel.c) */
     s32 cur_core;                   /* the core it owns (or was preempted on), or -1 */
+    s32 host_core;                  /* NX_HOST_CORES: the guest core whose host CPU set it has, plus 1 (0: none) */
     bool ready;                     /* waiting for a core */
     bool preempted;                 /* suspended on cur_core by a higher-priority thread */
     volatile bool preempt_req;      /* give the core up at the next SVC */
@@ -225,6 +226,19 @@ u64 hostcall_register(const char *name, GuestFn fn);  /* returns the guest addre
 GuestFn guest_fn(u64 addr);                            /* lifted function or host call at addr, or NULL */
 void dispatch_override(u64 addr, GuestFn fn);          /* calls through pointers to addr go to fn */
 void dispatch_trace_init(void);                         /* NX_TRACE_CALLS */
+/* the shared host replacements (tools/lifter/overrides.txt): lifted code calls them by name through funcs.h's NXCC
+ * declarations, which their definitions never see, so they are declared here: a definition without NXCC then fails
+ * to compile instead of crashing under NX_LIFT_CC */
+NXCC void h_longjmp(Ctx *c);
+NXCC void h__longjmp(Ctx *c);
+NXCC void h_nvnBootstrapLoader(Ctx *c);
+NXCC void h__ZN2nv18InitializeGraphicsEPvm(Ctx *c);
+NXCC void h__ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c);
+NXCC void h__ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c);
+NXCC void h__ZN5movie9ExtractorC1ENS_13ContainerTypeE(Ctx *c);
+NXCC void h__ZN5movie9ExtractorC2ENS_13ContainerTypeE(Ctx *c);
+NXCC void h__ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c);
+NXCC void h__ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE(Ctx *c);
 void nvn_init(void);
 void nvn_submit_ahead(u32 n, const u64 *handles);    /* a game's hook: command buffers it submits after a fence wait */
 void guest_call(Ctx *c, u64 addr);                      /* call_ind without the guest's LR */

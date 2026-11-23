@@ -63,7 +63,7 @@ void dispatch_init(void) {
         }
 }
 
-/* a BLR to a function that reads x19-x28 from its caller (a64lift.py csr_flow: Lua opcode handlers, IDA-split
+/* a BLR to a function that reads x19-x29 from its caller (a64lift.py csr_flow: Lua opcode handlers, IDA-split
  * chunks; meant to be entered by jumps): the call stored them (SAVEC), but its caller may not hold its own caller's
  * values. Logged once per target, to find where that assumption is wrong */
 void csr_ind_note(u64 a) {
@@ -73,7 +73,7 @@ void csr_ind_note(u64 a) {
     LONG i = InterlockedIncrement(&n) - 1;
     if (i < 64) seen[i] = a;
     char b[160];
-    hlog(0, "dispatch: BLR to %s, which reads x19-x28 from its caller", describe_addr(a, b, sizeof b));
+    hlog(0, "dispatch: BLR to %s, which reads x19-x29 from its caller", describe_addr(a, b, sizeof b));
 }
 
 u64 hostcall_register(const char *name, GuestFn fn) {
@@ -104,7 +104,7 @@ void dispatch_override(u64 addr, GuestFn fn) {
  * result), the first 40 of each. Direct calls (BL) are not seen. */
 static struct { u64 addr; GuestFn orig; volatile long n; } traced[16];
 static int ntraced;
-static void trace_call(Ctx *c) {
+static NXCC void trace_call(Ctx *c) {
     u64 a = c->pc;
     int i = 0;
     while (i < ntraced && traced[i].addr != a) i++;
@@ -136,14 +136,14 @@ void dispatch_trace_init(void) {
     }
 }
 
-void call_ind(Ctx *c, u64 addr) {
+NXCC void call_ind(Ctx *c, u64 addr) {
     GuestFn f = guest_fn(addr);
     c->pc = addr;                      /* host calls shared by several addresses tell them apart by it */
     if (!f) guest_trap(c, "call to an address with no lifted function", addr);
     f(c);
 }
 
-void jump_ind(Ctx *c) {
+NXCC void jump_ind(Ctx *c) {
     GuestFn f = guest_fn(c->pc);
     if (!f) guest_trap(c, "branch to an address with no lifted function", c->pc);
     MUSTTAIL return f(c);
@@ -191,7 +191,7 @@ jmp_buf *guest_jmp_slot(u64 guest_buf) {
     return &j->buf;
 }
 
-void h_longjmp(Ctx *c) {
+NXCC void h_longjmp(Ctx *c) {
     u64 b = c->x[0], val = c->x[1];
     HostJmp *j = host_jmp_find(b);
     if (!j) guest_trap(c, "longjmp to a jmp_buf no lifted setjmp call set", c->x[30]);
@@ -202,7 +202,7 @@ void h_longjmp(Ctx *c) {
     c->x[0] = val ? val : 1;
     longjmp(j->buf, 1);
 }
-void h__longjmp(Ctx *c) { h_longjmp(c); }
+NXCC void h__longjmp(Ctx *c) { h_longjmp(c); }
 
 void guest_call(Ctx *c, u64 addr) {
     c->x[30] = HOSTCALL_BASE;          /* a return address that is not guest code */

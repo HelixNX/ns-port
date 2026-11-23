@@ -466,6 +466,31 @@ static void page_video() {
         ImGui::EndCombo();
     }
     help("Draws above 1080p, then scales to the window.");
+    if (H->taa_available) {
+        static const char *modes[] = {"Off", "FSR 2 (native)"};
+        int m = H->taa_mode();
+        if (m < 0 || m > 1) m = 0;
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::BeginCombo("Anti-aliasing", modes[m])) {
+            for (int k = 0; k < 2; k++)
+                if (ImGui::Selectable(modes[k], k == m)) H->set_taa_mode(k);
+            ImGui::EndCombo();
+        }
+        help("AMD FSR 2 at the render size: smooths edges and shimmer using earlier frames. "
+             "Moving characters can leave a faint trail.");
+        if (H->taa_failed()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "FSR 2 could not start: see the log");
+        else if (m) {
+            float sh = H->taa_sharpness();
+            ImGui::SetNextItemWidth(260);
+            if (ImGui::SliderFloat("Sharpening", &sh, 0.0f, 1.0f, "%.2f")) H->set_taa_sharpness(sh);
+            if (H->development) {
+                bool j = H->taa_jitter();
+                if (ImGui::Checkbox("Jitter (dev)", &j)) H->set_taa_jitter(j);
+                help("Off: no sub-pixel offsets, so no anti-aliasing of edges; for telling jitter problems from "
+                     "motion vector problems.");
+            }
+        }
+    }
     bool fps = H->fps_counter();
     if (ImGui::Checkbox("FPS counter", &fps)) H->set_fps_counter(fps);
     bool full = H->fullscreen();

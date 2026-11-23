@@ -73,6 +73,45 @@ option(NX_STACK_PLAIN "plain (non-volatile) stack accesses in lifted code" OFF)
 if(NX_STACK_PLAIN)
     list(APPEND NX_LIFT_FLAGS /DNX_STACK_PLAIN)
 endif()
+# the calling convention of lifted functions and the host functions they call through GuestFn (a64rt.h NXCC): the
+# game.json's "lift_cc" (win64 | sysv | preserve_none; absent: win64), or this to compare. nx_game gives it to the
+# lifted code, a64rt and the game's executables (runtime and host code): a host function stored as a GuestFn without
+# NXCC is then a compile error, not a crash. Lifted code from before NXCC (2026-11-18) needs a re-lift for anything
+# but win64. Violet 2026-11-20 (1x, ABBA): win64 4.17, sysv 4.03, preserve_none 4.18 ms (+10% code)
+set(NX_LIFT_CC "" CACHE STRING "calling convention of lifted code: win64, sysv or preserve_none (empty: game.json)")
+set_property(CACHE NX_LIFT_CC PROPERTY STRINGS "" win64 sysv preserve_none)
+
+# PGO, profile-guided optimization of lifted code, a64rt and the game's executables: NX_PGO=gen builds counters in
+# (clang -fprofile-instr-generate; the runtime writes them every 30 s and at exit to NX_PGO_RAW, else pgo.profraw
+# next to the exe: main.c), `llvm-profdata merge -o x.profdata *.profraw` merges runs, NX_PGO=use builds with
+# NX_PGO_PROFILE = that file. A profile fits one lift: a function whose lifted C changed loses its counts (clang
+# matches by a hash of its control flow), so a re-lift wants a new profile.
+set(NX_PGO "" CACHE STRING "profile-guided optimization: empty (off), gen or use")
+set_property(CACHE NX_PGO PROPERTY STRINGS "" gen use)
+set(NX_PGO_PROFILE "" CACHE FILEPATH "the merged .profdata for NX_PGO=use")
+set(NX_PGO_FLAGS "")
+set(NX_PGO_LINK "")
+if(NX_PGO STREQUAL "gen")
+    # the profile runtime ships with clang: <llvm>/lib/clang/<version>/lib/windows
+    get_filename_component(_llvm "${CMAKE_C_COMPILER}" DIRECTORY)
+    file(GLOB _prt "${_llvm}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+    if(NOT _prt)
+        message(FATAL_ERROR "NX_PGO=gen: no clang_rt.profile-x86_64.lib next to ${CMAKE_C_COMPILER}")
+    endif()
+    list(GET _prt 0 _prt)
+    set(NX_PGO_FLAGS /clang:-fprofile-instr-generate /DNX_PGO_GEN)
+    set(NX_PGO_LINK "${_prt}")
+    message(STATUS "nxrecomp: PGO counters built in (${_prt})")
+elseif(NX_PGO STREQUAL "use")
+    if(NOT EXISTS "${NX_PGO_PROFILE}")
+        message(FATAL_ERROR "NX_PGO=use: NX_PGO_PROFILE (${NX_PGO_PROFILE}) does not exist")
+    endif()
+    set(NX_PGO_FLAGS "/clang:-fprofile-instr-use=${NX_PGO_PROFILE}" /clang:-Wno-profile-instr-unprofiled
+                     /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin)
+    message(STATUS "nxrecomp: PGO from ${NX_PGO_PROFILE}")
+elseif(NX_PGO)
+    message(FATAL_ERROR "NX_PGO: empty, gen or use (not ${NX_PGO})")
+endif()
 
 set(NX_RUNTIME_SOURCES
     main.c loader.c dispatch.c mem.c kernel.c kmem.c svc.c ipc.c
@@ -80,7 +119,7 @@ set(NX_RUNTIME_SOURCES
     services/acc.c services/mii.c services/audio.c audio_dsp.c audio_fx.c services/pl.c services/set.c
     services/nifm.c services/friends.c services/ldn.c services/bcat.c services/system.c services/audout.c services/hwopus.c services/offline.c services/fs.c romfs.c
     nca.c image.c nvn.c gpu.c gpu_prof.c gpu_pool.c gpu_image.c gpu_draw.c gpu_xfer.c gpu_query.c gpu_desc.c gpu_shader.c
-    gpu_pipe.c gpu_dump.c tex.c vk.c astc.c input.c options.c mods.c ui.c movie.c swkbd.c trace.c)
+    gpu_pipe.c gpu_dump.c gpu_taa.c tex.c vk.c astc.c input.c options.c mods.c ui.c movie.c swkbd.c trace.c)
 list(TRANSFORM NX_RUNTIME_SOURCES PREPEND "${NX_ROOT}/runtime/")
 
 # NETPLAY (nx_game option): local wireless over community rooms (runtime/net, services/ldn_net.c, services/bsd.c),
@@ -145,6 +184,41 @@ endfunction()
 
 # libopus for hwopus (services/hwopus.c): vcpkg (x64-windows: `vcpkg install opus`), in the vcpkg tree SDL3 came
 # from, then $VCPKG_ROOT and $VCPKG_INSTALLATION_ROOT. Defines nx_opus; NX_OPUS_DLL is copied next to the exe.
+# AMD FidelityFX FSR 2.2 (MIT; deps/FidelityFX-FSR2, tag v2.2.1): temporal anti-aliasing and upscaling (fsr2.cpp).
+# Its shaders are built here, one variant set per pass (tools/fsr2/fsr2_shaders.py: glslangValidator and
+# spirv-cross from the Vulkan SDK, next to the Vulkan headers or in $VULKAN_SDK), not with AMD's permutation tool.
+# Defines nx_fsr2 and NX_FSR2 (ON when everything was found; the game builds without it otherwise).
+function(nx_fsr2_lib)
+    if(TARGET nx_fsr2 OR DEFINED NX_FSR2_DONE)
+        return()
+    endif()
+    set(NX_FSR2_DONE ON PARENT_SCOPE)
+    set(NX_FSR2 OFF CACHE INTERNAL "")
+    set(_f "${NX_DEPS}/FidelityFX-FSR2/src/ffx-fsr2-api")
+    get_filename_component(_sdk "${NX_VULKAN_INCLUDE}" DIRECTORY)
+    find_program(NX_GLSLANG glslangValidator HINTS "${_sdk}/Bin" "$ENV{VULKAN_SDK}/Bin")
+    find_program(NX_SPIRV_CROSS spirv-cross HINTS "${_sdk}/Bin" "$ENV{VULKAN_SDK}/Bin")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT EXISTS "${_f}/ffx_fsr2.cpp" OR NOT NX_GLSLANG OR NOT NX_SPIRV_CROSS OR NOT Python3_FOUND)
+        message(STATUS "nxrecomp: no FSR 2 (needs deps/FidelityFX-FSR2, glslangValidator, spirv-cross, Python)")
+        return()
+    endif()
+    set(_gen "${CMAKE_BINARY_DIR}/fsr2/ffx_fsr2_shaders_nx.cpp")
+    file(GLOB _shaders "${_f}/shaders/*.h" "${_f}/shaders/*.glsl")
+    add_custom_command(OUTPUT "${_gen}"
+        COMMAND "${Python3_EXECUTABLE}" "${NX_ROOT}/tools/fsr2/fsr2_shaders.py" "${_f}/shaders" "${NX_GLSLANG}"
+                "${NX_SPIRV_CROSS}" "${_gen}"
+        DEPENDS "${NX_ROOT}/tools/fsr2/fsr2_shaders.py" ${_shaders}
+        COMMENT "FSR 2 shaders")
+    add_library(nx_fsr2 STATIC "${_f}/ffx_fsr2.cpp" "${_f}/ffx_assert.cpp" "${_f}/vk/ffx_fsr2_vk.cpp" "${_gen}")
+    target_include_directories(nx_fsr2 PRIVATE "${_f}/vk/shaders" "${NX_VULKAN_INCLUDE}" PUBLIC "${_f}" "${_f}/vk")
+    target_compile_options(nx_fsr2 PRIVATE /clang:-O2 /clang:-Wno-everything /std:c++17
+                           "/FI${NX_ROOT}/runtime/fsr2_vk_shim.h")
+    target_compile_definitions(nx_fsr2 PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
+    set(NX_FSR2 ON CACHE INTERNAL "")
+    message(STATUS "nxrecomp: FSR 2 from ${_f}")
+endfunction()
+
 function(nx_opus_lib)
     if(TARGET nx_opus)
         return()
@@ -219,6 +293,35 @@ function(nx_game)
     if(NOT no_on AND _on)
         set(NX_ONLINE_NOTICE 1)
     endif()
+    # the calling convention of lifted code (NX_LIFT_CC above): NX_CC_DEFS, for the targets that include a64rt.h
+    set(_cc "${NX_LIFT_CC}")
+    if(NOT _cc)
+        string(JSON _cc ERROR_VARIABLE no_cc GET "${json}" lift_cc)
+        if(no_cc)
+            set(_cc win64)
+        endif()
+    endif()
+    if(_cc STREQUAL "sysv")
+        set(NX_CC_DEFS NX_LIFT_CC_SYSV)
+    elseif(_cc STREQUAL "preserve_none")
+        set(NX_CC_DEFS NX_LIFT_CC_PRESERVE_NONE)
+    elseif(_cc STREQUAL "win64")
+        set(NX_CC_DEFS "")
+    else()
+        message(FATAL_ERROR "lift_cc / NX_LIFT_CC: win64, sysv or preserve_none (not ${_cc})")
+    endif()
+    message(STATUS "nxrecomp: lifted code's calling convention ${_cc}")
+    # "taa": {"resolve_fs": "<hash>", "camera_cb": n}: temporal anti-aliasing (gpu_taa.c): the tone-map draw's
+    # fragment shader (FSR 2 resolves after it, before the HUD) and the vertex constant buffer c[n] with the scene
+    # camera's view-projection; absent: no TAA for the game
+    set(NX_TAA_DEFS "")
+    string(JSON _taa ERROR_VARIABLE no_taa GET "${json}" taa)
+    if(NOT no_taa)
+        string(JSON _rfs GET "${_taa}" resolve_fs)
+        string(JSON _ccb GET "${_taa}" camera_cb)
+        set(NX_TAA_DEFS "#define NX_TAA_RESOLVE_FS 0x${_rfs}ull
+#define NX_TAA_CAMERA_CB ${_ccb}")
+    endif()
     list(LENGTH NX_DLC NX_DLC_COUNT)
     list(APPEND NX_DLC 0)                               # a C array may not be empty
     list(JOIN NX_DLC ", " NX_DLC)
@@ -240,13 +343,19 @@ function(nx_game)
 #define NX_DEFAULT_FRAMERATE (@NX_DEFAULT_FRAMERATE@)
 #define NX_UI_THEME "@NX_UI_THEME@"
 #define NX_ONLINE_NOTICE @NX_ONLINE_NOTICE@
+@NX_TAA_DEFS@
 ]] @ONLY)
 
     set(LIFTED_DIR "${build}/lifted" CACHE PATH "C sources written by tools/lifter/a64lift.py")
     file(GLOB lifted_sources CONFIGURE_DEPENDS "${LIFTED_DIR}/*.c")
+    if(NX_PGO STREQUAL "use")           # a new profile at the same path rebuilds what it covers
+        set_source_files_properties(${lifted_sources} "${NX_ROOT}/runtime/a64rt.c" ${NX_RUNTIME_SOURCES} ${G_SOURCES}
+                                    PROPERTIES OBJECT_DEPENDS "${NX_PGO_PROFILE}")
+    endif()
     add_library(lifted STATIC ${lifted_sources})
     target_include_directories(lifted PRIVATE "${NX_ROOT}/runtime" "${LIFTED_DIR}")
-    target_compile_options(lifted PRIVATE ${NX_LIFT_FLAGS})
+    target_compile_options(lifted PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS})
+    target_compile_definitions(lifted PRIVATE ${NX_CC_DEFS})
     # each compile of a ~2 MB generated file takes 1-2 GB: limit parallel jobs so a 16 GB machine does not page
     set(LIFT_JOBS 0 CACHE STRING "parallel compiles of lifted code (0: by cores and memory)")
     set(lift_jobs ${LIFT_JOBS})
@@ -271,7 +380,8 @@ function(nx_game)
 
     add_library(a64rt STATIC "${NX_ROOT}/runtime/a64rt.c")
     target_include_directories(a64rt PUBLIC "${NX_ROOT}/runtime")
-    target_compile_options(a64rt PRIVATE ${NX_LIFT_FLAGS})
+    target_compile_options(a64rt PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS})
+    target_compile_definitions(a64rt PUBLIC ${NX_CC_DEFS})
 
     # the package's lifted code is always -O3 (best speed for players): the same libraries at the default, else
     # a second full compile at -O3, made only when the package is built
@@ -281,17 +391,20 @@ function(nx_game)
         string(REPLACE "/clang:${NX_LIFT_OPT}" "/clang:-O3" lift_o3 "${NX_LIFT_FLAGS}")
         add_library(lifted_o3 STATIC EXCLUDE_FROM_ALL ${lifted_sources})
         target_include_directories(lifted_o3 PRIVATE "${NX_ROOT}/runtime" "${LIFTED_DIR}")
-        target_compile_options(lifted_o3 PRIVATE ${lift_o3})
+        target_compile_options(lifted_o3 PRIVATE ${lift_o3} ${NX_PGO_FLAGS})
+        target_compile_definitions(lifted_o3 PRIVATE ${NX_CC_DEFS})
         set_property(TARGET lifted_o3 PROPERTY JOB_POOL_COMPILE lift_pool)
         add_library(a64rt_o3 STATIC EXCLUDE_FROM_ALL "${NX_ROOT}/runtime/a64rt.c")
         target_include_directories(a64rt_o3 PUBLIC "${NX_ROOT}/runtime")
-        target_compile_options(a64rt_o3 PRIVATE ${lift_o3})
+        target_compile_options(a64rt_o3 PRIVATE ${lift_o3} ${NX_PGO_FLAGS})
+        target_compile_definitions(a64rt_o3 PUBLIC ${NX_CC_DEFS})
         set(NX_PKG_LIBS lifted_o3 a64rt_o3)
     endif()
 
     # zstd: the shader pack (gpu.c) in every build, netplay's compression; ENet with it
     nx_netplay_libs()
     nx_opus_lib()
+    nx_fsr2_lib()
     # the shader packer (tools/shader/pack.c): translate.py --spv's output in one file for players
     add_executable(nxshpack "${NX_ROOT}/tools/shader/pack.c")
     target_link_libraries(nxshpack PRIVATE nx_zstd)
@@ -322,7 +435,7 @@ function(nx_game_exe target package)
     target_compile_options(${target} PRIVATE /clang:-O3 /clang:-march=haswell /W3 /clang:-Wno-unused-parameter
                                               /clang:-Wno-bitwise-op-parentheses /clang:-fno-strict-aliasing
                                               /clang:-gline-tables-only /clang:-gcodeview)   # static functions named in profiles
-    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN ${NX_CC_DEFS})
     target_include_directories(${target} PRIVATE "${NX_ROOT}/runtime" "${CMAKE_BINARY_DIR}"
                                "${NX_VULKAN_INCLUDE}" "${NX_SDL3_INCLUDE}")
     target_link_libraries(${target} PRIVATE ${libs} nx_zstd nx_opus dbghelp bcrypt psapi mfplat mfreadwrite mfuuid ole32 cfgmgr32 gdi32
@@ -335,6 +448,10 @@ function(nx_game_exe target package)
     # /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
     # /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)
     target_link_options(${target} PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO /MAP)
+    target_compile_options(${target} PRIVATE ${NX_PGO_FLAGS})
+    if(NX_PGO_LINK)
+        target_link_libraries(${target} PRIVATE "${NX_PGO_LINK}")
+    endif()
     add_dependencies(${target} nxui)            # loaded at run time from next to the exe (ui.c)
     if(NOT package)                             # the mods too (run.ps1 builds only the game's target)
         nx_mods_group()
@@ -348,6 +465,12 @@ function(nx_game_exe target package)
         add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                            "${_dll}" "$<TARGET_FILE_DIR:${target}>")
     endforeach()
+    if(NX_FSR2)                                 # AMD FSR 2 (nx_fsr2_lib): runtime/fsr2.cpp around it
+        target_sources(${target} PRIVATE "${NX_ROOT}/runtime/fsr2.cpp")
+        set_source_files_properties("${NX_ROOT}/runtime/fsr2.cpp" PROPERTIES COMPILE_OPTIONS "/std:c++17")
+        target_compile_definitions(${target} PRIVATE NX_FSR2)
+        target_link_libraries(${target} PRIVATE nx_fsr2)
+    endif()
     if(G_NETPLAY)
         target_sources(${target} PRIVATE ${NX_NETPLAY_SOURCES})
         target_compile_definitions(${target} PRIVATE NX_NETPLAY)

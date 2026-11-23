@@ -86,6 +86,9 @@ bool ui_init(SDL_Window *window) {
         .mods_files = mods_files, .mods_windows = mods_windows, .mods_window_toggle = mods_window_toggle,
         .mods_set_enabled = mods_set_enabled, .mods_any_window_open = mods_any_window_open, .mods_ui = mods_ui,
         .theme = NX_UI_THEME, .setting = options_get, .set_setting = options_set,
+        .taa_available = taa_available(), .taa_failed = taa_failed, .taa_mode = taa_mode, .set_taa_mode = taa_set_mode,
+        .taa_sharpness = taa_sharpness, .set_taa_sharpness = taa_set_sharpness, .taa_jitter = taa_jitter,
+        .set_taa_jitter = taa_set_jitter,
 #ifdef NX_NETPLAY
         .netplay = true, .room_state = netmenu_state, .room_message = netmenu_message, .room_join = netmenu_join,
         .room_leave = netmenu_leave, .in_session = netmenu_in_session, .lobby_refresh = netmenu_lobby_refresh,

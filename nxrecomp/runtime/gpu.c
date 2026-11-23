@@ -1011,6 +1011,7 @@ static void env_init(void) {
 void gpu_init(void) {
     InitializeCriticalSection(&gpu_cs);
     env_init();
+    taa_init();
     VkSemaphoreTypeCreateInfo tci = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &tci};

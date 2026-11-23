@@ -102,27 +102,27 @@ static void obj_free(u64 addr) {
 }
 
 static u64 debug_ids;
-static void next_debug_id(Ctx *c) { RET(InterlockedIncrement64((LONG64 *)&debug_ids)); }
-static void return_true(Ctx *c) { RET(1); }
-static void return_zero(Ctx *c) { RET(0); }
-static void nothing(Ctx *c) {}
+static NXCC void next_debug_id(Ctx *c) { RET(InterlockedIncrement64((LONG64 *)&debug_ids)); }
+static NXCC void return_true(Ctx *c) { RET(1); }
+static NXCC void return_zero(Ctx *c) { RET(0); }
+static NXCC void nothing(Ctx *c) {}
 
 /* ---------------------------------------------------------------------------------------------- device */
 typedef struct DeviceBuilder { u32 flags; } DeviceBuilder;                      /* 0x40 */
 typedef struct Device { u32 flags, window_origin, depth_mode; } Device;
 
-static void device_builder_defaults(Ctx *c) { memset(P(void, 0), 0, 0x40); }
-static void device_builder_flags(Ctx *c) { P(DeviceBuilder, 0)->flags = (u32)A(1); }
-static void device_initialize(Ctx *c) {
+static NXCC void device_builder_defaults(Ctx *c) { memset(P(void, 0), 0, 0x40); }
+static NXCC void device_builder_flags(Ctx *c) { P(DeviceBuilder, 0)->flags = (u32)A(1); }
+static NXCC void device_initialize(Ctx *c) {
     Device *d = obj_new(A(0), T_DEVICE, sizeof(Device));
     d->flags = P(DeviceBuilder, 1)->flags;
     hlog(1, "nvn: device initialised (flags %x)", d->flags);
     RET(1);
 }
-static void device_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void device_finalize(Ctx *c) { obj_free(A(0)); }
 
 /* nvnDeviceGetInteger(device, NVNdeviceInfo, int *value) */
-static void device_get_integer(Ctx *c) {
+static NXCC void device_get_integer(Ctx *c) {
     static const struct { u32 id; s32 v; } info[] = {
         {0, 53}, {1, 311},                       /* API version */
         {2, 14}, {3, 0x10000}, {4, 0x100},       /* uniform buffers per stage, max size, alignment */
@@ -156,43 +156,43 @@ static u64 now_ns(void) {
     QueryPerformanceCounter(&n);
     return (u64)((double)n.QuadPart * 1e9 / (double)f.QuadPart);
 }
-static void device_timestamp(Ctx *c) { RET(now_ns()); }
+static NXCC void device_timestamp(Ctx *c) { RET(now_ns()); }
 /* handles: texture id in the low 20 bits, sampler id above, as on the console */
-static void device_texture_handle(Ctx *c) { RET((u64)(u32)A(1) | (u64)(u32)A(2) << 20); }
-static void device_texel_fetch_handle(Ctx *c) { RET((u64)(u32)A(1)); }
-static void device_image_handle(Ctx *c) { RET((u64)(u32)A(1)); }
-static void device_separate_texture_handle(Ctx *c) { RET((u64)(u32)A(1)); }
-static void device_separate_sampler_handle(Ctx *c) { RET((u64)(u32)A(1) << 20); }
-static void device_set_window_origin(Ctx *c) {
+static NXCC void device_texture_handle(Ctx *c) { RET((u64)(u32)A(1) | (u64)(u32)A(2) << 20); }
+static NXCC void device_texel_fetch_handle(Ctx *c) { RET((u64)(u32)A(1)); }
+static NXCC void device_image_handle(Ctx *c) { RET((u64)(u32)A(1)); }
+static NXCC void device_separate_texture_handle(Ctx *c) { RET((u64)(u32)A(1)); }
+static NXCC void device_separate_sampler_handle(Ctx *c) { RET((u64)(u32)A(1) << 20); }
+static NXCC void device_set_window_origin(Ctx *c) {
     Device *d = obj_get(A(0), T_DEVICE);
     if (!d) return;
     d->window_origin = (u32)A(1);
     hlog(1, "nvn: window origin mode %u", d->window_origin);
     gpu_device_modes(d->window_origin, d->depth_mode);
 }
-static void device_set_depth_mode(Ctx *c) {
+static NXCC void device_set_depth_mode(Ctx *c) {
     Device *d = obj_get(A(0), T_DEVICE);
     if (!d) return;
     d->depth_mode = (u32)A(1);
     hlog(1, "nvn: depth mode %u", d->depth_mode);
     gpu_device_modes(d->window_origin, d->depth_mode);
 }
-static void device_get_window_origin(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->window_origin : 0); }
-static void device_get_depth_mode(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->depth_mode : 0); }
+static NXCC void device_get_window_origin(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->window_origin : 0); }
+static NXCC void device_get_depth_mode(Ctx *c) { Device *d = obj_get(A(0), T_DEVICE); RET(d ? d->depth_mode : 0); }
 
 /* ---------------------------------------------------------------------------------------------- memory pools */
 typedef struct PoolBuilder { u64 device, storage, size; u32 flags; } PoolBuilder;   /* 0x40 */
 
 static volatile LONG64 virtual_next = 0x8000000000ll;       /* virtual pools' GPU addresses: never CPU memory */
 
-static void pool_builder_defaults(Ctx *c) { memset(P(void, 0), 0, 0x40); }
-static void pool_builder_device(Ctx *c) { P(PoolBuilder, 0)->device = A(1); }
-static void pool_builder_storage(Ctx *c) { P(PoolBuilder, 0)->storage = A(1); P(PoolBuilder, 0)->size = A(2); }
-static void pool_builder_flags(Ctx *c) { P(PoolBuilder, 0)->flags = (u32)A(1); }
-static void pool_builder_get_storage(Ctx *c) { RET(P(PoolBuilder, 0)->storage); }
-static void pool_builder_get_size(Ctx *c) { RET(P(PoolBuilder, 0)->size); }
-static void pool_builder_get_flags(Ctx *c) { RET(P(PoolBuilder, 0)->flags); }
-static void pool_initialize(Ctx *c) {
+static NXCC void pool_builder_defaults(Ctx *c) { memset(P(void, 0), 0, 0x40); }
+static NXCC void pool_builder_device(Ctx *c) { P(PoolBuilder, 0)->device = A(1); }
+static NXCC void pool_builder_storage(Ctx *c) { P(PoolBuilder, 0)->storage = A(1); P(PoolBuilder, 0)->size = A(2); }
+static NXCC void pool_builder_flags(Ctx *c) { P(PoolBuilder, 0)->flags = (u32)A(1); }
+static NXCC void pool_builder_get_storage(Ctx *c) { RET(P(PoolBuilder, 0)->storage); }
+static NXCC void pool_builder_get_size(Ctx *c) { RET(P(PoolBuilder, 0)->size); }
+static NXCC void pool_builder_get_flags(Ctx *c) { RET(P(PoolBuilder, 0)->flags); }
+static NXCC void pool_initialize(Ctx *c) {
     PoolBuilder *b = P(PoolBuilder, 1);
     Pool *p = obj_new(A(0), T_POOL, sizeof(Pool));
     p->storage = b->storage;
@@ -214,7 +214,7 @@ static void pool_initialize(Ctx *c) {
     core_enter();
     RET(1);
 }
-static void pool_finalize(Ctx *c) {
+static NXCC void pool_finalize(Ctx *c) {
     Pool *p = obj_get(A(0), T_POOL);
     if (p) {
         core_leave();
@@ -223,13 +223,13 @@ static void pool_finalize(Ctx *c) {
     }
     obj_free(A(0));
 }
-static void pool_map(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->storage : 0); }
-static void pool_address(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->gpu : 0); }
-static void pool_size(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->size : 0); }
-static void pool_flags(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->flags : 0); }
+static NXCC void pool_map(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->storage : 0); }
+static NXCC void pool_address(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->gpu : 0); }
+static NXCC void pool_size(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->size : 0); }
+static NXCC void pool_flags(Ctx *c) { Pool *p = obj_get(A(0), T_POOL); RET(p ? p->flags : 0); }
 /* nvnMemoryPoolMapVirtual(pool, int count, const NVNmappingRequest *): texture memory lives in our images, so
  * the mapping only matters for the addresses, which the virtual pool already has */
-static void pool_map_virtual(Ctx *c) {
+static NXCC void pool_map_virtual(Ctx *c) {
     static bool logged;
     if (!logged) { logged = true; hlog(1, "nvn: MapVirtual(%llx, %d requests): accepted", A(0), (int)A(1)); }
     RET(1);
@@ -242,16 +242,16 @@ u64 pool_gpu(u64 pool) { Pool *p = obj_get(pool, T_POOL); return p ? p->gpu : 0;
 typedef struct BufferBuilder { u64 device, pool, offset, size; } BufferBuilder;   /* 0x40 */
 typedef struct Buffer { u64 pool, offset, size, addr, cpu; } Buffer;
 
-static void buffer_builder_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(BufferBuilder)); }
-static void buffer_builder_device(Ctx *c) { P(BufferBuilder, 0)->device = A(1); }
-static void buffer_builder_storage(Ctx *c) {
+static NXCC void buffer_builder_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(BufferBuilder)); }
+static NXCC void buffer_builder_device(Ctx *c) { P(BufferBuilder, 0)->device = A(1); }
+static NXCC void buffer_builder_storage(Ctx *c) {
     BufferBuilder *b = P(BufferBuilder, 0);
     b->pool = A(1); b->offset = A(2); b->size = A(3);
 }
-static void buffer_builder_get_pool(Ctx *c) { RET(P(BufferBuilder, 0)->pool); }
-static void buffer_builder_get_offset(Ctx *c) { RET(P(BufferBuilder, 0)->offset); }
-static void buffer_builder_get_size(Ctx *c) { RET(P(BufferBuilder, 0)->size); }
-static void buffer_initialize(Ctx *c) {
+static NXCC void buffer_builder_get_pool(Ctx *c) { RET(P(BufferBuilder, 0)->pool); }
+static NXCC void buffer_builder_get_offset(Ctx *c) { RET(P(BufferBuilder, 0)->offset); }
+static NXCC void buffer_builder_get_size(Ctx *c) { RET(P(BufferBuilder, 0)->size); }
+static NXCC void buffer_initialize(Ctx *c) {
     BufferBuilder *b = P(BufferBuilder, 1);
     Buffer *x = obj_new(A(0), T_BUFFER, sizeof(Buffer));
     x->pool = b->pool; x->offset = b->offset; x->size = b->size;
@@ -259,12 +259,12 @@ static void buffer_initialize(Ctx *c) {
     x->cpu = pool_storage(b->pool) ? pool_storage(b->pool) + b->offset : 0;
     RET(1);
 }
-static void buffer_finalize(Ctx *c) { obj_free(A(0)); }
-static void buffer_map(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->cpu : 0); }
-static void buffer_address(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->addr : 0); }
-static void buffer_size(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->size : 0); }
-static void buffer_pool(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->pool : 0); }
-static void buffer_offset(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->offset : 0); }
+static NXCC void buffer_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void buffer_map(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->cpu : 0); }
+static NXCC void buffer_address(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->addr : 0); }
+static NXCC void buffer_size(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->size : 0); }
+static NXCC void buffer_pool(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->pool : 0); }
+static NXCC void buffer_offset(Ctx *c) { Buffer *b = obj_get(A(0), T_BUFFER); RET(b ? b->offset : 0); }
 
 /* ---------------------------------------------------------------------------------------------- queues */
 typedef struct QueueBuilder {                                                   /* 0x40 */
@@ -274,39 +274,39 @@ typedef struct QueueBuilder {                                                   
 } QueueBuilder;
 typedef struct Queue { u32 flags; } Queue;
 
-static void queue_builder_defaults(Ctx *c) {
+static NXCC void queue_builder_defaults(Ctx *c) {
     QueueBuilder *b = P(QueueBuilder, 0);
     memset(b, 0, 0x40);
     b->command_size = 0x100000; b->compute_size = 0x40000; b->control_size = 0x4000;
     b->flush_threshold = 0x10000;
 }
-static void queue_builder_device(Ctx *c) { P(QueueBuilder, 0)->device = A(1); }
-static void queue_builder_flags(Ctx *c) { P(QueueBuilder, 0)->flags = (u32)A(1); }
-static void queue_builder_command_size(Ctx *c) { P(QueueBuilder, 0)->command_size = A(1); }
-static void queue_builder_compute_size(Ctx *c) { P(QueueBuilder, 0)->compute_size = A(1); }
-static void queue_builder_control_size(Ctx *c) { P(QueueBuilder, 0)->control_size = A(1); }
-static void queue_builder_flush_threshold(Ctx *c) { P(QueueBuilder, 0)->flush_threshold = A(1); }
-static void queue_builder_priority(Ctx *c) { P(QueueBuilder, 0)->priority = (u32)A(1); }
-static void queue_builder_memory(Ctx *c) { P(QueueBuilder, 0)->memory = A(1); P(QueueBuilder, 0)->memory_size = A(2); }
+static NXCC void queue_builder_device(Ctx *c) { P(QueueBuilder, 0)->device = A(1); }
+static NXCC void queue_builder_flags(Ctx *c) { P(QueueBuilder, 0)->flags = (u32)A(1); }
+static NXCC void queue_builder_command_size(Ctx *c) { P(QueueBuilder, 0)->command_size = A(1); }
+static NXCC void queue_builder_compute_size(Ctx *c) { P(QueueBuilder, 0)->compute_size = A(1); }
+static NXCC void queue_builder_control_size(Ctx *c) { P(QueueBuilder, 0)->control_size = A(1); }
+static NXCC void queue_builder_flush_threshold(Ctx *c) { P(QueueBuilder, 0)->flush_threshold = A(1); }
+static NXCC void queue_builder_priority(Ctx *c) { P(QueueBuilder, 0)->priority = (u32)A(1); }
+static NXCC void queue_builder_memory(Ctx *c) { P(QueueBuilder, 0)->memory = A(1); P(QueueBuilder, 0)->memory_size = A(2); }
 /* the memory a queue wants from the game for its own command buffers */
-static void queue_builder_memory_size(Ctx *c) {
+static NXCC void queue_builder_memory_size(Ctx *c) {
     QueueBuilder *b = P(QueueBuilder, 0);
     RET((b->command_size + b->compute_size + b->control_size + 0xfff) & ~0xfffull);
 }
-static void queue_initialize(Ctx *c) {
+static NXCC void queue_initialize(Ctx *c) {
     Queue *q = obj_new(A(0), T_QUEUE, sizeof(Queue));
     q->flags = P(QueueBuilder, 1)->flags;
     RET(1);
 }
-static void queue_finalize(Ctx *c) { gpu_finish(A(0)); obj_free(A(0)); }
-static void queue_get_error(Ctx *c) { if (A(1)) memset(P(void, 1), 0, 0x18); RET(0); }
+static NXCC void queue_finalize(Ctx *c) { gpu_finish(A(0)); obj_free(A(0)); }
+static NXCC void queue_get_error(Ctx *c) { if (A(1)) memset(P(void, 1), 0, 0x18); RET(0); }
 /* nvnQueueSubmitCommands(queue, int count, const NVNcommandHandle *). Translating the commands is the console GPU's
  * work, not the CPU core's: the thread gives up its core meanwhile (else the threads sharing that core waited
  * for it, the main thread 60% of the time in Mesagoza) */
 static u64 *ahead_h;                    /* the command buffers nvn_submit_ahead ran, until the game submits them */
 static u32 ahead_n, ahead_cap;
 static volatile LONG ahead_tid;         /* the thread that ran them, 0: none */
-static void queue_submit(Ctx *c) {
+static NXCC void queue_submit(Ctx *c) {
     u32 n = (u32)A(1);
     if (!n) return;
     if (ahead_tid && (DWORD)ahead_tid == GetCurrentThreadId()) {
@@ -339,14 +339,14 @@ void nvn_submit_ahead(u32 n, const u64 *handles) {
     core_enter();
     ahead_tid = (LONG)GetCurrentThreadId();
 }
-static void queue_flush(Ctx *c) { gpu_flush(A(0)); }
-static void queue_finish(Ctx *c) { gpu_wait_site = c->x[30] + 1; gpu_finish(A(0)); }
+static NXCC void queue_flush(Ctx *c) { gpu_flush(A(0)); }
+static NXCC void queue_finish(Ctx *c) { gpu_wait_site = c->x[30] + 1; gpu_finish(A(0)); }
 
 /* ---------------------------------------------------------------------------------------------- sync */
-static void sync_initialize(Ctx *c) { obj_new(A(0), T_SYNC, sizeof(Sync)); RET(1); }
-static void sync_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void sync_initialize(Ctx *c) { obj_new(A(0), T_SYNC, sizeof(Sync)); RET(1); }
+static NXCC void sync_finalize(Ctx *c) { obj_free(A(0)); }
 /* nvnQueueFenceSync(queue, sync, condition, flags) */
-static void queue_fence_sync(Ctx *c) {
+static NXCC void queue_fence_sync(Ctx *c) {
     Sync *s = obj_get(A(1), T_SYNC);
     if (!s) return;
     core_leave();                               /* gpu_fence flushes under gpu_cs: as queue_submit */
@@ -355,7 +355,7 @@ static void queue_fence_sync(Ctx *c) {
     s->fenced = true;
 }
 /* nvnSyncWait(sync, u64 timeout_ns): ALREADY_SIGNALED 0, CONDITION_SATISFIED 1, TIMEOUT_EXPIRED 2, FAILED 3 */
-static void sync_wait(Ctx *c) {
+static NXCC void sync_wait(Ctx *c) {
     Sync *s = obj_get(A(0), T_SYNC);
     if (!s || !s->fenced || gpu_completed() >= s->value) { RET(0); return; }
     core_leave();
@@ -429,7 +429,7 @@ static void texinfo_from_builder(const TexBuilder *b, TexInfo *t) {
         t->target != TEX_CUBE_ARRAY) t->depth = 1;
 }
 
-static void tb_defaults(Ctx *c) {
+static NXCC void tb_defaults(Ctx *c) {
     TexBuilder *b = P(TexBuilder, 0);
     u64 dev = b->device;
     memset(b, 0, 0x80);
@@ -437,54 +437,54 @@ static void tb_defaults(Ctx *c) {
     b->target = TEX_2D; b->width = b->height = b->depth = 1; b->levels = 1; b->samples = 0;
     b->swizzle[0] = 2; b->swizzle[1] = 3; b->swizzle[2] = 4; b->swizzle[3] = 5;   /* R, G, B, A */
 }
-static void tb_device(Ctx *c) { P(TexBuilder, 0)->device = A(1); }
-static void tb_flags(Ctx *c) { P(TexBuilder, 0)->flags = (u32)A(1); }
-static void tb_target(Ctx *c) { P(TexBuilder, 0)->target = (u32)A(1); }
-static void tb_width(Ctx *c) { P(TexBuilder, 0)->width = (u32)A(1); }
-static void tb_height(Ctx *c) { P(TexBuilder, 0)->height = (u32)A(1); }
-static void tb_depth(Ctx *c) { P(TexBuilder, 0)->depth = (u32)A(1); }
-static void tb_size1d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = b->depth = 1; }
-static void tb_size2d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = (u32)A(2); b->depth = 1; }
-static void tb_size3d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = (u32)A(2); b->depth = (u32)A(3); }
-static void tb_levels(Ctx *c) { P(TexBuilder, 0)->levels = (u32)A(1); }
-static void tb_format(Ctx *c) { P(TexBuilder, 0)->format = (u32)A(1); }
-static void tb_samples(Ctx *c) { P(TexBuilder, 0)->samples = (u32)A(1); }
-static void tb_swizzle(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); for (int i = 0; i < 4; i++) b->swizzle[i] = (u8)A(1 + i); }
-static void tb_ds_mode(Ctx *c) { P(TexBuilder, 0)->ds_mode = (u32)A(1); }
-static void tb_storage(Ctx *c) { P(TexBuilder, 0)->pool = A(1); P(TexBuilder, 0)->offset = A(2); }
-static void tb_stride(Ctx *c) { P(TexBuilder, 0)->stride = (s64)A(1); }
-static void tb_packaged_data(Ctx *c) { P(TexBuilder, 0)->packaged = A(1); }
-static void tb_packaged_layout(Ctx *c) {
+static NXCC void tb_device(Ctx *c) { P(TexBuilder, 0)->device = A(1); }
+static NXCC void tb_flags(Ctx *c) { P(TexBuilder, 0)->flags = (u32)A(1); }
+static NXCC void tb_target(Ctx *c) { P(TexBuilder, 0)->target = (u32)A(1); }
+static NXCC void tb_width(Ctx *c) { P(TexBuilder, 0)->width = (u32)A(1); }
+static NXCC void tb_height(Ctx *c) { P(TexBuilder, 0)->height = (u32)A(1); }
+static NXCC void tb_depth(Ctx *c) { P(TexBuilder, 0)->depth = (u32)A(1); }
+static NXCC void tb_size1d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = b->depth = 1; }
+static NXCC void tb_size2d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = (u32)A(2); b->depth = 1; }
+static NXCC void tb_size3d(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); b->width = (u32)A(1); b->height = (u32)A(2); b->depth = (u32)A(3); }
+static NXCC void tb_levels(Ctx *c) { P(TexBuilder, 0)->levels = (u32)A(1); }
+static NXCC void tb_format(Ctx *c) { P(TexBuilder, 0)->format = (u32)A(1); }
+static NXCC void tb_samples(Ctx *c) { P(TexBuilder, 0)->samples = (u32)A(1); }
+static NXCC void tb_swizzle(Ctx *c) { TexBuilder *b = P(TexBuilder, 0); for (int i = 0; i < 4; i++) b->swizzle[i] = (u8)A(1 + i); }
+static NXCC void tb_ds_mode(Ctx *c) { P(TexBuilder, 0)->ds_mode = (u32)A(1); }
+static NXCC void tb_storage(Ctx *c) { P(TexBuilder, 0)->pool = A(1); P(TexBuilder, 0)->offset = A(2); }
+static NXCC void tb_stride(Ctx *c) { P(TexBuilder, 0)->stride = (s64)A(1); }
+static NXCC void tb_packaged_data(Ctx *c) { P(TexBuilder, 0)->packaged = A(1); }
+static NXCC void tb_packaged_layout(Ctx *c) {
     TexBuilder *b = P(TexBuilder, 0);
     if (A(1)) { memcpy(b->layout, P(void, 1), 8); b->has_layout = 1; }
     else b->has_layout = 0;
 }
-static void tb_gl_name(Ctx *c) { P(TexBuilder, 0)->gl_name = (u32)A(1); }
-static void tb_storage_size(Ctx *c) { TexInfo t; texinfo_from_builder(P(TexBuilder, 0), &t); RET(texture_storage_size(&t)); }
-static void tb_storage_alignment(Ctx *c) { RET(0x200); }
-static void tb_get_device(Ctx *c) { RET(P(TexBuilder, 0)->device); }
-static void tb_get_flags(Ctx *c) { RET(P(TexBuilder, 0)->flags); }
-static void tb_get_target(Ctx *c) { RET(P(TexBuilder, 0)->target); }
-static void tb_get_width(Ctx *c) { RET(P(TexBuilder, 0)->width); }
-static void tb_get_height(Ctx *c) { RET(P(TexBuilder, 0)->height); }
-static void tb_get_depth(Ctx *c) { RET(P(TexBuilder, 0)->depth); }
-static void tb_get_levels(Ctx *c) { RET(P(TexBuilder, 0)->levels); }
-static void tb_get_format(Ctx *c) { RET(P(TexBuilder, 0)->format); }
-static void tb_get_samples(Ctx *c) { RET(P(TexBuilder, 0)->samples); }
-static void tb_get_ds_mode(Ctx *c) { RET(P(TexBuilder, 0)->ds_mode); }
-static void tb_get_stride(Ctx *c) { RET(P(TexBuilder, 0)->stride); }
-static void tb_get_pool(Ctx *c) { RET(P(TexBuilder, 0)->pool); }
-static void tb_get_pool_offset(Ctx *c) { RET(P(TexBuilder, 0)->offset); }
-static void tb_get_packaged(Ctx *c) { RET(P(TexBuilder, 0)->packaged); }
-static void tb_get_gl_name(Ctx *c) { RET(P(TexBuilder, 0)->gl_name); }
-static void tb_get_swizzle(Ctx *c) {
+static NXCC void tb_gl_name(Ctx *c) { P(TexBuilder, 0)->gl_name = (u32)A(1); }
+static NXCC void tb_storage_size(Ctx *c) { TexInfo t; texinfo_from_builder(P(TexBuilder, 0), &t); RET(texture_storage_size(&t)); }
+static NXCC void tb_storage_alignment(Ctx *c) { RET(0x200); }
+static NXCC void tb_get_device(Ctx *c) { RET(P(TexBuilder, 0)->device); }
+static NXCC void tb_get_flags(Ctx *c) { RET(P(TexBuilder, 0)->flags); }
+static NXCC void tb_get_target(Ctx *c) { RET(P(TexBuilder, 0)->target); }
+static NXCC void tb_get_width(Ctx *c) { RET(P(TexBuilder, 0)->width); }
+static NXCC void tb_get_height(Ctx *c) { RET(P(TexBuilder, 0)->height); }
+static NXCC void tb_get_depth(Ctx *c) { RET(P(TexBuilder, 0)->depth); }
+static NXCC void tb_get_levels(Ctx *c) { RET(P(TexBuilder, 0)->levels); }
+static NXCC void tb_get_format(Ctx *c) { RET(P(TexBuilder, 0)->format); }
+static NXCC void tb_get_samples(Ctx *c) { RET(P(TexBuilder, 0)->samples); }
+static NXCC void tb_get_ds_mode(Ctx *c) { RET(P(TexBuilder, 0)->ds_mode); }
+static NXCC void tb_get_stride(Ctx *c) { RET(P(TexBuilder, 0)->stride); }
+static NXCC void tb_get_pool(Ctx *c) { RET(P(TexBuilder, 0)->pool); }
+static NXCC void tb_get_pool_offset(Ctx *c) { RET(P(TexBuilder, 0)->offset); }
+static NXCC void tb_get_packaged(Ctx *c) { RET(P(TexBuilder, 0)->packaged); }
+static NXCC void tb_get_gl_name(Ctx *c) { RET(P(TexBuilder, 0)->gl_name); }
+static NXCC void tb_get_swizzle(Ctx *c) {
     TexBuilder *b = P(TexBuilder, 0);
     for (int i = 0; i < 4; i++) if (A(1 + i)) ST32(A(1 + i), b->swizzle[i]);
 }
 /* NVNstorageClass for MapVirtual: the console's generic block-linear kind */
-static void tb_storage_class(Ctx *c) { RET(P(TexBuilder, 0)->flags & TEX_FLAG_LINEAR ? 0 : 0xfe); }
+static NXCC void tb_storage_class(Ctx *c) { RET(P(TexBuilder, 0)->flags & TEX_FLAG_LINEAR ? 0 : 0xfe); }
 
-static void tex_initialize(Ctx *c) {
+static NXCC void tex_initialize(Ctx *c) {
     TexBuilder *b = P(TexBuilder, 1);
     Texture *t = obj_new(A(0), T_TEXTURE, sizeof(Texture));
     t->b = *b;
@@ -494,8 +494,8 @@ static void tex_initialize(Ctx *c) {
          b->depth, b->format, b->target, b->levels, t->info.addr, t->size);
     RET(1);
 }
-static void tex_finalize(Ctx *c) { obj_free(A(0)); }
-#define TEX_GET(name, expr) static void name(Ctx *c) { Texture *t = obj_get(A(0), T_TEXTURE); RET(t ? (u64)(expr) : 0); }
+static NXCC void tex_finalize(Ctx *c) { obj_free(A(0)); }
+#define TEX_GET(name, expr) static NXCC void name(Ctx *c) { Texture *t = obj_get(A(0), T_TEXTURE); RET(t ? (u64)(expr) : 0); }
 TEX_GET(tex_get_width, t->b.width)
 TEX_GET(tex_get_height, t->b.height)
 TEX_GET(tex_get_depth, t->b.depth)
@@ -511,11 +511,11 @@ TEX_GET(tex_get_pool, t->b.pool)
 TEX_GET(tex_get_pool_offset, t->b.offset)
 TEX_GET(tex_get_ds_mode, t->b.ds_mode)
 TEX_GET(tex_get_storage_class, t->b.flags & TEX_FLAG_LINEAR ? 0 : 0xfe)
-static void tex_get_swizzle(Ctx *c) {
+static NXCC void tex_get_swizzle(Ctx *c) {
     Texture *t = obj_get(A(0), T_TEXTURE);
     for (int i = 0; i < 4; i++) if (A(1 + i)) ST32(A(1 + i), t ? t->b.swizzle[i] : 0);
 }
-static void tex_compare(Ctx *c) {
+static NXCC void tex_compare(Ctx *c) {
     Texture *a = obj_get(A(0), T_TEXTURE), *b = obj_get(A(1), T_TEXTURE);
     RET(a && b && !memcmp(&a->info, &b->info, sizeof a->info));
 }
@@ -528,8 +528,8 @@ static void write_texels(Ctx *c, s64 row, s64 image) {
     view_resolve(t, A(1) ? P(TexView, 1) : NULL, &v);
     gpu_texture_written(&t->info, &v, P(CopyRegion, 2), P(void, 3), row, image);
 }
-static void tex_write_texels(Ctx *c) { write_texels(c, 0, 0); }
-static void tex_write_texels_strided(Ctx *c) { write_texels(c, (s64)A(4), (s64)A(5)); }
+static NXCC void tex_write_texels(Ctx *c) { write_texels(c, 0, 0); }
+static NXCC void tex_write_texels_strided(Ctx *c) { write_texels(c, (s64)A(4), (s64)A(5)); }
 /* nvnTextureReadTexels / Strided: the CPU reads texels back (the ghost thumbnail of Time Trials) */
 static void read_texels(Ctx *c, s64 row, s64 image) {
     Texture *t = obj_get(A(0), T_TEXTURE);
@@ -538,37 +538,37 @@ static void read_texels(Ctx *c, s64 row, s64 image) {
     view_resolve(t, A(1) ? P(TexView, 1) : NULL, &v);
     gpu_texture_read(&t->info, &v, P(CopyRegion, 2), P(void, 3), row, image);
 }
-static void tex_read_texels(Ctx *c) { read_texels(c, 0, 0); }
-static void tex_read_texels_strided(Ctx *c) { read_texels(c, (s64)A(4), (s64)A(5)); }
+static NXCC void tex_read_texels(Ctx *c) { read_texels(c, 0, 0); }
+static NXCC void tex_read_texels_strided(Ctx *c) { read_texels(c, (s64)A(4), (s64)A(5)); }
 
-static void view_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(TexView)); }
-static void view_levels(Ctx *c) { TexView *v = P(TexView, 0); v->base_level = (u16)A(1); v->num_levels = (u16)A(2); v->flags |= VIEW_LEVELS; }
-static void view_layers(Ctx *c) { TexView *v = P(TexView, 0); v->min_layer = (u32)A(1); v->num_layers = (u32)A(2); v->flags |= VIEW_LAYERS; }
-static void view_format(Ctx *c) { TexView *v = P(TexView, 0); v->format = (u32)A(1); v->flags |= VIEW_FORMAT; }
-static void view_swizzle(Ctx *c) { TexView *v = P(TexView, 0); for (int i = 0; i < 4; i++) v->swizzle[i] = (u8)A(1 + i); v->flags |= VIEW_SWIZZLE; }
-static void view_ds_mode(Ctx *c) { TexView *v = P(TexView, 0); v->ds_mode = (u32)A(1); v->flags |= VIEW_DS_MODE; }
-static void view_target(Ctx *c) { TexView *v = P(TexView, 0); v->target = (u32)A(1); v->flags |= VIEW_TARGET; }
-static void view_get_levels(Ctx *c) {
+static NXCC void view_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(TexView)); }
+static NXCC void view_levels(Ctx *c) { TexView *v = P(TexView, 0); v->base_level = (u16)A(1); v->num_levels = (u16)A(2); v->flags |= VIEW_LEVELS; }
+static NXCC void view_layers(Ctx *c) { TexView *v = P(TexView, 0); v->min_layer = (u32)A(1); v->num_layers = (u32)A(2); v->flags |= VIEW_LAYERS; }
+static NXCC void view_format(Ctx *c) { TexView *v = P(TexView, 0); v->format = (u32)A(1); v->flags |= VIEW_FORMAT; }
+static NXCC void view_swizzle(Ctx *c) { TexView *v = P(TexView, 0); for (int i = 0; i < 4; i++) v->swizzle[i] = (u8)A(1 + i); v->flags |= VIEW_SWIZZLE; }
+static NXCC void view_ds_mode(Ctx *c) { TexView *v = P(TexView, 0); v->ds_mode = (u32)A(1); v->flags |= VIEW_DS_MODE; }
+static NXCC void view_target(Ctx *c) { TexView *v = P(TexView, 0); v->target = (u32)A(1); v->flags |= VIEW_TARGET; }
+static NXCC void view_get_levels(Ctx *c) {
     TexView *v = P(TexView, 0);
     if (A(1)) ST32(A(1), v->base_level);
     if (A(2)) ST32(A(2), v->num_levels);
     RET(!!(v->flags & VIEW_LEVELS));
 }
-static void view_get_layers(Ctx *c) {
+static NXCC void view_get_layers(Ctx *c) {
     TexView *v = P(TexView, 0);
     if (A(1)) ST32(A(1), v->min_layer);
     if (A(2)) ST32(A(2), v->num_layers);
     RET(!!(v->flags & VIEW_LAYERS));
 }
-static void view_get_format(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->format); RET(!!(v->flags & VIEW_FORMAT)); }
-static void view_get_target(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->target); RET(!!(v->flags & VIEW_TARGET)); }
-static void view_get_ds_mode(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->ds_mode); RET(!!(v->flags & VIEW_DS_MODE)); }
-static void view_get_swizzle(Ctx *c) {
+static NXCC void view_get_format(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->format); RET(!!(v->flags & VIEW_FORMAT)); }
+static NXCC void view_get_target(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->target); RET(!!(v->flags & VIEW_TARGET)); }
+static NXCC void view_get_ds_mode(Ctx *c) { TexView *v = P(TexView, 0); if (A(1)) ST32(A(1), v->ds_mode); RET(!!(v->flags & VIEW_DS_MODE)); }
+static NXCC void view_get_swizzle(Ctx *c) {
     TexView *v = P(TexView, 0);
     for (int i = 0; i < 4; i++) if (A(1 + i)) ST32(A(1 + i), v->swizzle[i]);
     RET(!!(v->flags & VIEW_SWIZZLE));
 }
-static void view_compare(Ctx *c) { RET(memcmp(P(void, 0), P(void, 1), sizeof(TexView)) == 0); }
+static NXCC void view_compare(Ctx *c) { RET(memcmp(P(void, 0), P(void, 1), sizeof(TexView)) == 0); }
 
 /* ---------------------------------------------------------------------------------------------- interned descriptors */
 typedef struct Intern { void *items; u32 size, count, cap; u32 *hash; u32 hcap; SRWLOCK lock; } Intern;
@@ -632,7 +632,7 @@ const SamplerState *sdesc_get(u32 i) { return i < sdescs.count ? intern_item(&sd
 /* ---------------------------------------------------------------------------------------------- samplers */
 typedef struct SmpBuilder { u64 device; SamplerState s; } SmpBuilder;          /* 0x60 */
 typedef struct Sampler { SamplerState s; } Sampler;
-static void sb_defaults(Ctx *c) {
+static NXCC void sb_defaults(Ctx *c) {
     SmpBuilder *b = P(SmpBuilder, 0);
     memset(&b->s, 0, sizeof b->s);
     b->s.min_filter = 4;                /* NEAREST_MIPMAP_LINEAR, as in GL */
@@ -641,50 +641,50 @@ static void sb_defaults(Ctx *c) {
     b->s.lod_min = -1000; b->s.lod_max = 1000; b->s.max_aniso = 1;
     b->s.compare_func = 8;
 }
-static void sb_device(Ctx *c) { P(SmpBuilder, 0)->device = A(1); }
-static void sb_min_mag(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.min_filter = (u8)A(1); b->s.mag_filter = (u8)A(2); }
-static void sb_wrap(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); for (int i = 0; i < 3; i++) b->s.wrap[i] = (u8)A(1 + i); }
-static void sb_lod_clamp(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.lod_min = F32(0); b->s.lod_max = F32(1); }
-static void sb_lod_bias(Ctx *c) { P(SmpBuilder, 0)->s.lod_bias = F32(0); }
-static void sb_compare(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.compare_mode = (u8)A(1); b->s.compare_func = (u8)A(2); }
-static void sb_aniso(Ctx *c) { P(SmpBuilder, 0)->s.max_aniso = F32(0); }
-static void sb_reduction(Ctx *c) { P(SmpBuilder, 0)->s.reduction = (u8)A(1); }
-static void sb_lod_snap(Ctx *c) { P(SmpBuilder, 0)->s.lod_snap = F32(0) != 0; }
+static NXCC void sb_device(Ctx *c) { P(SmpBuilder, 0)->device = A(1); }
+static NXCC void sb_min_mag(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.min_filter = (u8)A(1); b->s.mag_filter = (u8)A(2); }
+static NXCC void sb_wrap(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); for (int i = 0; i < 3; i++) b->s.wrap[i] = (u8)A(1 + i); }
+static NXCC void sb_lod_clamp(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.lod_min = F32(0); b->s.lod_max = F32(1); }
+static NXCC void sb_lod_bias(Ctx *c) { P(SmpBuilder, 0)->s.lod_bias = F32(0); }
+static NXCC void sb_compare(Ctx *c) { SmpBuilder *b = P(SmpBuilder, 0); b->s.compare_mode = (u8)A(1); b->s.compare_func = (u8)A(2); }
+static NXCC void sb_aniso(Ctx *c) { P(SmpBuilder, 0)->s.max_aniso = F32(0); }
+static NXCC void sb_reduction(Ctx *c) { P(SmpBuilder, 0)->s.reduction = (u8)A(1); }
+static NXCC void sb_lod_snap(Ctx *c) { P(SmpBuilder, 0)->s.lod_snap = F32(0) != 0; }
 static void sb_border(Ctx *c, u8 type) {
     SmpBuilder *b = P(SmpBuilder, 0);
     memcpy(b->s.border, P(void, 1), 16);
     b->s.border_type = type;
 }
-static void sb_border_f(Ctx *c) { sb_border(c, 0); }
-static void sb_border_i(Ctx *c) { sb_border(c, 1); }
-static void sb_border_ui(Ctx *c) { sb_border(c, 2); }
+static NXCC void sb_border_f(Ctx *c) { sb_border(c, 0); }
+static NXCC void sb_border_i(Ctx *c) { sb_border(c, 1); }
+static NXCC void sb_border_ui(Ctx *c) { sb_border(c, 2); }
 static const SamplerState *smp_state(Ctx *c) {
     ObjHdr *o = P(ObjHdr, 0);
     if (o->magic == NVN_MAGIC && o->type == T_SAMPLER) return &((Sampler *)o->host)->s;
     return &P(SmpBuilder, 0)->s;                         /* builder getters share these */
 }
 static void ret_float(Ctx *c, float f) { memset(&c->v[0], 0, sizeof c->v[0]); memcpy(&c->v[0], &f, 4); }
-static void s_get_min_mag(Ctx *c) { const SamplerState *s = smp_state(c); if (A(1)) ST32(A(1), s->min_filter); if (A(2)) ST32(A(2), s->mag_filter); }
-static void s_get_wrap(Ctx *c) { const SamplerState *s = smp_state(c); for (int i = 0; i < 3; i++) if (A(1 + i)) ST32(A(1 + i), s->wrap[i]); }
-static void s_get_lod_clamp(Ctx *c) {
+static NXCC void s_get_min_mag(Ctx *c) { const SamplerState *s = smp_state(c); if (A(1)) ST32(A(1), s->min_filter); if (A(2)) ST32(A(2), s->mag_filter); }
+static NXCC void s_get_wrap(Ctx *c) { const SamplerState *s = smp_state(c); for (int i = 0; i < 3; i++) if (A(1 + i)) ST32(A(1 + i), s->wrap[i]); }
+static NXCC void s_get_lod_clamp(Ctx *c) {
     const SamplerState *s = smp_state(c);
     u32 v;
     if (A(1)) { memcpy(&v, &s->lod_min, 4); ST32(A(1), v); }
     if (A(2)) { memcpy(&v, &s->lod_max, 4); ST32(A(2), v); }
 }
-static void s_get_lod_bias(Ctx *c) { ret_float(c, smp_state(c)->lod_bias); }
-static void s_get_aniso(Ctx *c) { ret_float(c, smp_state(c)->max_aniso); }
-static void s_get_lod_snap(Ctx *c) { ret_float(c, smp_state(c)->lod_snap); }
-static void s_get_compare(Ctx *c) { const SamplerState *s = smp_state(c); if (A(1)) ST32(A(1), s->compare_mode); if (A(2)) ST32(A(2), s->compare_func); }
-static void s_get_reduction(Ctx *c) { RET(smp_state(c)->reduction); }
-static void s_get_border(Ctx *c) { if (A(1)) memcpy(P(void, 1), smp_state(c)->border, 16); }
-static void smp_initialize(Ctx *c) {
+static NXCC void s_get_lod_bias(Ctx *c) { ret_float(c, smp_state(c)->lod_bias); }
+static NXCC void s_get_aniso(Ctx *c) { ret_float(c, smp_state(c)->max_aniso); }
+static NXCC void s_get_lod_snap(Ctx *c) { ret_float(c, smp_state(c)->lod_snap); }
+static NXCC void s_get_compare(Ctx *c) { const SamplerState *s = smp_state(c); if (A(1)) ST32(A(1), s->compare_mode); if (A(2)) ST32(A(2), s->compare_func); }
+static NXCC void s_get_reduction(Ctx *c) { RET(smp_state(c)->reduction); }
+static NXCC void s_get_border(Ctx *c) { if (A(1)) memcpy(P(void, 1), smp_state(c)->border, 16); }
+static NXCC void smp_initialize(Ctx *c) {
     Sampler *s = obj_new(A(0), T_SAMPLER, sizeof(Sampler));
     s->s = P(SmpBuilder, 1)->s;
     RET(1);
 }
-static void smp_finalize(Ctx *c) { obj_free(A(0)); }
-static void smp_compare(Ctx *c) {
+static NXCC void smp_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void smp_compare(Ctx *c) {
     Sampler *a = obj_get(A(0), T_SAMPLER), *b = obj_get(A(1), T_SAMPLER);
     RET(a && b && !memcmp(&a->s, &b->s, sizeof a->s));
 }
@@ -698,16 +698,16 @@ static void descpool_init(Ctx *c, u32 type) {
     p->cpu = pool_storage(p->pool) + p->offset;
     RET(1);
 }
-static void texpool_initialize(Ctx *c) { descpool_init(c, T_TEXPOOL); }
-static void smppool_initialize(Ctx *c) { descpool_init(c, T_SMPPOOL); }
-static void descpool_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void texpool_initialize(Ctx *c) { descpool_init(c, T_TEXPOOL); }
+static NXCC void smppool_initialize(Ctx *c) { descpool_init(c, T_SMPPOOL); }
+static NXCC void descpool_finalize(Ctx *c) { obj_free(A(0)); }
 static DescPool *descpool(u64 a) {
     ObjHdr *o = (ObjHdr *)(uintptr_t)a;
     return a && o->magic == NVN_MAGIC && (o->type == T_TEXPOOL || o->type == T_SMPPOOL) ? o->host : NULL;
 }
-static void descpool_pool(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->pool : 0); }
-static void descpool_offset(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->offset : 0); }
-static void descpool_size(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->count : 0); }
+static NXCC void descpool_pool(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->pool : 0); }
+static NXCC void descpool_offset(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->offset : 0); }
+static NXCC void descpool_size(Ctx *c) { DescPool *p = descpool(A(0)); RET(p ? p->count : 0); }
 static void write_desc(DescPool *p, u32 id, u32 magic, u32 index) {
     if (!p || id >= p->count || !p->cpu) return;
     u64 a = p->cpu + (u64)id * DESC_SIZE;
@@ -715,7 +715,7 @@ static void write_desc(DescPool *p, u32 id, u32 magic, u32 index) {
     ST32(a + 4, index);
 }
 /* nvnTexturePoolRegisterTexture(pool, int id, const NVNtexture *, const NVNtextureView *) (and RegisterImage) */
-static void texpool_register(Ctx *c) {
+static NXCC void texpool_register(Ctx *c) {
     Texture *t = obj_get(A(2), T_TEXTURE);
     if (!t) return;
     TexDesc d;
@@ -725,11 +725,11 @@ static void texpool_register(Ctx *c) {
     write_desc(descpool(A(0)), (u32)A(1), TDESC_MAGIC, tdesc_intern(&d));
 }
 /* nvnSamplerPoolRegisterSampler(pool, int id, const NVNsampler *) / ...SamplerBuilder(pool, id, builder) */
-static void smppool_register(Ctx *c) {
+static NXCC void smppool_register(Ctx *c) {
     Sampler *s = obj_get(A(2), T_SAMPLER);
     if (s) write_desc(descpool(A(0)), (u32)A(1), SDESC_MAGIC, sdesc_intern(&s->s));
 }
-static void smppool_register_builder(Ctx *c) {
+static NXCC void smppool_register_builder(Ctx *c) {
     SamplerState s = P(SmpBuilder, 2)->s;
     write_desc(descpool(A(0)), (u32)A(1), SDESC_MAGIC, sdesc_intern(&s));
 }
@@ -876,10 +876,10 @@ Shaders *shaders_intern(ShaderCode *const stage[ST_COUNT]) {
     ReleaseSRWLockExclusive(&codes.lock);
     return found;
 }
-static void program_set_shaders(Ctx *c) { set_shaders(c, 16); }
-static void program_set_shaders_ext(Ctx *c) { set_shaders(c, 24); }
-static void program_initialize(Ctx *c) { obj_new(A(0), T_PROGRAM, sizeof(Program)); RET(1); }
-static void program_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void program_set_shaders(Ctx *c) { set_shaders(c, 16); }
+static NXCC void program_set_shaders_ext(Ctx *c) { set_shaders(c, 24); }
+static NXCC void program_initialize(Ctx *c) { obj_new(A(0), T_PROGRAM, sizeof(Program)); RET(1); }
+static NXCC void program_finalize(Ctx *c) { obj_free(A(0)); }
 
 /* ---------------------------------------------------------------------------------------------- state blocks */
 static bool first_use(const char *what, Ctx *c) {
@@ -893,61 +893,61 @@ static bool first_use(const char *what, Ctx *c) {
 }
 #define TRACE() first_use(__func__, c)
 
-static void blend_defaults(Ctx *c) {
+static NXCC void blend_defaults(Ctx *c) {
     BlendState *s = P(BlendState, 0);
     memset(s, 0, sizeof *s);
     s->src_rgb = s->src_a = 2;          /* ONE */
     s->dst_rgb = s->dst_a = 1;          /* ZERO */
     s->eq = 1 | 1 << 4;                 /* ADD */
 }
-static void blend_target(Ctx *c) { P(BlendState, 0)->target = (u8)A(1); }
-static void blend_func(Ctx *c) {
+static NXCC void blend_target(Ctx *c) { P(BlendState, 0)->target = (u8)A(1); }
+static NXCC void blend_func(Ctx *c) {
     TRACE();
     BlendState *s = P(BlendState, 0);
     s->src_rgb = (u8)A(1); s->dst_rgb = (u8)A(2); s->src_a = (u8)A(3); s->dst_a = (u8)A(4);
 }
-static void blend_equation(Ctx *c) { TRACE(); P(BlendState, 0)->eq = (u8)((A(1) & 0xf) | (A(2) & 0xf) << 4); }
-static void blend_advanced_mode(Ctx *c) { P(BlendState, 0)->advanced = (u8)A(1); }
-static void blend_advanced_overlap(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~3) | (A(1) & 3)); }
-static void blend_advanced_premul(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~4) | (A(1) ? 4 : 0)); }
-static void blend_advanced_normdst(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~8) | (A(1) ? 8 : 0)); }
-static void blend_get_target(Ctx *c) { RET(P(BlendState, 0)->target); }
-static void blend_get_func(Ctx *c) {
+static NXCC void blend_equation(Ctx *c) { TRACE(); P(BlendState, 0)->eq = (u8)((A(1) & 0xf) | (A(2) & 0xf) << 4); }
+static NXCC void blend_advanced_mode(Ctx *c) { P(BlendState, 0)->advanced = (u8)A(1); }
+static NXCC void blend_advanced_overlap(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~3) | (A(1) & 3)); }
+static NXCC void blend_advanced_premul(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~4) | (A(1) ? 4 : 0)); }
+static NXCC void blend_advanced_normdst(Ctx *c) { BlendState *s = P(BlendState, 0); s->adv_flags = (u8)((s->adv_flags & ~8) | (A(1) ? 8 : 0)); }
+static NXCC void blend_get_target(Ctx *c) { RET(P(BlendState, 0)->target); }
+static NXCC void blend_get_func(Ctx *c) {
     BlendState *s = P(BlendState, 0);
     u8 v[4] = {s->src_rgb, s->dst_rgb, s->src_a, s->dst_a};
     for (int i = 0; i < 4; i++) if (A(1 + i)) ST32(A(1 + i), v[i]);
 }
-static void blend_get_equation(Ctx *c) { BlendState *s = P(BlendState, 0); if (A(1)) ST32(A(1), s->eq & 0xf); if (A(2)) ST32(A(2), s->eq >> 4); }
-static void blend_get_advanced_mode(Ctx *c) { RET(P(BlendState, 0)->advanced); }
-static void blend_get_advanced_overlap(Ctx *c) { RET(P(BlendState, 0)->adv_flags & 3); }
-static void blend_get_advanced_premul(Ctx *c) { RET(!!(P(BlendState, 0)->adv_flags & 4)); }
-static void blend_get_advanced_normdst(Ctx *c) { RET(!!(P(BlendState, 0)->adv_flags & 8)); }
+static NXCC void blend_get_equation(Ctx *c) { BlendState *s = P(BlendState, 0); if (A(1)) ST32(A(1), s->eq & 0xf); if (A(2)) ST32(A(2), s->eq >> 4); }
+static NXCC void blend_get_advanced_mode(Ctx *c) { RET(P(BlendState, 0)->advanced); }
+static NXCC void blend_get_advanced_overlap(Ctx *c) { RET(P(BlendState, 0)->adv_flags & 3); }
+static NXCC void blend_get_advanced_premul(Ctx *c) { RET(!!(P(BlendState, 0)->adv_flags & 4)); }
+static NXCC void blend_get_advanced_normdst(Ctx *c) { RET(!!(P(BlendState, 0)->adv_flags & 8)); }
 
-static void color_defaults(Ctx *c) { ColorState *s = P(ColorState, 0); memset(s, 0, sizeof *s); s->logic_op = 3; s->alpha_test = 8; }
-static void color_blend_enable(Ctx *c) {
+static NXCC void color_defaults(Ctx *c) { ColorState *s = P(ColorState, 0); memset(s, 0, sizeof *s); s->logic_op = 3; s->alpha_test = 8; }
+static NXCC void color_blend_enable(Ctx *c) {
     ColorState *s = P(ColorState, 0);
     u32 i = (u32)A(1) & 7;
     s->blend_enable = (u8)((s->blend_enable & ~(1u << i)) | (A(2) & 1 ? 1u << i : 0));
 }
-static void color_logic_op(Ctx *c) { TRACE(); P(ColorState, 0)->logic_op = (u8)A(1); }
-static void color_alpha_test(Ctx *c) { TRACE(); P(ColorState, 0)->alpha_test = (u8)A(1); }
-static void color_get_blend_enable(Ctx *c) { RET(P(ColorState, 0)->blend_enable >> (A(1) & 7) & 1); }
-static void color_get_logic_op(Ctx *c) { RET(P(ColorState, 0)->logic_op); }
-static void color_get_alpha_test(Ctx *c) { RET(P(ColorState, 0)->alpha_test); }
+static NXCC void color_logic_op(Ctx *c) { TRACE(); P(ColorState, 0)->logic_op = (u8)A(1); }
+static NXCC void color_alpha_test(Ctx *c) { TRACE(); P(ColorState, 0)->alpha_test = (u8)A(1); }
+static NXCC void color_get_blend_enable(Ctx *c) { RET(P(ColorState, 0)->blend_enable >> (A(1) & 7) & 1); }
+static NXCC void color_get_logic_op(Ctx *c) { RET(P(ColorState, 0)->logic_op); }
+static NXCC void color_get_alpha_test(Ctx *c) { RET(P(ColorState, 0)->alpha_test); }
 
-static void mask_defaults(Ctx *c) { P(ChannelMaskState, 0)->mask = 0xffffffffu; }
-static void mask_set(Ctx *c) {
+static NXCC void mask_defaults(Ctx *c) { P(ChannelMaskState, 0)->mask = 0xffffffffu; }
+static NXCC void mask_set(Ctx *c) {
     ChannelMaskState *s = P(ChannelMaskState, 0);
     u32 i = (u32)A(1) & 7;
     u32 m = (A(2) & 1) | (A(3) & 1) << 1 | (A(4) & 1) << 2 | (A(5) & 1) << 3;
     s->mask = (s->mask & ~(0xfu << 4 * i)) | m << 4 * i;
 }
-static void mask_get(Ctx *c) {
+static NXCC void mask_get(Ctx *c) {
     u32 m = P(ChannelMaskState, 0)->mask >> 4 * (A(1) & 7);
     for (int k = 0; k < 4; k++) if (A(2 + k)) ST32(A(2 + k), m >> k & 1);
 }
 
-static void ds_defaults(Ctx *c) {
+static NXCC void ds_defaults(Ctx *c) {
     DepthStencilState *s = P(DepthStencilState, 0);
     memset(s, 0, sizeof *s);
     s->flags = 2;                       /* depth writes on, tests off */
@@ -956,17 +956,17 @@ static void ds_defaults(Ctx *c) {
     s->fail = s->zfail = s->zpass = 1 | 1 << 4;     /* KEEP */
 }
 static void ds_flag(Ctx *c, u8 bit) { DepthStencilState *s = P(DepthStencilState, 0); s->flags = (u8)(A(1) & 1 ? s->flags | bit : s->flags & ~bit); }
-static void ds_depth_test(Ctx *c) { ds_flag(c, 1); }
-static void ds_depth_write(Ctx *c) { ds_flag(c, 2); }
-static void ds_stencil_test(Ctx *c) { ds_flag(c, 4); }
-static void ds_depth_func(Ctx *c) { TRACE(); P(DepthStencilState, 0)->depth_func = (u8)A(1); }
+static NXCC void ds_depth_test(Ctx *c) { ds_flag(c, 1); }
+static NXCC void ds_depth_write(Ctx *c) { ds_flag(c, 2); }
+static NXCC void ds_stencil_test(Ctx *c) { ds_flag(c, 4); }
+static NXCC void ds_depth_func(Ctx *c) { TRACE(); P(DepthStencilState, 0)->depth_func = (u8)A(1); }
 static u8 face_set(u8 old, u32 face, u32 v) {
     if (face & 1) old = (u8)((old & 0xf0) | (v & 0xf));
     if (face & 2) old = (u8)((old & 0x0f) | (v & 0xf) << 4);
     return old;
 }
-static void ds_stencil_func(Ctx *c) { TRACE(); DepthStencilState *s = P(DepthStencilState, 0); s->stencil_func = face_set(s->stencil_func, (u32)A(1), (u32)A(2)); }
-static void ds_stencil_op(Ctx *c) {
+static NXCC void ds_stencil_func(Ctx *c) { TRACE(); DepthStencilState *s = P(DepthStencilState, 0); s->stencil_func = face_set(s->stencil_func, (u32)A(1), (u32)A(2)); }
+static NXCC void ds_stencil_op(Ctx *c) {
     TRACE();
     DepthStencilState *s = P(DepthStencilState, 0);
     u32 f = (u32)A(1);
@@ -974,13 +974,13 @@ static void ds_stencil_op(Ctx *c) {
     s->zfail = face_set(s->zfail, f, (u32)A(3));
     s->zpass = face_set(s->zpass, f, (u32)A(4));
 }
-static void ds_get_depth_test(Ctx *c) { RET(P(DepthStencilState, 0)->flags & 1); }
-static void ds_get_depth_write(Ctx *c) { RET(P(DepthStencilState, 0)->flags >> 1 & 1); }
-static void ds_get_stencil_test(Ctx *c) { RET(P(DepthStencilState, 0)->flags >> 2 & 1); }
-static void ds_get_depth_func(Ctx *c) { RET(P(DepthStencilState, 0)->depth_func); }
+static NXCC void ds_get_depth_test(Ctx *c) { RET(P(DepthStencilState, 0)->flags & 1); }
+static NXCC void ds_get_depth_write(Ctx *c) { RET(P(DepthStencilState, 0)->flags >> 1 & 1); }
+static NXCC void ds_get_stencil_test(Ctx *c) { RET(P(DepthStencilState, 0)->flags >> 2 & 1); }
+static NXCC void ds_get_depth_func(Ctx *c) { RET(P(DepthStencilState, 0)->depth_func); }
 static u32 face_get(u8 v, u32 face) { return face == 2 ? v >> 4 : v & 0xf; }
-static void ds_get_stencil_func(Ctx *c) { RET(face_get(P(DepthStencilState, 0)->stencil_func, (u32)A(1))); }
-static void ds_get_stencil_op(Ctx *c) {
+static NXCC void ds_get_stencil_func(Ctx *c) { RET(face_get(P(DepthStencilState, 0)->stencil_func, (u32)A(1))); }
+static NXCC void ds_get_stencil_op(Ctx *c) {
     DepthStencilState *s = P(DepthStencilState, 0);
     u32 f = (u32)A(1);
     if (A(2)) ST32(A(2), face_get(s->fail, f));
@@ -988,19 +988,19 @@ static void ds_get_stencil_op(Ctx *c) {
     if (A(4)) ST32(A(4), face_get(s->zpass, f));
 }
 
-static void poly_defaults(Ctx *c) { PolygonState *s = P(PolygonState, 0); s->cull = 0; s->front_face = 1; s->mode = 2; s->offset_enables = 0; }
-static void poly_cull(Ctx *c) { TRACE(); P(PolygonState, 0)->cull = (u8)A(1); }
-static void poly_front_face(Ctx *c) { TRACE(); P(PolygonState, 0)->front_face = (u8)A(1); }
-static void poly_mode(Ctx *c) { TRACE(); P(PolygonState, 0)->mode = (u8)A(1); }
-static void poly_offset_enables(Ctx *c) { P(PolygonState, 0)->offset_enables = (u8)A(1); }
-static void poly_get_cull(Ctx *c) { RET(P(PolygonState, 0)->cull); }
-static void poly_get_front_face(Ctx *c) { RET(P(PolygonState, 0)->front_face); }
-static void poly_get_mode(Ctx *c) { RET(P(PolygonState, 0)->mode); }
-static void poly_get_offset_enables(Ctx *c) { RET(P(PolygonState, 0)->offset_enables); }
+static NXCC void poly_defaults(Ctx *c) { PolygonState *s = P(PolygonState, 0); s->cull = 0; s->front_face = 1; s->mode = 2; s->offset_enables = 0; }
+static NXCC void poly_cull(Ctx *c) { TRACE(); P(PolygonState, 0)->cull = (u8)A(1); }
+static NXCC void poly_front_face(Ctx *c) { TRACE(); P(PolygonState, 0)->front_face = (u8)A(1); }
+static NXCC void poly_mode(Ctx *c) { TRACE(); P(PolygonState, 0)->mode = (u8)A(1); }
+static NXCC void poly_offset_enables(Ctx *c) { P(PolygonState, 0)->offset_enables = (u8)A(1); }
+static NXCC void poly_get_cull(Ctx *c) { RET(P(PolygonState, 0)->cull); }
+static NXCC void poly_get_front_face(Ctx *c) { RET(P(PolygonState, 0)->front_face); }
+static NXCC void poly_get_mode(Ctx *c) { RET(P(PolygonState, 0)->mode); }
+static NXCC void poly_get_offset_enables(Ctx *c) { RET(P(PolygonState, 0)->offset_enables); }
 
-static void ms_defaults(Ctx *c) { MultisampleState *s = P(MultisampleState, 0); memset(s, 0, sizeof *s); s->enable = 1; }
-#define MS_SET(name, field) static void name(Ctx *c) { P(MultisampleState, 0)->field = (u8)A(1); } \
-                            static void name##_get(Ctx *c) { RET(P(MultisampleState, 0)->field); }
+static NXCC void ms_defaults(Ctx *c) { MultisampleState *s = P(MultisampleState, 0); memset(s, 0, sizeof *s); s->enable = 1; }
+#define MS_SET(name, field) static NXCC void name(Ctx *c) { P(MultisampleState, 0)->field = (u8)A(1); } \
+                            static NXCC void name##_get(Ctx *c) { RET(P(MultisampleState, 0)->field); }
 MS_SET(ms_enable, enable)
 MS_SET(ms_samples, samples)
 MS_SET(ms_a2c, a2c)
@@ -1012,17 +1012,17 @@ MS_SET(ms_cov_to_color_out, cov_to_color_out)
 MS_SET(ms_sample_loc, sample_loc)
 MS_SET(ms_sample_loc_grid, sample_loc_grid)
 
-static void va_defaults(Ctx *c) { P(VertexAttribState, 0)->v = 0; }
+static NXCC void va_defaults(Ctx *c) { P(VertexAttribState, 0)->v = 0; }
 /* nvnVertexAttribStateSetFormat(state, NVNformat, ptrdiff_t relativeOffset) */
-static void va_format(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); s->v = (s->v & 0xff000000u) | ((u32)A(1) & 0x3ff) | ((u32)A(2) & 0x3fff) << 10; }
-static void va_stream(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); s->v = (s->v & 0x00ffffffu) | ((u32)A(1) & 0x3f) << 24; }
-static void va_get_format(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); if (A(1)) ST32(A(1), VA_FORMAT(*s)); if (A(2)) ST64(A(2), VA_OFFSET(*s)); }
-static void va_get_stream(Ctx *c) { RET(VA_STREAM(*P(VertexAttribState, 0))); }
-static void vs_defaults(Ctx *c) { VertexStreamState *s = P(VertexStreamState, 0); s->stride = 0; s->divisor = 0; }
-static void vs_stride(Ctx *c) { P(VertexStreamState, 0)->stride = (u32)A(1); }
-static void vs_divisor(Ctx *c) { P(VertexStreamState, 0)->divisor = (u32)A(1); }
-static void vs_get_stride(Ctx *c) { RET(P(VertexStreamState, 0)->stride); }
-static void vs_get_divisor(Ctx *c) { RET(P(VertexStreamState, 0)->divisor); }
+static NXCC void va_format(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); s->v = (s->v & 0xff000000u) | ((u32)A(1) & 0x3ff) | ((u32)A(2) & 0x3fff) << 10; }
+static NXCC void va_stream(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); s->v = (s->v & 0x00ffffffu) | ((u32)A(1) & 0x3f) << 24; }
+static NXCC void va_get_format(Ctx *c) { VertexAttribState *s = P(VertexAttribState, 0); if (A(1)) ST32(A(1), VA_FORMAT(*s)); if (A(2)) ST64(A(2), VA_OFFSET(*s)); }
+static NXCC void va_get_stream(Ctx *c) { RET(VA_STREAM(*P(VertexAttribState, 0))); }
+static NXCC void vs_defaults(Ctx *c) { VertexStreamState *s = P(VertexStreamState, 0); s->stride = 0; s->divisor = 0; }
+static NXCC void vs_stride(Ctx *c) { P(VertexStreamState, 0)->stride = (u32)A(1); }
+static NXCC void vs_divisor(Ctx *c) { P(VertexStreamState, 0)->divisor = (u32)A(1); }
+static NXCC void vs_get_stride(Ctx *c) { RET(P(VertexStreamState, 0)->stride); }
+static NXCC void vs_get_divisor(Ctx *c) { RET(P(VertexStreamState, 0)->divisor); }
 
 /* ---------------------------------------------------------------------------------------------- command buffers */
 typedef struct CmdBuf {
@@ -1038,8 +1038,8 @@ typedef struct CmdBuf {
 
 static CmdBuf *cmdbuf(Ctx *c) { return obj_get(A(0), T_CMDBUF); }
 
-static void cmdbuf_initialize(Ctx *c) { CmdBuf *b = obj_new(A(0), T_CMDBUF, sizeof(CmdBuf)); b->self = A(0); RET(1); }
-static void cmdbuf_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void cmdbuf_initialize(Ctx *c) { CmdBuf *b = obj_new(A(0), T_CMDBUF, sizeof(CmdBuf)); b->self = A(0); RET(1); }
+static NXCC void cmdbuf_finalize(Ctx *c) { obj_free(A(0)); }
 
 static void put_jump(u64 at, u64 to) {
     ST32(at, OP_JUMP | 8u << 8);
@@ -1055,38 +1055,38 @@ static void switch_memory(CmdBuf *b, u64 start, u64 size) {
 }
 
 /* nvnCommandBufferAddCommandMemory(cmd, const NVNmemoryPool *, ptrdiff_t offset, size_t size) */
-static void cmdbuf_add_command_memory(Ctx *c) {
+static NXCC void cmdbuf_add_command_memory(Ctx *c) {
     CmdBuf *b = cmdbuf(c);
     if (!b) return;
     u64 at = pool_storage(A(1)) + A(2);
     switch_memory(b, at, A(3));
     b->cmd_total += A(3);
 }
-static void cmdbuf_add_control_memory(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) { b->ctrl_total += A(2); b->ctrl_used = 0; } }
-static void cmdbuf_command_size(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->end - b->chunk : 0); }
-static void cmdbuf_control_size(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_total : 0); }
-static void cmdbuf_command_used(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->cur - b->chunk : 0); }
-static void cmdbuf_command_free(Ctx *c) {
+static NXCC void cmdbuf_add_control_memory(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) { b->ctrl_total += A(2); b->ctrl_used = 0; } }
+static NXCC void cmdbuf_command_size(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->end - b->chunk : 0); }
+static NXCC void cmdbuf_control_size(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_total : 0); }
+static NXCC void cmdbuf_command_used(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->cur - b->chunk : 0); }
+static NXCC void cmdbuf_command_free(Ctx *c) {
     CmdBuf *b = cmdbuf(c);
     RET(b && b->end > b->cur + JUMP_SIZE ? b->end - b->cur - JUMP_SIZE : 0);
 }
-static void cmdbuf_control_used(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_used : 0); }
-static void cmdbuf_control_free(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_total - b->ctrl_used : 0); }
-static void cmdbuf_set_callback(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->callback = A(1); }
-static void cmdbuf_set_callback_data(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->callback_data = A(1); }
-static void cmdbuf_get_callback(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->callback : 0); }
-static void cmdbuf_get_callback_data(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->callback_data : 0); }
-static void cmdbuf_begin(Ctx *c) {
+static NXCC void cmdbuf_control_used(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_used : 0); }
+static NXCC void cmdbuf_control_free(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->ctrl_total - b->ctrl_used : 0); }
+static NXCC void cmdbuf_set_callback(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->callback = A(1); }
+static NXCC void cmdbuf_set_callback_data(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->callback_data = A(1); }
+static NXCC void cmdbuf_get_callback(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->callback : 0); }
+static NXCC void cmdbuf_get_callback_data(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->callback_data : 0); }
+static NXCC void cmdbuf_begin(Ctx *c) {
     CmdBuf *b = cmdbuf(c);
     if (!b) return;
     b->recording = true;
     b->start = b->cur;
 }
-static void cmdbuf_is_recording(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b && b->recording); }
-static void cmdbuf_set_row_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->row_stride = (s64)A(1); }
-static void cmdbuf_set_image_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->image_stride = (s64)A(1); }
-static void cmdbuf_get_row_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->row_stride : 0); }
-static void cmdbuf_get_image_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->image_stride : 0); }
+static NXCC void cmdbuf_is_recording(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b && b->recording); }
+static NXCC void cmdbuf_set_row_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->row_stride = (s64)A(1); }
+static NXCC void cmdbuf_set_image_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); if (b) b->image_stride = (s64)A(1); }
+static NXCC void cmdbuf_get_row_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->row_stride : 0); }
+static NXCC void cmdbuf_get_image_stride(Ctx *c) { CmdBuf *b = cmdbuf(c); RET(b ? b->image_stride : 0); }
 
 /* room for `need` bytes of command: from the game's memory callback (OUT_OF_COMMAND_MEMORY), or from the host */
 static void cmd_room(Ctx *c, CmdBuf *b, u32 need) {
@@ -1118,7 +1118,7 @@ static u8 *cmd_put(Ctx *c, CmdBuf *b, u32 op, u32 len) {
     return PTR(at + 4);
 }
 
-static void cmdbuf_end(Ctx *c) {
+static NXCC void cmdbuf_end(Ctx *c) {
     CmdBuf *b = cmdbuf(c);
     if (!b) { RET(0); return; }
     cmd_put(c, b, OP_END, 0);
@@ -1134,26 +1134,26 @@ static void cmdbuf_end(Ctx *c) {
 #define EMIT(op, T) CmdBuf *b = cmdbuf(c); if (!b) return; T *p = (T *)cmd_put(c, b, op, sizeof(T))
 #define EMIT_N(op, n) CmdBuf *b = cmdbuf(c); if (!b) return; u8 *p = cmd_put(c, b, op, (u32)(n))
 
-static void cmd_bind_blend(Ctx *c) { EMIT(OP_BLEND, BlendState); *p = *P(BlendState, 1); }
-static void cmd_bind_channel_mask(Ctx *c) { EMIT(OP_CHANNEL_MASK, ChannelMaskState); *p = *P(ChannelMaskState, 1); }
-static void cmd_bind_color(Ctx *c) { EMIT(OP_COLOR, ColorState); *p = *P(ColorState, 1); }
-static void cmd_bind_multisample(Ctx *c) { EMIT(OP_MULTISAMPLE, MultisampleState); *p = *P(MultisampleState, 1); }
-static void cmd_bind_polygon(Ctx *c) { EMIT(OP_POLYGON, PolygonState); *p = *P(PolygonState, 1); }
-static void cmd_bind_depth_stencil(Ctx *c) { EMIT(OP_DEPTH_STENCIL, DepthStencilState); *p = *P(DepthStencilState, 1); }
-static void cmd_bind_vertex_attribs(Ctx *c) {
+static NXCC void cmd_bind_blend(Ctx *c) { EMIT(OP_BLEND, BlendState); *p = *P(BlendState, 1); }
+static NXCC void cmd_bind_channel_mask(Ctx *c) { EMIT(OP_CHANNEL_MASK, ChannelMaskState); *p = *P(ChannelMaskState, 1); }
+static NXCC void cmd_bind_color(Ctx *c) { EMIT(OP_COLOR, ColorState); *p = *P(ColorState, 1); }
+static NXCC void cmd_bind_multisample(Ctx *c) { EMIT(OP_MULTISAMPLE, MultisampleState); *p = *P(MultisampleState, 1); }
+static NXCC void cmd_bind_polygon(Ctx *c) { EMIT(OP_POLYGON, PolygonState); *p = *P(PolygonState, 1); }
+static NXCC void cmd_bind_depth_stencil(Ctx *c) { EMIT(OP_DEPTH_STENCIL, DepthStencilState); *p = *P(DepthStencilState, 1); }
+static NXCC void cmd_bind_vertex_attribs(Ctx *c) {
     u32 n = (u32)A(1) > 32 ? 32 : (u32)A(1);
     EMIT_N(OP_VERTEX_ATTRIBS, 4 + 4 * n);
     memcpy(p, &n, 4);
     memcpy(p + 4, P(void, 2), 4 * n);
 }
-static void cmd_bind_vertex_streams(Ctx *c) {
+static NXCC void cmd_bind_vertex_streams(Ctx *c) {
     u32 n = (u32)A(1) > 32 ? 32 : (u32)A(1);
     EMIT_N(OP_VERTEX_STREAMS, 4 + 8 * n);
     memcpy(p, &n, 4);
     memcpy(p + 4, P(void, 2), 8 * n);
 }
 /* nvnCommandBufferBindProgram(cmd, const NVNprogram *, int stageBits) */
-static void cmd_bind_program(Ctx *c) {
+static NXCC void cmd_bind_program(Ctx *c) {
     Program *pr = obj_get(A(1), T_PROGRAM);
     struct { u64 shaders; u32 stages; } v = {pr ? (u64)(uintptr_t)pr->shaders : 0, (u32)A(2)};
     EMIT_N(OP_PROGRAM, 12);
@@ -1169,25 +1169,25 @@ static void emit_bind(Ctx *c, u32 op, u32 stage, u32 first, u32 count, const voi
     memcpy(p, &h, sizeof h);
     memcpy(p + sizeof h, vals, (size_t)count * each);
 }
-static void cmd_bind_vertex_buffer(Ctx *c) { BufferRange r = {A(2), A(3)}; emit_bind(c, OP_VERTEX_BUFFERS, 0, (u32)A(1), 1, &r, 16); }
-static void cmd_bind_vertex_buffers(Ctx *c) { emit_bind(c, OP_VERTEX_BUFFERS, 0, (u32)A(1), (u32)A(2), P(void, 3), 16); }
-static void cmd_bind_uniform_buffer(Ctx *c) { BufferRange r = {A(3), A(4)}; emit_bind(c, OP_UNIFORM_BUFFERS, (u32)A(1), (u32)A(2), 1, &r, 16); }
-static void cmd_bind_uniform_buffers(Ctx *c) { emit_bind(c, OP_UNIFORM_BUFFERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 16); }
-static void cmd_bind_storage_buffer(Ctx *c) { BufferRange r = {A(3), A(4)}; emit_bind(c, OP_STORAGE_BUFFERS, (u32)A(1), (u32)A(2), 1, &r, 16); }
-static void cmd_bind_storage_buffers(Ctx *c) { emit_bind(c, OP_STORAGE_BUFFERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 16); }
-static void cmd_bind_xfb_buffer(Ctx *c) { BufferRange r = {A(2), A(3)}; emit_bind(c, OP_XFB_BUFFERS, 0, (u32)A(1), 1, &r, 16); }
-static void cmd_bind_xfb_buffers(Ctx *c) { emit_bind(c, OP_XFB_BUFFERS, 0, (u32)A(1), (u32)A(2), P(void, 3), 16); }
-static void cmd_bind_texture(Ctx *c) { u64 h = A(3); emit_bind(c, OP_TEXTURES, (u32)A(1), (u32)A(2), 1, &h, 8); }
-static void cmd_bind_textures(Ctx *c) { emit_bind(c, OP_TEXTURES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
-static void cmd_bind_image(Ctx *c) { u64 h = A(3); emit_bind(c, OP_IMAGES, (u32)A(1), (u32)A(2), 1, &h, 8); }
-static void cmd_bind_images(Ctx *c) { emit_bind(c, OP_IMAGES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
-static void cmd_bind_sep_texture(Ctx *c) { u64 h = A(3); emit_bind(c, OP_SEP_TEXTURES, (u32)A(1), (u32)A(2), 1, &h, 8); }
-static void cmd_bind_sep_textures(Ctx *c) { emit_bind(c, OP_SEP_TEXTURES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
-static void cmd_bind_sep_sampler(Ctx *c) { u64 h = A(3); emit_bind(c, OP_SEP_SAMPLERS, (u32)A(1), (u32)A(2), 1, &h, 8); }
-static void cmd_bind_sep_samplers(Ctx *c) { emit_bind(c, OP_SEP_SAMPLERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
+static NXCC void cmd_bind_vertex_buffer(Ctx *c) { BufferRange r = {A(2), A(3)}; emit_bind(c, OP_VERTEX_BUFFERS, 0, (u32)A(1), 1, &r, 16); }
+static NXCC void cmd_bind_vertex_buffers(Ctx *c) { emit_bind(c, OP_VERTEX_BUFFERS, 0, (u32)A(1), (u32)A(2), P(void, 3), 16); }
+static NXCC void cmd_bind_uniform_buffer(Ctx *c) { BufferRange r = {A(3), A(4)}; emit_bind(c, OP_UNIFORM_BUFFERS, (u32)A(1), (u32)A(2), 1, &r, 16); }
+static NXCC void cmd_bind_uniform_buffers(Ctx *c) { emit_bind(c, OP_UNIFORM_BUFFERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 16); }
+static NXCC void cmd_bind_storage_buffer(Ctx *c) { BufferRange r = {A(3), A(4)}; emit_bind(c, OP_STORAGE_BUFFERS, (u32)A(1), (u32)A(2), 1, &r, 16); }
+static NXCC void cmd_bind_storage_buffers(Ctx *c) { emit_bind(c, OP_STORAGE_BUFFERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 16); }
+static NXCC void cmd_bind_xfb_buffer(Ctx *c) { BufferRange r = {A(2), A(3)}; emit_bind(c, OP_XFB_BUFFERS, 0, (u32)A(1), 1, &r, 16); }
+static NXCC void cmd_bind_xfb_buffers(Ctx *c) { emit_bind(c, OP_XFB_BUFFERS, 0, (u32)A(1), (u32)A(2), P(void, 3), 16); }
+static NXCC void cmd_bind_texture(Ctx *c) { u64 h = A(3); emit_bind(c, OP_TEXTURES, (u32)A(1), (u32)A(2), 1, &h, 8); }
+static NXCC void cmd_bind_textures(Ctx *c) { emit_bind(c, OP_TEXTURES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
+static NXCC void cmd_bind_image(Ctx *c) { u64 h = A(3); emit_bind(c, OP_IMAGES, (u32)A(1), (u32)A(2), 1, &h, 8); }
+static NXCC void cmd_bind_images(Ctx *c) { emit_bind(c, OP_IMAGES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
+static NXCC void cmd_bind_sep_texture(Ctx *c) { u64 h = A(3); emit_bind(c, OP_SEP_TEXTURES, (u32)A(1), (u32)A(2), 1, &h, 8); }
+static NXCC void cmd_bind_sep_textures(Ctx *c) { emit_bind(c, OP_SEP_TEXTURES, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
+static NXCC void cmd_bind_sep_sampler(Ctx *c) { u64 h = A(3); emit_bind(c, OP_SEP_SAMPLERS, (u32)A(1), (u32)A(2), 1, &h, 8); }
+static NXCC void cmd_bind_sep_samplers(Ctx *c) { emit_bind(c, OP_SEP_SAMPLERS, (u32)A(1), (u32)A(2), (u32)A(3), P(void, 4), 8); }
 
 /* nvnCommandBufferUpdateUniformBuffer(cmd, buffer, size_t bufferSize, ptrdiff_t offset, size_t size, data) */
-static void cmd_update_ubo(Ctx *c) {
+static NXCC void cmd_update_ubo(Ctx *c) {
     u32 len = (u32)A(4) > 0x10000 ? 0x10000 : (u32)A(4);
     CmdUpdateUbo h = {A(1), A(2), A(3), len};
     EMIT_N(OP_UPDATE_UBO, sizeof h + len);
@@ -1196,37 +1196,37 @@ static void cmd_update_ubo(Ctx *c) {
 }
 
 static void emit_draw(Ctx *c, const CmdDraw *d) { EMIT(d->index_type != ~0u ? OP_DRAW_ELEMENTS : OP_DRAW_ARRAYS, CmdDraw); *p = *d; }
-static void cmd_draw_arrays(Ctx *c) { CmdDraw d = {(u32)A(1), ~0u, (u32)A(2), (u32)A(3), 0, 0, 1, 0}; emit_draw(c, &d); }
-static void cmd_draw_arrays_instanced(Ctx *c) { CmdDraw d = {(u32)A(1), ~0u, (u32)A(2), (u32)A(3), 0, (u32)A(4), (u32)A(5), 0}; emit_draw(c, &d); }
-static void cmd_draw_elements(Ctx *c) { CmdDraw d = {(u32)A(1), (u32)A(2), 0, (u32)A(3), 0, 0, 1, A(4)}; emit_draw(c, &d); }
-static void cmd_draw_elements_base_vertex(Ctx *c) { CmdDraw d = {(u32)A(1), (u32)A(2), 0, (u32)A(3), (s32)A(5), 0, 1, A(4)}; emit_draw(c, &d); }
-static void cmd_draw_elements_instanced(Ctx *c) {
+static NXCC void cmd_draw_arrays(Ctx *c) { CmdDraw d = {(u32)A(1), ~0u, (u32)A(2), (u32)A(3), 0, 0, 1, 0}; emit_draw(c, &d); }
+static NXCC void cmd_draw_arrays_instanced(Ctx *c) { CmdDraw d = {(u32)A(1), ~0u, (u32)A(2), (u32)A(3), 0, (u32)A(4), (u32)A(5), 0}; emit_draw(c, &d); }
+static NXCC void cmd_draw_elements(Ctx *c) { CmdDraw d = {(u32)A(1), (u32)A(2), 0, (u32)A(3), 0, 0, 1, A(4)}; emit_draw(c, &d); }
+static NXCC void cmd_draw_elements_base_vertex(Ctx *c) { CmdDraw d = {(u32)A(1), (u32)A(2), 0, (u32)A(3), (s32)A(5), 0, 1, A(4)}; emit_draw(c, &d); }
+static NXCC void cmd_draw_elements_instanced(Ctx *c) {
     CmdDraw d = {(u32)A(1), (u32)A(2), 0, (u32)A(3), (s32)A(5), (u32)A(6), (u32)A(7), A(4)};
     emit_draw(c, &d);
 }
-static void cmd_draw_arrays_indirect(Ctx *c) { EMIT(OP_DRAW_ARRAYS_INDIRECT, CmdDrawIndirect); *p = (CmdDrawIndirect){(u32)A(1), ~0u, 0, A(2), 0, 1, 16}; }
-static void cmd_draw_elements_indirect(Ctx *c) { EMIT(OP_DRAW_ELEMENTS_INDIRECT, CmdDrawIndirect); *p = (CmdDrawIndirect){(u32)A(1), (u32)A(2), A(3), A(4), 0, 1, 20}; }
+static NXCC void cmd_draw_arrays_indirect(Ctx *c) { EMIT(OP_DRAW_ARRAYS_INDIRECT, CmdDrawIndirect); *p = (CmdDrawIndirect){(u32)A(1), ~0u, 0, A(2), 0, 1, 16}; }
+static NXCC void cmd_draw_elements_indirect(Ctx *c) { EMIT(OP_DRAW_ELEMENTS_INDIRECT, CmdDrawIndirect); *p = (CmdDrawIndirect){(u32)A(1), (u32)A(2), A(3), A(4), 0, 1, 20}; }
 /* MultiDrawArraysIndirectCount(cmd, mode, indirect, parameterBuffer, maxDrawCount, stride) */
-static void cmd_multi_draw_arrays(Ctx *c) {
+static NXCC void cmd_multi_draw_arrays(Ctx *c) {
     EMIT(OP_MULTI_DRAW_INDIRECT, CmdDrawIndirect);
     *p = (CmdDrawIndirect){(u32)A(1), ~0u, 0, A(2), A(3), (u32)A(4), (u32)A(5)};
 }
 /* MultiDrawElementsIndirectCount(cmd, mode, type, indexBuffer, indirect, parameterBuffer, maxDrawCount, stride):
  * eight arguments, so the stride is x7 (it was read from the stack, as a ninth would be) */
-static void cmd_multi_draw_elements(Ctx *c) {
+static NXCC void cmd_multi_draw_elements(Ctx *c) {
     EMIT(OP_MULTI_DRAW_INDIRECT, CmdDrawIndirect);
     *p = (CmdDrawIndirect){(u32)A(1), (u32)A(2), A(3), A(4), A(5), (u32)A(6), (u32)A(7)};
 }
-static void cmd_dispatch(Ctx *c) { u32 v[3] = {(u32)A(1), (u32)A(2), (u32)A(3)}; EMIT_N(OP_DISPATCH, 12); memcpy(p, v, 12); }
-static void cmd_dispatch_indirect(Ctx *c) { u64 a = A(1); EMIT_N(OP_DISPATCH_INDIRECT, 8); memcpy(p, &a, 8); }
+static NXCC void cmd_dispatch(Ctx *c) { u32 v[3] = {(u32)A(1), (u32)A(2), (u32)A(3)}; EMIT_N(OP_DISPATCH, 12); memcpy(p, v, 12); }
+static NXCC void cmd_dispatch_indirect(Ctx *c) { u64 a = A(1); EMIT_N(OP_DISPATCH_INDIRECT, 8); memcpy(p, &a, 8); }
 /* nvnCommandBufferDrawTexture(cmd, NVNtextureHandle, const NVNdrawTextureRegion *dst, const ... *src) */
-static void cmd_draw_texture(Ctx *c) {
+static NXCC void cmd_draw_texture(Ctx *c) {
     EMIT(OP_DRAW_TEXTURE, CmdDrawTexture);
     p->handle = A(1);
     memcpy(p->dst, P(void, 2), 16);
     memcpy(p->src, P(void, 3), 16);
 }
-static void cmd_draw_xfb(Ctx *c) { u32 m = (u32)A(1); u64 a = A(2); EMIT_N(OP_DRAW_XFB, 12); memcpy(p, &m, 4); memcpy(p + 4, &a, 8); }
+static NXCC void cmd_draw_xfb(Ctx *c) { u32 m = (u32)A(1); u64 a = A(2); EMIT_N(OP_DRAW_XFB, 12); memcpy(p, &m, 4); memcpy(p + 4, &a, 8); }
 
 static void emit_range(Ctx *c, u32 op, u32 first, u32 count, const void *vals, u32 each) {
     if (count > 16) count = 16;
@@ -1235,13 +1235,13 @@ static void emit_range(Ctx *c, u32 op, u32 first, u32 count, const void *vals, u
     memcpy(p, &h, sizeof h);
     memcpy(p + sizeof h, vals, (size_t)count * each);
 }
-static void cmd_viewport(Ctx *c) { float v[4] = {(float)(s32)A(1), (float)(s32)A(2), (float)(s32)A(3), (float)(s32)A(4)}; emit_range(c, OP_VIEWPORTS, 0, 1, v, 16); }
-static void cmd_viewports(Ctx *c) { emit_range(c, OP_VIEWPORTS, (u32)A(1), (u32)A(2), P(void, 3), 16); }
-static void cmd_scissor(Ctx *c) { s32 v[4] = {(s32)A(1), (s32)A(2), (s32)A(3), (s32)A(4)}; emit_range(c, OP_SCISSORS, 0, 1, v, 16); }
-static void cmd_scissors(Ctx *c) { emit_range(c, OP_SCISSORS, (u32)A(1), (u32)A(2), P(void, 3), 16); }
-static void cmd_depth_range(Ctx *c) { float v[2] = {F32(0), F32(1)}; emit_range(c, OP_DEPTH_RANGES, 0, 1, v, 8); }
-static void cmd_depth_ranges(Ctx *c) { emit_range(c, OP_DEPTH_RANGES, (u32)A(1), (u32)A(2), P(void, 3), 8); }
-static void cmd_depth_bounds(Ctx *c) {
+static NXCC void cmd_viewport(Ctx *c) { float v[4] = {(float)(s32)A(1), (float)(s32)A(2), (float)(s32)A(3), (float)(s32)A(4)}; emit_range(c, OP_VIEWPORTS, 0, 1, v, 16); }
+static NXCC void cmd_viewports(Ctx *c) { emit_range(c, OP_VIEWPORTS, (u32)A(1), (u32)A(2), P(void, 3), 16); }
+static NXCC void cmd_scissor(Ctx *c) { s32 v[4] = {(s32)A(1), (s32)A(2), (s32)A(3), (s32)A(4)}; emit_range(c, OP_SCISSORS, 0, 1, v, 16); }
+static NXCC void cmd_scissors(Ctx *c) { emit_range(c, OP_SCISSORS, (u32)A(1), (u32)A(2), P(void, 3), 16); }
+static NXCC void cmd_depth_range(Ctx *c) { float v[2] = {F32(0), F32(1)}; emit_range(c, OP_DEPTH_RANGES, 0, 1, v, 8); }
+static NXCC void cmd_depth_ranges(Ctx *c) { emit_range(c, OP_DEPTH_RANGES, (u32)A(1), (u32)A(2), P(void, 3), 8); }
+static NXCC void cmd_depth_bounds(Ctx *c) {
     u32 e = (u32)A(1) & 1;
     float v[2] = {F32(0), F32(1)};
     EMIT_N(OP_DEPTH_BOUNDS, 12);
@@ -1250,22 +1250,22 @@ static void cmd_depth_bounds(Ctx *c) {
 }
 static void emit_u32x2(Ctx *c, u32 op, u32 a, u32 b2) { EMIT_N(op, 8); memcpy(p, &a, 4); memcpy(p + 4, &b2, 4); }
 static void emit_floats(Ctx *c, u32 op, const float *v, u32 n) { EMIT_N(op, 4 * n); memcpy(p, v, 4 * n); }
-static void cmd_stencil_value_mask(Ctx *c) { emit_u32x2(c, OP_STENCIL_VALUE_MASK, (u32)A(1), (u32)A(2)); }
-static void cmd_stencil_mask(Ctx *c) { emit_u32x2(c, OP_STENCIL_MASK, (u32)A(1), (u32)A(2)); }
-static void cmd_stencil_ref(Ctx *c) { emit_u32x2(c, OP_STENCIL_REF, (u32)A(1), (u32)A(2)); }
-static void cmd_blend_color(Ctx *c) { float v[4]; memcpy(v, P(void, 1), 16); emit_floats(c, OP_BLEND_COLOR, v, 4); }
-static void cmd_point_size(Ctx *c) { float f = F32(0); emit_floats(c, OP_POINT_SIZE, &f, 1); }
-static void cmd_line_width(Ctx *c) { float f = F32(0); emit_floats(c, OP_LINE_WIDTH, &f, 1); }
-static void cmd_polygon_offset(Ctx *c) { float f[3] = {F32(0), F32(1), F32(2)}; emit_floats(c, OP_POLYGON_OFFSET, f, 3); }
-static void cmd_alpha_ref(Ctx *c) { float f = F32(0); emit_floats(c, OP_ALPHA_REF, &f, 1); }
-static void cmd_sample_mask(Ctx *c) { emit_u32x2(c, OP_SAMPLE_MASK, (u32)A(1), 0); }
-static void cmd_rasterizer_discard(Ctx *c) { emit_u32x2(c, OP_RASTERIZER_DISCARD, (u32)A(1) & 1, 0); }
-static void cmd_depth_clamp(Ctx *c) { emit_u32x2(c, OP_DEPTH_CLAMP, (u32)A(1) & 1, 0); }
-static void cmd_primitive_restart(Ctx *c) { emit_u32x2(c, OP_PRIMITIVE_RESTART, (u32)A(1) & 1, (u32)A(2)); }
-static void cmd_patch_size(Ctx *c) { emit_u32x2(c, OP_PATCH_SIZE, (u32)A(1), 0); }
-static void cmd_render_enable(Ctx *c) { emit_u32x2(c, OP_RENDER_ENABLE, (u32)A(1) & 1, 0); }
+static NXCC void cmd_stencil_value_mask(Ctx *c) { emit_u32x2(c, OP_STENCIL_VALUE_MASK, (u32)A(1), (u32)A(2)); }
+static NXCC void cmd_stencil_mask(Ctx *c) { emit_u32x2(c, OP_STENCIL_MASK, (u32)A(1), (u32)A(2)); }
+static NXCC void cmd_stencil_ref(Ctx *c) { emit_u32x2(c, OP_STENCIL_REF, (u32)A(1), (u32)A(2)); }
+static NXCC void cmd_blend_color(Ctx *c) { float v[4]; memcpy(v, P(void, 1), 16); emit_floats(c, OP_BLEND_COLOR, v, 4); }
+static NXCC void cmd_point_size(Ctx *c) { float f = F32(0); emit_floats(c, OP_POINT_SIZE, &f, 1); }
+static NXCC void cmd_line_width(Ctx *c) { float f = F32(0); emit_floats(c, OP_LINE_WIDTH, &f, 1); }
+static NXCC void cmd_polygon_offset(Ctx *c) { float f[3] = {F32(0), F32(1), F32(2)}; emit_floats(c, OP_POLYGON_OFFSET, f, 3); }
+static NXCC void cmd_alpha_ref(Ctx *c) { float f = F32(0); emit_floats(c, OP_ALPHA_REF, &f, 1); }
+static NXCC void cmd_sample_mask(Ctx *c) { emit_u32x2(c, OP_SAMPLE_MASK, (u32)A(1), 0); }
+static NXCC void cmd_rasterizer_discard(Ctx *c) { emit_u32x2(c, OP_RASTERIZER_DISCARD, (u32)A(1) & 1, 0); }
+static NXCC void cmd_depth_clamp(Ctx *c) { emit_u32x2(c, OP_DEPTH_CLAMP, (u32)A(1) & 1, 0); }
+static NXCC void cmd_primitive_restart(Ctx *c) { emit_u32x2(c, OP_PRIMITIVE_RESTART, (u32)A(1) & 1, (u32)A(2)); }
+static NXCC void cmd_patch_size(Ctx *c) { emit_u32x2(c, OP_PATCH_SIZE, (u32)A(1), 0); }
+static NXCC void cmd_render_enable(Ctx *c) { emit_u32x2(c, OP_RENDER_ENABLE, (u32)A(1) & 1, 0); }
 /* nvnCommandBufferSetRenderEnableConditional(cmd, mode, counters): not done (draws render regardless); logged */
-static void cmd_render_enable_cond(Ctx *c) {
+static NXCC void cmd_render_enable_cond(Ctx *c) {
     static u64 n;
     if (n++ < 4) hlog(0, "nvn: SetRenderEnableConditional(mode %u, counters %llx) (call %llu): ignored", (u32)A(1), A(2), n);
 }
@@ -1282,7 +1282,7 @@ static bool texref(u64 tex, u64 view, TexRef *r) {
 
 /* nvnCommandBufferSetRenderTargets(cmd, int n, const NVNtexture *const *colors, const NVNtextureView *const *views,
  *                                  const NVNtexture *depth, const NVNtextureView *depthView) */
-static void cmd_render_targets(Ctx *c) {
+static NXCC void cmd_render_targets(Ctx *c) {
     u32 n = (u32)A(1) > 8 ? 8 : (u32)A(1);
     TexRef refs[9];
     for (u32 i = 0; i < n; i++)
@@ -1300,11 +1300,11 @@ static void clear_color(Ctx *c, u32 type) {
     EMIT(OP_CLEAR_COLOR, CmdClearColor);
     *p = v;
 }
-static void cmd_clear_color(Ctx *c) { clear_color(c, 0); }
-static void cmd_clear_color_i(Ctx *c) { clear_color(c, 1); }
-static void cmd_clear_color_ui(Ctx *c) { clear_color(c, 2); }
+static NXCC void cmd_clear_color(Ctx *c) { clear_color(c, 0); }
+static NXCC void cmd_clear_color_i(Ctx *c) { clear_color(c, 1); }
+static NXCC void cmd_clear_color_ui(Ctx *c) { clear_color(c, 2); }
 /* nvnCommandBufferClearDepthStencil(cmd, float depth, NVNboolean depthMask, int stencil, int stencilMask) */
-static void cmd_clear_depth_stencil(Ctx *c) {
+static NXCC void cmd_clear_depth_stencil(Ctx *c) {
     CmdClearDS v = {F32(0), (u32)A(1) & 1, (u32)A(2), (u32)A(3)};
     EMIT(OP_CLEAR_DEPTH_STENCIL, CmdClearDS);
     *p = v;
@@ -1320,14 +1320,14 @@ static void clear_texture(Ctx *c, u32 type) {
     EMIT(OP_CLEAR_TEXTURE, CmdClearTexture);
     *p = v;
 }
-static void cmd_clear_texture(Ctx *c) { clear_texture(c, 0); }
-static void cmd_clear_texture_i(Ctx *c) { clear_texture(c, 1); }
-static void cmd_clear_texture_ui(Ctx *c) { clear_texture(c, 2); }
-static void cmd_discard_color(Ctx *c) { emit_u32x2(c, OP_DISCARD, (u32)A(1), 0); }
-static void cmd_discard_depth_stencil(Ctx *c) { emit_u32x2(c, OP_DISCARD, ~0u, 0); }
+static NXCC void cmd_clear_texture(Ctx *c) { clear_texture(c, 0); }
+static NXCC void cmd_clear_texture_i(Ctx *c) { clear_texture(c, 1); }
+static NXCC void cmd_clear_texture_ui(Ctx *c) { clear_texture(c, 2); }
+static NXCC void cmd_discard_color(Ctx *c) { emit_u32x2(c, OP_DISCARD, (u32)A(1), 0); }
+static NXCC void cmd_discard_depth_stencil(Ctx *c) { emit_u32x2(c, OP_DISCARD, ~0u, 0); }
 
 /* nvnCommandBufferCopyBufferToTexture(cmd, buffer, dstTex, dstView, dstRegion, flags) */
-static void cmd_copy_buffer_to_texture(Ctx *c) {
+static NXCC void cmd_copy_buffer_to_texture(Ctx *c) {
     CmdBuf *b0 = cmdbuf(c);
     CmdCopyBT v;
     if (!b0 || !texref(A(2), A(3), &v.tex)) return;
@@ -1337,7 +1337,7 @@ static void cmd_copy_buffer_to_texture(Ctx *c) {
     *p = v;
 }
 /* nvnCommandBufferCopyTextureToBuffer(cmd, srcTex, srcView, srcRegion, buffer, flags) */
-static void cmd_copy_texture_to_buffer(Ctx *c) {
+static NXCC void cmd_copy_texture_to_buffer(Ctx *c) {
     CmdBuf *b0 = cmdbuf(c);
     CmdCopyBT v;
     if (!b0 || !texref(A(1), A(2), &v.tex)) return;
@@ -1347,62 +1347,62 @@ static void cmd_copy_texture_to_buffer(Ctx *c) {
     *p = v;
 }
 /* nvnCommandBufferCopyTextureToTexture(cmd, src, srcView, srcRegion, dst, dstView, dstRegion, flags) */
-static void cmd_copy_texture_to_texture(Ctx *c) {
+static NXCC void cmd_copy_texture_to_texture(Ctx *c) {
     CmdCopyTT v;
     if (!texref(A(1), A(2), &v.src) || !texref(A(4), A(5), &v.dst)) return;
     v.sr = *P(CopyRegion, 3); v.dr = *P(CopyRegion, 6); v.flags = (u32)A(7);
     EMIT(OP_COPY_TEXTURE_TO_TEXTURE, CmdCopyTT);
     *p = v;
 }
-static void cmd_copy_buffer(Ctx *c) { CmdCopyBuffer v = {A(1), A(2), A(3), (u32)A(4)}; EMIT(OP_COPY_BUFFER, CmdCopyBuffer); *p = v; }
-static void cmd_clear_buffer(Ctx *c) { CmdClearBuffer v = {A(1), A(2), (u32)A(3)}; EMIT(OP_CLEAR_BUFFER, CmdClearBuffer); *p = v; }
+static NXCC void cmd_copy_buffer(Ctx *c) { CmdCopyBuffer v = {A(1), A(2), A(3), (u32)A(4)}; EMIT(OP_COPY_BUFFER, CmdCopyBuffer); *p = v; }
+static NXCC void cmd_clear_buffer(Ctx *c) { CmdClearBuffer v = {A(1), A(2), (u32)A(3)}; EMIT(OP_CLEAR_BUFFER, CmdClearBuffer); *p = v; }
 /* Downsample(cmd, src, dst) and DownsampleTextureView(cmd, src, srcView, dst, dstView) */
-static void cmd_downsample(Ctx *c) {
+static NXCC void cmd_downsample(Ctx *c) {
     CmdDownsample v;
     if (!texref(A(1), 0, &v.src) || !texref(A(2), 0, &v.dst)) return;
     EMIT(OP_DOWNSAMPLE, CmdDownsample);
     *p = v;
 }
-static void cmd_downsample_view(Ctx *c) {
+static NXCC void cmd_downsample_view(Ctx *c) {
     CmdDownsample v;
     if (!texref(A(1), A(2), &v.src) || !texref(A(3), A(4), &v.dst)) return;
     EMIT(OP_DOWNSAMPLE, CmdDownsample);
     *p = v;
 }
-static void cmd_barrier(Ctx *c) { emit_u32x2(c, OP_BARRIER, (u32)A(1), 0); }
+static NXCC void cmd_barrier(Ctx *c) { emit_u32x2(c, OP_BARRIER, (u32)A(1), 0); }
 /* nvnCommandBufferFenceSync(cmd, sync, condition, flags) / WaitSync(cmd, sync) */
-static void cmd_fence_sync(Ctx *c) { CmdSync v = {A(1), (u32)A(2), (u32)A(3)}; EMIT(OP_FENCE_SYNC, CmdSync); *p = v; }
-static void cmd_wait_sync(Ctx *c) { CmdSync v = {A(1), 0, 0}; EMIT(OP_WAIT_SYNC, CmdSync); *p = v; }
+static NXCC void cmd_fence_sync(Ctx *c) { CmdSync v = {A(1), (u32)A(2), (u32)A(3)}; EMIT(OP_FENCE_SYNC, CmdSync); *p = v; }
+static NXCC void cmd_wait_sync(Ctx *c) { CmdSync v = {A(1), 0, 0}; EMIT(OP_WAIT_SYNC, CmdSync); *p = v; }
 
 /* ---------------------------------------------------------------------------------------------- events */
 typedef struct EventBuilder { u64 pool, offset; } EventBuilder;
 typedef struct Event { u64 addr, gpu; } Event;
-static void eb_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(EventBuilder)); }
-static void eb_storage(Ctx *c) { P(EventBuilder, 0)->pool = A(1); P(EventBuilder, 0)->offset = A(2); }
-static void event_initialize(Ctx *c) {
+static NXCC void eb_defaults(Ctx *c) { memset(P(void, 0), 0, sizeof(EventBuilder)); }
+static NXCC void eb_storage(Ctx *c) { P(EventBuilder, 0)->pool = A(1); P(EventBuilder, 0)->offset = A(2); }
+static NXCC void event_initialize(Ctx *c) {
     EventBuilder *b = P(EventBuilder, 1);
     Event *e = obj_new(A(0), T_EVENT, sizeof(Event));
     e->addr = pool_storage(b->pool) + b->offset;
     e->gpu = pool_gpu(b->pool) + b->offset;
     RET(1);
 }
-static void event_finalize(Ctx *c) { obj_free(A(0)); }
-static void event_get_value(Ctx *c) { Event *e = obj_get(A(0), T_EVENT); RET(e && e->addr ? LD32(e->addr) : 0); }
+static NXCC void event_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void event_get_value(Ctx *c) { Event *e = obj_get(A(0), T_EVENT); RET(e && e->addr ? LD32(e->addr) : 0); }
 /* nvnEventSignal(event, mode (0 write, 1 add), value) */
-static void nvn_event_signal(Ctx *c) {
+static NXCC void nvn_event_signal(Ctx *c) {
     Event *e = obj_get(A(0), T_EVENT);
     if (!e || !e->addr) return;
     ST32(e->addr, (u32)A(1) == 1 ? LD32(e->addr) + (u32)A(2) : (u32)A(2));
 }
 /* nvnCommandBufferSignalEvent(cmd, event, mode, location, flags, value) / WaitEvent(cmd, event, mode, value) */
-static void cmd_signal_event(Ctx *c) {
+static NXCC void cmd_signal_event(Ctx *c) {
     Event *e = obj_get(A(1), T_EVENT);
     if (!e) return;
     CmdEvent v = {e->addr, (u32)A(2), (u32)A(5), (u32)A(3), (u32)A(4)};
     EMIT(OP_SIGNAL_EVENT, CmdEvent);
     *p = v;
 }
-static void cmd_wait_event(Ctx *c) {
+static NXCC void cmd_wait_event(Ctx *c) {
     Event *e = obj_get(A(1), T_EVENT);
     if (!e) return;
     CmdEvent v = {e->addr, (u32)A(2), (u32)A(3), 0, 0};
@@ -1410,26 +1410,26 @@ static void cmd_wait_event(Ctx *c) {
     *p = v;
 }
 /* nvnCommandBufferReportCounter(cmd, counter, address), ResetCounter(cmd, counter), ReportValue(cmd, value, addr) */
-static void cmd_report_counter(Ctx *c) { CmdReport v = {(u32)A(1), 0, A(2)}; EMIT(OP_REPORT_COUNTER, CmdReport); *p = v; }
-static void cmd_reset_counter(Ctx *c) { CmdReport v = {(u32)A(1), 0, 0}; EMIT(OP_RESET_COUNTER, CmdReport); *p = v; }
-static void cmd_report_value(Ctx *c) { CmdReport v = {0, (u32)A(1), A(2)}; EMIT(OP_REPORT_VALUE, CmdReport); *p = v; }
+static NXCC void cmd_report_counter(Ctx *c) { CmdReport v = {(u32)A(1), 0, A(2)}; EMIT(OP_REPORT_COUNTER, CmdReport); *p = v; }
+static NXCC void cmd_reset_counter(Ctx *c) { CmdReport v = {(u32)A(1), 0, 0}; EMIT(OP_RESET_COUNTER, CmdReport); *p = v; }
+static NXCC void cmd_report_value(Ctx *c) { CmdReport v = {0, (u32)A(1), A(2)}; EMIT(OP_REPORT_VALUE, CmdReport); *p = v; }
 /* nvnDeviceGetTimestampInNanoseconds(device, const NVNcounterData *): the GPU writes our nanoseconds */
-static void device_counter_ns(Ctx *c) { RET(A(1) ? LD64(A(1) + 8) : 0); }
+static NXCC void device_counter_ns(Ctx *c) { RET(A(1) ? LD64(A(1) + 8) : 0); }
 
-static void cmd_texture_pool(Ctx *c) {
+static NXCC void cmd_texture_pool(Ctx *c) {
     DescPool *d = descpool(A(1));
     CmdPool v = {d ? d->cpu : 0, d ? d->count : 0};
     EMIT(OP_TEXTURE_POOL, CmdPool);
     *p = v;
 }
-static void cmd_sampler_pool(Ctx *c) {
+static NXCC void cmd_sampler_pool(Ctx *c) {
     DescPool *d = descpool(A(1));
     CmdPool v = {d ? d->cpu : 0, d ? d->count : 0};
     EMIT(OP_SAMPLER_POOL, CmdPool);
     *p = v;
 }
 /* nvnCommandBufferCallCommands(cmd, int n, const NVNcommandHandle *) */
-static void cmd_call_commands(Ctx *c) {
+static NXCC void cmd_call_commands(Ctx *c) {
     u32 n = (u32)A(1);
     u64 list = A(2);
     for (u32 i = 0; i < n; i++) {
@@ -1450,7 +1450,7 @@ static void copy_stream(Ctx *c, CmdBuf *b, u64 at, int depth) {
         at += 4 + len;
     }
 }
-static void cmd_copy_commands(Ctx *c) {
+static NXCC void cmd_copy_commands(Ctx *c) {
     CmdBuf *b = cmdbuf(c);
     if (!b) return;
     u32 n = (u32)A(1);
@@ -1459,22 +1459,22 @@ static void cmd_copy_commands(Ctx *c) {
 }
 /* transform feedback: Begin / End / Pause / Resume (cmd, NVNbufferAddress) */
 static void cmd_xfb(Ctx *c, u32 kind) { u64 a = A(1); EMIT_N(OP_XFB, 12); memcpy(p, &kind, 4); memcpy(p + 4, &a, 8); }
-static void cmd_xfb_begin(Ctx *c) { cmd_xfb(c, 0); }
-static void cmd_xfb_end(Ctx *c) { cmd_xfb(c, 1); }
-static void cmd_xfb_pause(Ctx *c) { cmd_xfb(c, 2); }
-static void cmd_xfb_resume(Ctx *c) { cmd_xfb(c, 3); }
+static NXCC void cmd_xfb_begin(Ctx *c) { cmd_xfb(c, 0); }
+static NXCC void cmd_xfb_end(Ctx *c) { cmd_xfb(c, 1); }
+static NXCC void cmd_xfb_pause(Ctx *c) { cmd_xfb(c, 2); }
+static NXCC void cmd_xfb_resume(Ctx *c) { cmd_xfb(c, 3); }
 
 /* ---------------------------------------------------------------------------------------------- windows */
 typedef struct WinBuilder { u64 device, native, textures; u32 count, interval; } WinBuilder;   /* 0x40 */
 
-static void wb_defaults(Ctx *c) { WinBuilder *b = P(WinBuilder, 0); memset(b, 0, 0x40); b->interval = 1; }
-static void wb_device(Ctx *c) { P(WinBuilder, 0)->device = A(1); }
-static void wb_native(Ctx *c) { P(WinBuilder, 0)->native = A(1); }
-static void wb_textures(Ctx *c) { P(WinBuilder, 0)->count = (u32)A(1); P(WinBuilder, 0)->textures = A(2); }
-static void wb_interval(Ctx *c) { P(WinBuilder, 0)->interval = (u32)A(1); }
-static void wb_get_native(Ctx *c) { RET(P(WinBuilder, 0)->native); }
-static void wb_get_interval(Ctx *c) { RET(P(WinBuilder, 0)->interval); }
-static void win_initialize(Ctx *c) {
+static NXCC void wb_defaults(Ctx *c) { WinBuilder *b = P(WinBuilder, 0); memset(b, 0, 0x40); b->interval = 1; }
+static NXCC void wb_device(Ctx *c) { P(WinBuilder, 0)->device = A(1); }
+static NXCC void wb_native(Ctx *c) { P(WinBuilder, 0)->native = A(1); }
+static NXCC void wb_textures(Ctx *c) { P(WinBuilder, 0)->count = (u32)A(1); P(WinBuilder, 0)->textures = A(2); }
+static NXCC void wb_interval(Ctx *c) { P(WinBuilder, 0)->interval = (u32)A(1); }
+static NXCC void wb_get_native(Ctx *c) { RET(P(WinBuilder, 0)->native); }
+static NXCC void wb_get_interval(Ctx *c) { RET(P(WinBuilder, 0)->interval); }
+static NXCC void win_initialize(Ctx *c) {
     WinBuilder *b = P(WinBuilder, 1);
     Window *w = obj_new(A(0), T_WINDOW, sizeof(Window));
     w->native = b->native;
@@ -1492,11 +1492,11 @@ static void win_initialize(Ctx *c) {
     gpu_window_created(w);
     RET(1);
 }
-static void win_finalize(Ctx *c) { obj_free(A(0)); }
+static NXCC void win_finalize(Ctx *c) { obj_free(A(0)); }
 /* acquire the next texture in turn; it is free once its last present has read it, i.e. once the work that present
  * waited for is done (the copy to the swapchain is queued before any later work). Not all work so far: waiting on
  * that kept the game from building a frame while the GPU drew the one before */
-static void win_acquire(Ctx *c) {
+static NXCC void win_acquire(Ctx *c) {
     Window *w = obj_get(A(0), T_WINDOW);
     Sync *s = obj_get(A(1), T_SYNC);
     if (!w || !w->count) {
@@ -1509,7 +1509,7 @@ static void win_acquire(Ctx *c) {
     w->next = (w->next + 1) % w->count;
     RET(0);
 }
-static void queue_acquire(Ctx *c) {
+static NXCC void queue_acquire(Ctx *c) {
     Window *w = obj_get(A(1), T_WINDOW);
     if (!w || !w->count) { RET(1); return; }
     if (A(2)) ST32(A(2), w->next);
@@ -1587,7 +1587,7 @@ static void hold_present(s64 start, s64 period, s64 freq) {
 }
 
 /* present, then keep the pace: the display's (60 Hz / the game's interval) or the frame rate set */
-static void queue_present(Ctx *c) {
+static NXCC void queue_present(Ctx *c) {
     Window *w = obj_get(A(1), T_WINDOW);
     if (!w) return;
     u32 index = (u32)A(2);
@@ -1651,16 +1651,16 @@ static void queue_present(Ctx *c) {
         kernel_report_cpu(frames);
     }
 }
-static void win_get_native(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->native : 0); }
-static void win_get_interval(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->interval : 0); }
-static void win_set_interval(Ctx *c) {
+static NXCC void win_get_native(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->native : 0); }
+static NXCC void win_get_interval(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); RET(w ? w->interval : 0); }
+static NXCC void win_set_interval(Ctx *c) {
     Window *w = obj_get(A(0), T_WINDOW);
     if (!w) return;
     if (w->interval != (u32)A(1)) hlog(1, "nvn: present interval %u", (u32)A(1));
     w->interval = (u32)A(1);
 }
-static void win_set_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w) for (int i = 0; i < 4; i++) w->crop[i] = (s32)A(1 + i); }
-static void win_get_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w && A(1)) memcpy(P(void, 1), w->crop, 16); }
+static NXCC void win_set_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w) for (int i = 0; i < 4; i++) w->crop[i] = (s32)A(1 + i); }
+static NXCC void win_get_crop(Ctx *c) { Window *w = obj_get(A(0), T_WINDOW); if (w && A(1)) memcpy(P(void, 1), w->crop, 16); }
 
 /* ---------------------------------------------------------------------------------------------- the table */
 static const NvnProc procs[] = {
@@ -2159,15 +2159,15 @@ static const NvnProc procs[] = {
 };
 
 /* ---------------------------------------------------------------------------------------------- lookup */
-static void nvn_get_proc_address(Ctx *c);
-static void bootstrap_loader(Ctx *c);
+static NXCC void nvn_get_proc_address(Ctx *c);
+static NXCC void bootstrap_loader(Ctx *c);
 
 /* names handed out so far, each with its host-call address */
 static struct { char name[96]; u64 addr; bool warned; } given[1024];
 static int ngiven;
 static SRWLOCK lock = SRWLOCK_INIT;
 
-static void unimplemented(Ctx *c) {
+static NXCC void unimplemented(Ctx *c) {
     for (int i = 0; i < ngiven; i++)
         if (given[i].addr == c->pc) {
             if (!given[i].warned) {
@@ -2203,16 +2203,16 @@ static u64 proc_address(const char *name) {
     return a;
 }
 
-static void bootstrap_loader(Ctx *c) { c->x[0] = proc_address((const char *)(uintptr_t)c->x[0]); }
-static void nvn_get_proc_address(Ctx *c) { c->x[0] = proc_address((const char *)(uintptr_t)c->x[1]); }
+static NXCC void bootstrap_loader(Ctx *c) { c->x[0] = proc_address((const char *)(uintptr_t)c->x[0]); }
+static NXCC void nvn_get_proc_address(Ctx *c) { c->x[0] = proc_address((const char *)(uintptr_t)c->x[1]); }
 
 /* the sdk entry points main calls (a64lift overrides, see tools/lifter/overrides.txt) */
-void h_nvnBootstrapLoader(Ctx *c) { bootstrap_loader(c); }
-void h__ZN2nv18InitializeGraphicsEPvm(Ctx *c) {
+NXCC void h_nvnBootstrapLoader(Ctx *c) { bootstrap_loader(c); }
+NXCC void h__ZN2nv18InitializeGraphicsEPvm(Ctx *c) {
     hlog(1, "nv::InitializeGraphics(%llx, %llx): ignored", c->x[0], c->x[1]);
 }
-void h__ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c) {}
-void h__ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c) {}
+NXCC void h__ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c) {}
+NXCC void h__ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_(Ctx *c) {}
 
 /* the same functions reached through pointers */
 void nvn_init(void) {
