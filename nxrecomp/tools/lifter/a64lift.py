@@ -16,14 +16,19 @@ Instruction semantics live in a64insn.py (integer, branches, loads and stores, s
 Usage:
     python a64lift.py cover <module> [...]                 coverage statistics, nothing written
     python a64lift.py lift  <outdir> [--only mod:0xOFF,...] lift every module into <outdir>
-Lifting runs in NX_LIFT_PROCS worker processes (default: by free memory, ~3 GB each, at most 8); 1 lifts in this one.
+Lifting runs in NX_LIFT_PROCS worker processes (default: by free memory, ~0.6 GB each, up to every logical core); 1
+lifts in this one. The module analysis is cached in <build>/modcache, kept across lifter changes that leave it alone.
 Modules are read from <dump>/elf/<module>.elf and <analysis>/<module>_ida.json (game.json): an IDA / Ghidra export
 (ida_export.py, tools/ghidra), or, when there is none, written from the module's unwind tables (../funcs.py: the same
 lift without IDA or Ghidra, as players build it).
 """
+import array
+import bisect
 import collections
 import concurrent.futures
 import ctypes
+import hashlib
+import inspect
 import io
 import json
 import os
@@ -36,6 +41,7 @@ sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, HERE)
 
 import gamecfg                                  # noqa: E402
+import nxmod                                    # noqa: E402
 from nxmod import Module                       # noqa: E402
 from a64insn import Unimpl, lift_insn, branch_targets, sext, decode_bitmask   # noqa: E402
 
@@ -49,6 +55,23 @@ LINE_INFO = os.environ.get('LIFT_LINES', '1') != '0'   # #line <guest offset> be
 
 def regname(n):
     return 'SP' if n == 31 else 'X%d' % n
+
+
+_ANALYSIS_VERSION = None
+
+
+def analysis_version():
+    """A hash of the code the cached module analysis (Mod, secondary_entries) comes from, and of nxmod.py."""
+    global _ANALYSIS_VERSION
+    if _ANALYSIS_VERSION is None:
+        import a64insn
+        import nxmod
+        parts = [inspect.getsource(o) for o in (Mod, secondary_entries, code_address_refs, sext26, a64insn.bits,
+                                                a64insn.sext, a64insn.mask, a64insn.branch_targets,
+                                                a64insn.decode_bitmask)]
+        parts.append(open(nxmod.__file__, encoding='utf-8').read())
+        _ANALYSIS_VERSION = hashlib.sha1('\0'.join(parts).encode()).hexdigest()
+    return _ANALYSIS_VERSION
 
 
 # ----------------------------------------------------------------------------- modules and symbols
@@ -66,8 +89,12 @@ class Mod:
         self.m = Module(elf)
         self.base = BASES[name]
         self.text = self.m.text
-        # the analysis below takes minutes for a large module: cached, keyed by its inputs and this source
-        key = repr([(p, os.path.getsize(p), os.path.getmtime(p)) for p in (elf, ida, __file__)])
+        # the text's words, read as uint32 (word() is called ~10 times per instruction)
+        self._wlen = min(self.text[1], len(self.m.img) - nxmod.OFF) & ~3
+        self._w = memoryview(self.m.img)[nxmod.OFF:nxmod.OFF + self._wlen].cast('I')
+        # the analysis below takes minutes for a large module: cached, keyed by its inputs and the source of the
+        # analysis itself (analysis_version: a lifter change elsewhere keeps the cache)
+        key = repr([(p, os.path.getsize(p), os.path.getmtime(p)) for p in (elf, ida)] + [analysis_version()])
         cache = os.path.join(gamecfg.BUILD, 'modcache', name + '.pickle')
         try:
             with open(cache, 'rb') as f:
@@ -75,13 +102,20 @@ class Mod:
             if k == key:
                 self.__dict__.update(state)
                 return
-        except (OSError, EOFError, pickle.UnpicklingError, ValueError):
+        except (OSError, EOFError, pickle.UnpicklingError, ValueError, AttributeError):
             pass
         self.analyse(json.load(open(ida)))
+        self.sec, self.orphans = secondary_entries(self)
+        # what lifting needs, compact: every worker process loads it (instruction offsets as lists of ints and the
+        # owner map of every instruction were ~2 GB of its ~2.6 GB for Violet's main)
+        del self.owner
+        self.funcs = {f: array.array('I', offs) for f, offs in self.funcs.items()}
         os.makedirs(os.path.dirname(cache), exist_ok=True)
-        with open(cache, 'wb') as f:
-            pickle.dump((key, {k: v for k, v in self.__dict__.items() if k not in ('m', '_bt_cache')}), f,
+        tmp = cache + '.%d.tmp' % os.getpid()
+        with open(tmp, 'wb') as f:
+            pickle.dump((key, {k: v for k, v in self.__dict__.items() if k not in ('m', '_w', '_wlen', '_bt_cache')}), f,
                         pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache)
 
     def analyse(self, ida):
         data = set()
@@ -111,7 +145,21 @@ class Mod:
                 self.plt[ea] = self.m.syms[got[slot]][0]
         self.exports = {s[0]: s[1] for s in self.m.exports() if s[3] & 0xf in (1, 2, 0)}
 
+    def __getattr__(self, name):
+        # the cache leaves out `owner` (instruction offset -> function), which only the analysis needs: rebuilt on
+        # first use (tools/a64dis.py), first function first as the analysis set it
+        if name != 'owner' or 'funcs' not in self.__dict__:
+            raise AttributeError(name)
+        owner = {}
+        for f, offs in self.funcs.items():
+            for a in offs:
+                owner.setdefault(a, f)
+        self.owner = owner
+        return owner
+
     def word(self, off):
+        if 0 <= off < self._wlen and not off & 3:
+            return self._w[off >> 2]
         return self.m.u32(off)
 
     def recover_functions(self, data):
@@ -190,7 +238,7 @@ class Mod:
                 inside = set(offs)
                 for i, a in enumerate(offs):
                     w = self.word(a)
-                    if w & 0xfffffc1f != 0xd61f0000 or a in self.switches:
+                    if w & 0xfffffc1f != 0xd61f0000 or a in self.switches or not self._maybe_table(a, (w >> 5) & 31):
                         continue
                     cases = (self.jump_table(range(max(self.text[0], a - 0x800), a, 4), (w >> 5) & 31, inside) or
                              self.jump_table(range(max(self.text[0], a - 0x4000), a, 4), (w >> 5) & 31, inside) or
@@ -213,6 +261,33 @@ class Mod:
         if found:
             print('%s: %d jump tables found beyond IDA\'s (%d instructions of case code added)' % (self.name, found, grown))
         return found
+
+    @staticmethod
+    def _table_add(w):
+        """ADD Xd, Xn, Xm, LSL #s or ADD Xd, Xn, Wm, UXTW / SXTW #s: what makes jump_table's 'table'"""
+        return (w & 0xff200000 == 0x8b000000 and (w >> 22) & 3 == 0) or \
+            (w & 0xffe00000 == 0x8b200000 and (w >> 13) & 7 in (2, 6))
+
+    def _maybe_table(self, a, reg):
+        """Whether jump_table can find a table for `br reg` at a (in any of its windows, the largest 0x4000 bytes):
+        only when the last instruction before it that sets reg's definition there (in address order, as
+        jump_table's scan goes) is a _table_add. Most BRs are tail calls through a loaded pointer: the full scans
+        of 0x800 + 0x4000 bytes for each of them were most of the analysis time."""
+        lo = max(self.text[0], a - 0x4000)
+        b = a - 4
+        while b >= lo:
+            w = self.word(b)
+            if self._table_add(w):
+                if w & 31 == reg:
+                    return True
+            elif w & 0x9f000000 in (0x90000000, 0x10000000) or w & 0xff800000 == 0x91000000 or \
+                    (w & 0x3f200c00 == 0x38200800 and (w >> 22) & 3):     # ADRP, ADR, ADD (imm), LDR (register)
+                if w & 31 == reg:
+                    return False
+            elif reg in self._writes(w):
+                return False
+            b -= 4
+        return False
 
     def table_candidates(self, offs):
         """(start, end, addresses in the read-only segment the function builds with ADRP + ADD) for jump_table"""
@@ -802,9 +877,13 @@ def lift_function(env, owner, secondary=(), stats=None):
             if t in fn.addrs:
                 bt.add(t)
     sw_targets = set()
-    for br, cases in mod.switches.items():
+    keys = mod.__dict__.get('_sw_keys')         # the switches' BR offsets, sorted: those within the function's span
+    if keys is None:
+        keys = mod._sw_keys = sorted(mod.switches)
+    for i in range(bisect.bisect_left(keys, offs[0]), bisect.bisect_right(keys, offs[-1])):
+        br = keys[i]
         if mod.base + br in fn.addrs:
-            sw_targets.update(mod.base + t for t in cases)
+            sw_targets.update(mod.base + t for t in mod.switches[br])
     bt |= sw_targets
     bt |= set(entries)
     fn.labels.update(entries)
@@ -839,7 +918,14 @@ def lift_function(env, owner, secondary=(), stats=None):
             if stats is not None:
                 stats['bad'][str(e)] += 1
                 stats['example'].setdefault(str(e), (pc, w))
-        recs.append((pc, w, regmask(fn.rx), regmask(fn.wx), bool(patch and patch[1] in ('call', 'after'))))
+        rm = wm = 0                                # regmask of the two sets
+        for n in fn.rx:
+            if n < 31:
+                rm |= 1 << n
+        for n in fn.wx:
+            if n < 31:
+                wm |= 1 << n
+        recs.append((pc, w, rm, wm, bool(patch and patch[1] in ('call', 'after'))))
         fn.rx, fn.wx = rx0 | fn.rx, wx0 | fn.wx
         lines.append((pc, stmt))
         noreturn_prev = not falls_through(stmt)
@@ -1196,7 +1282,7 @@ def cmd_cover(names):
         mod = prog.mods[n]
         env = Env(prog, mod)
         stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
-        sec, orphans = secondary_entries(mod)
+        sec = mod.sec
         nf = 0
         for off in sorted(mod.funcs):
             if off in mod.plt:
@@ -1218,6 +1304,7 @@ def cmd_cover(names):
 # Functions lift independently (Env only collects names), so workers lift chunks of them in their own Program
 # (~2.6 GB each for Violet) and the files are put together here in the same order: the output is the same.
 LIFT_CHUNK = 1000
+LIFT_WORKER_GB = 0.6
 _worker_prog = None
 
 
@@ -1233,8 +1320,11 @@ def lift_procs():
         ms = MemStatus(len=ctypes.sizeof(MemStatus))
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
             avail_gb = ms.avail / 2**30
-    # 8 GB left: this process and its results (~4), and the rest of the machine (8 workers on 28 GB free filled it)
-    return max(1, min(8, os.cpu_count() or 1, int((avail_gb - 8) / 3)))
+    # A worker holds the modules' cached analysis (~0.35 GB for Violet, since the cache left out the per-instruction
+    # owner map and keeps offsets as arrays; ~2.6 GB before) and one chunk being lifted: 0.6 GB each (measured
+    # 0.37-0.43). 1.5 GB left for this process's results in flight and the rest of the machine (this process is
+    # already counted; with 1 GB, 7 workers on 6 GB free left 0.7 free). Every logical core
+    return max(1, min(os.cpu_count() or 1, int((avail_gb - 1.5) / LIFT_WORKER_GB)))
 
 
 def _lift_worker_init(overrides):
@@ -1246,8 +1336,6 @@ def _lift_chunk(job, prog=None):
     """Lift functions of one module: their sources, and what their Env and statistics collected."""
     n, offs, sec = job
     prog = prog or _worker_prog
-    if not hasattr(prog.mods[n], 'sec_entries'):
-        secondary_entries(prog.mods[n])     # sets mod.sec_entries, which env_is_entry reads
     env = Env(prog, prog.mods[n])
     stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}}
     srcs = [lift_function(env, off, sec.get(off, ()), stats) for off in offs]
@@ -1270,14 +1358,22 @@ def cmd_lift(outdir, only=None, per_file=40000):
     unresolved = {}                          # u_<mangled> -> symbol
     csr = {}                                 # csr_flow's results, all modules
     taken = set()                            # names of entries whose address is taken (relocations, ADR)
+    # every module's chunks go to the workers at once (no idle workers at a module's end), results taken in order
+    plans = []
     for n in MODULES:
         mod = prog.mods[n]
-        env = Env(prog, mod)
-        sec, orphans = secondary_entries(mod)
         if only:
             todo = sorted(o for o in mod.funcs if mod.base + o in only)
         else:
             todo = sorted(o for o in mod.funcs if o not in mod.plt)
+        plans.append((n, [(n, todo[i:i + LIFT_CHUNK], {o: mod.sec[o] for o in todo[i:i + LIFT_CHUNK] if o in mod.sec})
+                          for i in range(0, len(todo), LIFT_CHUNK)]))
+    all_jobs = [j for _, jobs in plans for j in jobs]
+    results = iter(pool.map(_lift_chunk, all_jobs) if pool else (_lift_chunk(j, prog) for j in all_jobs))
+    for n, jobs in plans:
+        mod = prog.mods[n]
+        env = Env(prog, mod)
+        sec, orphans = mod.sec, mod.orphans
         done, files, buf, count = set(), [], [], 0
 
         def flush():
@@ -1289,11 +1385,9 @@ def cmd_lift(outdir, only=None, per_file=40000):
                 files.append(path)
                 buf, count = [], 0
 
-        jobs = [(n, todo[i:i + LIFT_CHUNK], {o: sec[o] for o in todo[i:i + LIFT_CHUNK] if o in sec})
-                for i in range(0, len(todo), LIFT_CHUNK)]
-        results = pool.map(_lift_chunk, jobs) if pool else (_lift_chunk(j, prog) for j in jobs)
         taken.update('f_%x' % (mod.base + t) for t in set(mod.m.code_seeds()) | mod.addr_refs)
-        for job, (srcs, extra, callees, unres, st, cs) in zip(jobs, results):
+        for job in jobs:
+            srcs, extra, callees, unres, st, cs = next(results)
             csr.update(cs)
             env.extra |= extra
             env.ext_callees |= callees
