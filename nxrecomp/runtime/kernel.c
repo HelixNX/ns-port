@@ -484,8 +484,38 @@ void core_enter(void) {
     kunlock();
 }
 
+/* NX_MMCSS=1: the guest threads that run most (20% of the time or more in a cpu report, at most MMCSS_MAX) join
+ * Windows' "Games" MMCSS task, which raises them into the real-time priority range for most of each period (the
+ * scheduler keeps a share for everything else). Only busy threads: dozens of guest threads share the game's
+ * priorities (44 / 45), and raising all of them would starve the runtime's and the driver's threads. A thread must
+ * register itself, so the report marks it and the thread applies it at its next SVC. avrt.dll loaded on use. */
+#define MMCSS_MAX 6
+#define MMCSS_PCT 20.0
+static int mmcss_mode = -1;
+static int mmcss_n;
+static bool mmcss_enabled(void) {
+    if (mmcss_mode < 0) { const char *e = getenv("NX_MMCSS"); mmcss_mode = e && *e == '1'; }
+    return mmcss_mode;
+}
+
+static void mmcss_apply(KThread *t) {
+    t->mmcss_on = 1;
+    static HANDLE (WINAPI *set_mm)(LPCWSTR, LPDWORD);
+    static bool loaded;
+    if (!loaded) {
+        loaded = true;
+        HMODULE m = LoadLibraryW(L"avrt.dll");
+        if (m) set_mm = (HANDLE (WINAPI *)(LPCWSTR, LPDWORD))(void *)GetProcAddress(m, "AvSetMmThreadCharacteristicsW");
+    }
+    DWORD idx = 0;
+    HANDLE h = set_mm ? set_mm(L"Games", &idx) : NULL;
+    hlog(0, "kernel: %s joins the MMCSS \"Games\" task%s", t->name, h ? "" : " (failed)");
+    if (!h) hlog(0, "kernel: AvSetMmThreadCharacteristics error %lu", GetLastError());
+}
+
 void kernel_svc_exit(void) {
     KThread *t = cur_thread;
+    if (t->mmcss_want && !t->mmcss_on) mmcss_apply(t);
     if (!t->preempt_req) return;
     klock();
     t->preempt_req = false;
@@ -1159,6 +1189,10 @@ void kernel_report_cpu(u64 frames) {
             for (int k = 0; k < 4; k++) acq[k] = t->acq[k] - prev[i].acq[k];
             prev[i] = (typeof(prev[0])){t, cpu, t->ready_qpc, t->sleep_qpc, t->sleeps};
             memcpy(prev[i].acq, t->acq, sizeof t->acq);
+            if (pct >= MMCSS_PCT && !t->mmcss_want && mmcss_n < MMCSS_MAX && mmcss_enabled()) {
+                t->mmcss_want = 1;
+                mmcss_n++;
+            }
             if ((pct >= 5 || ready >= 5 || sleep >= 5) && nb < 128) {
                 busy[nb] = (typeof(busy[0])){t->name, pct, ready, sleep, sleeps};
                 memcpy(busy[nb++].acq, acq, sizeof acq);

@@ -122,6 +122,8 @@ typedef struct KThread {
     /* core ownership, under klock (see kernel.c) */
     s32 cur_core;                   /* the core it owns (or was preempted on), or -1 */
     s32 host_core;                  /* NX_HOST_CORES: the guest core whose host CPU set it has, plus 1 (0: none) */
+    volatile u8 mmcss_want;         /* NX_MMCSS: busy enough for the "Games" MMCSS task (kernel_report_cpu) ... */
+    u8 mmcss_on;                    /* ... applied by the thread itself at its next SVC (kernel_svc_exit) */
     bool ready;                     /* waiting for a core */
     bool preempted;                 /* suspended on cur_core by a higher-priority thread */
     volatile bool preempt_req;      /* give the core up at the next SVC */
