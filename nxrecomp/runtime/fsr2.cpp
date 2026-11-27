@@ -61,10 +61,11 @@ static bool make_ctx(const Fsr2Frame *f) {
         hlog(0, "fsr2: no Vulkan interface (%d): off", (int)e);
         return false;
     }
-    static int debug = -1;
+    static int debug = -1, autoexp = -1;
     if (debug < 0) debug = getenv("NX_FSR2_DEBUG") && atoi(getenv("NX_FSR2_DEBUG"));
+    if (autoexp < 0) autoexp = !getenv("NX_FSR2_AUTOEXP") || atoi(getenv("NX_FSR2_AUTOEXP"));
     /* auto exposure: the input is the tone-mapped picture, but FSR 2 still weighs its history by luminance */
-    d.flags = FFX_FSR2_ENABLE_AUTO_EXPOSURE | (f->depth_inverted ? FFX_FSR2_ENABLE_DEPTH_INVERTED : 0) |
+    d.flags = (autoexp ? FFX_FSR2_ENABLE_AUTO_EXPOSURE : 0) | (f->depth_inverted ? FFX_FSR2_ENABLE_DEPTH_INVERTED : 0) |
               (f->depth_infinite ? FFX_FSR2_ENABLE_DEPTH_INFINITE : 0) |
               (debug ? FFX_FSR2_ENABLE_DEBUG_CHECKING : 0);
     d.maxRenderSize = {f->w, f->h};
@@ -117,7 +118,8 @@ extern "C" bool fsr2_record(VkCommandBuffer cmd, const Fsr2Frame *f) {
     FfxFsr2DispatchDescription d;
     memset(&d, 0, sizeof d);
     d.commandList = ffxGetCommandListVK(cmd);
-    d.color = ffxGetTextureResourceVK(&g_ctx, f->color, f->color_view, f->w, f->h, f->color_format, L"nx color");
+    d.color = ffxGetTextureResourceVK(&g_ctx, f->color, f->color_view, f->color_w ? f->color_w : f->w,
+                                      f->color_h ? f->color_h : f->h, f->color_format, L"nx color");
     d.depth = ffxGetTextureResourceVK(&g_ctx, f->depth, f->depth_view, f->w, f->h, f->depth_format, L"nx depth");
     d.motionVectors = ffxGetTextureResourceVK(&g_ctx, f->mv, f->mv_view, f->w, f->h, VK_FORMAT_R16G16_SFLOAT, L"nx mv");
     d.output = ffxGetTextureResourceVK(&g_ctx, f->out, f->out_view, f->ow, f->oh, f->out_format, L"nx out",

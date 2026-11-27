@@ -113,6 +113,21 @@ elseif(NX_PGO)
     message(FATAL_ERROR "NX_PGO: empty, gen or use (not ${NX_PGO})")
 endif()
 
+# ThinLTO of lifted code and a64rt (NX_LTO=thin): bitcode objects, optimized together when the exe is linked, so the
+# compiler can inline small lifted functions into callers in other files (911 of them) and drop the Ctx stores
+# around such calls. The runtime stays out: runtime code inlined into lifted code could be suspended there while
+# holding a lock (kernel.c preempts threads only inside lifted code). NX_LTO_JOBS: backend threads (0: LIFT_JOBS).
+set(NX_LTO "" CACHE STRING "link-time optimization of lifted code: empty (off) or thin")
+set_property(CACHE NX_LTO PROPERTY STRINGS "" thin)
+set(NX_LTO_JOBS 0 CACHE STRING "ThinLTO backend threads at link (0: as many as lifted compiles)")
+set(NX_LTO_FLAGS "")
+if(NX_LTO STREQUAL "thin")
+    set(NX_LTO_FLAGS /clang:-flto=thin)
+    message(STATUS "nxrecomp: ThinLTO of lifted code")
+elseif(NX_LTO)
+    message(FATAL_ERROR "NX_LTO: empty or thin (not ${NX_LTO})")
+endif()
+
 set(NX_RUNTIME_SOURCES
     main.c loader.c dispatch.c mem.c kernel.c kmem.c svc.c ipc.c
     services/am.c services/lm.c services/apm.c services/pctl.c services/vi.c services/hid.c services/time.c
@@ -354,7 +369,7 @@ function(nx_game)
     endif()
     add_library(lifted STATIC ${lifted_sources})
     target_include_directories(lifted PRIVATE "${NX_ROOT}/runtime" "${LIFTED_DIR}")
-    target_compile_options(lifted PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS})
+    target_compile_options(lifted PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS} ${NX_LTO_FLAGS})
     target_compile_definitions(lifted PRIVATE ${NX_CC_DEFS})
     # each compile of a ~2 MB generated file takes 1-2 GB: limit parallel jobs so a 16 GB machine does not page
     set(LIFT_JOBS 0 CACHE STRING "parallel compiles of lifted code (0: by cores and memory)")
@@ -375,12 +390,13 @@ function(nx_game)
         endif()
     endif()
     message(STATUS "nxrecomp: ${lift_jobs} parallel compiles of lifted code (LIFT_JOBS)")
+    set(NX_LTO_THREADS ${lift_jobs})                 # (nx_game_exe, called below, sees it)
     set_property(GLOBAL APPEND PROPERTY JOB_POOLS lift_pool=${lift_jobs})
     set_property(TARGET lifted PROPERTY JOB_POOL_COMPILE lift_pool)
 
     add_library(a64rt STATIC "${NX_ROOT}/runtime/a64rt.c")
     target_include_directories(a64rt PUBLIC "${NX_ROOT}/runtime")
-    target_compile_options(a64rt PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS})
+    target_compile_options(a64rt PRIVATE ${NX_LIFT_FLAGS} ${NX_PGO_FLAGS} ${NX_LTO_FLAGS})
     target_compile_definitions(a64rt PUBLIC ${NX_CC_DEFS})
 
     # the package's lifted code is always -O3 (best speed for players): the same libraries at the default, else
@@ -448,6 +464,13 @@ function(nx_game_exe target package)
     # /HIGHENTROPYVA:NO: otherwise Windows puts thread stacks and heaps anywhere up to 1 TB, inside the guest range.
     # /MAP: shows where lifted code lies (kernel.c preempts threads only inside it; see dispatch_init)
     target_link_options(${target} PRIVATE /DEBUG /INCREMENTAL:NO /HIGHENTROPYVA:NO /MAP)
+    if(NX_LTO STREQUAL "thin")          # backends as many as the lifted compiles (memory), their results cached
+        set(_jobs ${NX_LTO_JOBS})
+        if(_jobs LESS 1)
+            set(_jobs ${NX_LTO_THREADS})
+        endif()
+        target_link_options(${target} PRIVATE /opt:lldltojobs=${_jobs} "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache")
+    endif()
     target_compile_options(${target} PRIVATE ${NX_PGO_FLAGS})
     if(NX_PGO_LINK)
         target_link_libraries(${target} PRIVATE "${NX_PGO_LINK}")

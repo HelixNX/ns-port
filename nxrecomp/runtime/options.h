@@ -18,8 +18,8 @@ void options_set_float(const char *key, float v);
 /* video (the menu calls these from the render thread; applied on the window thread by options_tick) */
 s32 options_framerate(void);                /* FRAMERATE_GAME, FRAMERATE_UNCAPPED or fps (framerate.h) */
 void options_set_framerate(s32 r);
-u32 options_render_scale(void);             /* 1-4 */
-void options_set_render_scale(u32 s);
+float options_render_scale(void);           /* 1-4, in 120ths (4/3: 1440p for a 1080p game) */
+void options_set_render_scale(float s);
 bool options_fps_counter(void);
 void options_set_fps_counter(bool on);
 bool options_fullscreen(void);
@@ -27,13 +27,15 @@ void options_set_fullscreen(bool on);
 void options_toggle_fullscreen(void);       /* window thread */
 /* anti-aliasing (gpu_taa.c, any thread; taken at the next frame, saved as "taa" / "taa_sharpness"). Available:
  * a build with FSR 2 and a game.json "taa"; failed: FSR 2 or our part of it could not be set up (the log says) */
-enum { TAA_OFF, TAA_NATIVE };
+enum { TAA_OFF, TAA_NATIVE, TAA_UPSCALE };
 bool taa_available(void);
 bool taa_failed(void);
 int taa_mode(void);                         /* TAA_* */
 void taa_set_mode(int m);
 float taa_sharpness(void);                  /* 0-1: FSR 2's sharpening (RCAS), 0 none */
 void taa_set_sharpness(float s);
+float taa_ratio(void);                      /* TAA_UPSCALE: output / scene (FSR 2's quality: 1.5 Quality, 2 Performance) */
+void taa_set_ratio(float r);
 bool taa_jitter(void);                      /* the sub-pixel jitter (off: to compare; development builds) */
 void taa_set_jitter(bool on);
 

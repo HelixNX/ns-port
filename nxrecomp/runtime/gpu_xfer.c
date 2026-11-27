@@ -4,9 +4,14 @@
 #include "gpu_int.h"
 
 VkRect2D clear_rect(void) {
-    s64 S = st.rt_scale ? st.rt_scale : 1;  /* the scissor is in the game's pixels */
-    s64 x0 = (s64)st.scissor[0][0] * S, y0 = (s64)st.scissor[0][1] * S;
-    s64 x1 = x0 + (s64)st.scissor[0][2] * S, y1 = y0 + (s64)st.scissor[0][3] * S;
+    float S = st.rt_scale > 0 ? st.rt_scale : 1;       /* the scissor is in the game's pixels */
+    s64 gx0 = st.scissor[0][0], gy0 = st.scissor[0][1];
+    s64 gx1 = gx0 + st.scissor[0][2], gy1 = gy0 + st.scissor[0][3];
+    if (gx0 < 0) gx0 = 0;
+    if (gy0 < 0) gy0 = 0;
+    if (gx1 > 0x7fff) gx1 = 0x7fff;                     /* (a "no scissor" maximum: kept in float's exact range) */
+    if (gy1 > 0x7fff) gy1 = 0x7fff;
+    s64 x0 = sc_edge((s32)gx0, S), y0 = sc_edge((s32)gy0, S), x1 = sc_edge((s32)gx1, S), y1 = sc_edge((s32)gy1, S);
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > (s64)st.area.extent.width) x1 = st.area.extent.width;
@@ -125,8 +130,9 @@ void do_clear_texture(const CmdClearTexture *p) {
         memcpy(&val.depthStencil.depth, &p->v[0], 4);
         val.depthStencil.stencil = p->v[1];
     }
-    s32 S = (s32)im->scale;
-    VkRect2D rect = {{(s32)x0 * S, (s32)y0 * S}, {(u32)(x1 - x0) * im->scale, (u32)(y1 - y0) * im->scale}};
+    float S = im->scale;
+    s32 rx0 = sc_edge((s32)x0, S), ry0 = sc_edge((s32)y0, S);
+    VkRect2D rect = {{rx0, ry0}, {(u32)(sc_edge((s32)x1, S) - rx0), (u32)(sc_edge((s32)y1, S) - ry0)}};
     if (!level_whole && clear_part(im, &v, level, is3d ? (u32)z0 : layer, is3d ? (u32)nz : nlayers, rect, &val)) {
         /* done */
     } else {
@@ -192,7 +198,8 @@ static bool copy_in(Image *im, VkBuffer buf, VkBufferImageCopy r) {
         return true;
     }
     Temp t;
-    u32 n = r.imageSubresource.layerCount, S = im->scale;
+    u32 n = r.imageSubresource.layerCount;
+    float S = im->scale;
     if (!scale_blittable(im) || !temp_image(im->format, r.imageExtent.width, r.imageExtent.height, 1, n, &t)) return false;
     VkBufferImageCopy tr = r;
     tr.imageSubresource.mipLevel = 0;
@@ -202,7 +209,7 @@ static bool copy_in(Image *im, VkBuffer buf, VkBufferImageCopy r) {
     barrier();
     s32 x = r.imageOffset.x, y = r.imageOffset.y, w = (s32)r.imageExtent.width, h = (s32)r.imageExtent.height;
     VkImageBlit b = {{r.imageSubresource.aspectMask, 0, 0, n}, {{0, 0, 0}, {w, h, 1}}, r.imageSubresource,
-                     {{x * (s32)S, y * (s32)S, 0}, {(x + w) * (s32)S, (y + h) * (s32)S, 1}}};
+                     {{sc_edge(x, S), sc_edge(y, S), 0}, {sc_edge(x + w, S), sc_edge(y + h, S), 1}}};
     vkCmdBlitImage(cmd(), t.image, VK_IMAGE_LAYOUT_GENERAL, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
     temp_free(&t);
     return true;
@@ -214,10 +221,11 @@ static bool copy_out(Image *im, VkBuffer buf, VkBuffer mbuf, u64 moff, VkBufferI
     VkImage src = im->image;
     Temp t = {0};
     if (im->scale > 1) {
-        u32 n = r.imageSubresource.layerCount, S = im->scale;
+        u32 n = r.imageSubresource.layerCount;
+        float S = im->scale;
         if (!scale_blittable(im) || !temp_image(im->format, r.imageExtent.width, r.imageExtent.height, 1, n, &t)) return false;
         s32 x = r.imageOffset.x, y = r.imageOffset.y, w = (s32)r.imageExtent.width, h = (s32)r.imageExtent.height;
-        VkImageBlit b = {r.imageSubresource, {{x * (s32)S, y * (s32)S, 0}, {(x + w) * (s32)S, (y + h) * (s32)S, 1}},
+        VkImageBlit b = {r.imageSubresource, {{sc_edge(x, S), sc_edge(y, S), 0}, {sc_edge(x + w, S), sc_edge(y + h, S), 1}},
                          {r.imageSubresource.aspectMask, 0, 0, n}, {{0, 0, 0}, {w, h, 1}}};
         vkCmdBlitImage(cmd(), im->image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
         barrier();
@@ -455,10 +463,11 @@ void do_copy_texture_to_texture(const CmdCopyTT *p) {
     s32 sh = p->sr.h > 0 ? p->sr.h : 1, dh = p->dr.h > 0 ? p->dr.h : 1;
     s32 sd = s3 ? (p->sr.d > 0 ? p->sr.d : 1) : 1, dd = d3 ? (p->dr.d > 0 ? p->dr.d : 1) : 1;
     /* rectangles in each image's own (scaled) pixels */
-    s32 ss = (s32)s->scale, ds = (s32)d->scale;
-    s32 sx = p->sr.x * ss, sy = p->sr.y * ss, sw = p->sr.w * ss, dx = p->dr.x * ds, dy = p->dr.y * ds, dw = p->dr.w * ds;
-    sh *= ss;
-    dh *= ds;
+    float ss = s->scale, ds = d->scale;
+    s32 sx = sc_edge(p->sr.x, ss), sy = sc_edge(p->sr.y, ss), sw = sc_edge(p->sr.x + p->sr.w, ss) - sx;
+    s32 dx = sc_edge(p->dr.x, ds), dy = sc_edge(p->dr.y, ds), dw = sc_edge(p->dr.x + p->dr.w, ds) - dx;
+    sh = sc_edge(p->sr.y + sh, ss) - sy;
+    dh = sc_edge(p->dr.y + dh, ds) - dy;
     u32 sb, db, bw, bh;
     format_info(p->src.t.format, &sb, &bw, &bh);
     format_info(p->dst.t.format, &db, &bw, &bh);
@@ -500,8 +509,8 @@ void do_downsample(const CmdDownsample *p) {
     if (trace_frame())
         hlog(0, "gpu: downsample %ux%u f%u @%llx -> %ux%u f%u @%llx", p->src.t.width, p->src.t.height, p->src.t.format,
              p->src.t.addr, p->dst.t.width, p->dst.t.height, p->dst.t.format, p->dst.t.addr);
-    u32 w = p->dst.t.width * d->scale, h = tex_height(&p->dst.t) * d->scale;      /* in each image's own pixels */
-    u32 srw = p->src.t.width * s->scale, srh = tex_height(&p->src.t) * s->scale;
+    u32 w = sc_size(p->dst.t.width, d->scale), h = sc_size(tex_height(&p->dst.t), d->scale);   /* each image's own pixels */
+    u32 srw = sc_size(p->src.t.width, s->scale), srh = sc_size(tex_height(&p->src.t), s->scale);
     VkImageSubresourceLayers sl = {copy_aspect(s), p->src.v.base_level, p->src.v.min_layer, 1};
     VkImageSubresourceLayers dl = {copy_aspect(d), p->dst.v.base_level, p->dst.v.min_layer, 1};
     if (s->info.samples > 1 && d->info.samples <= 1 && s->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {

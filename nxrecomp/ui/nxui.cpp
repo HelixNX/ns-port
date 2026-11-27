@@ -16,6 +16,7 @@
 #include <mutex>
 #include <ctype.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
@@ -454,32 +455,86 @@ static void page_video() {
         ImGui::EndCombo();
     }
     help("Above 30, the game runs on our timing hooks.");
-    uint32_t s = H->render_scale();
-    char cs[32];
-    snprintf(cs, sizeof cs, "%ux  (%up)", s, 1080 * s);
+    /* render scale: the game's 1080p height in 9-pixel steps (scales in 120ths, gpu.c), applied when let go: every
+     * change remakes the scaled images */
+    static int drag_h = 0;                              /* the slider's value while it is held */
+    int cur_h = (int)(H->render_scale() * 120.0f + 0.5f) * 9;
+    int h = drag_h ? drag_h : cur_h;
     ImGui::SetNextItemWidth(260);
-    if (ImGui::BeginCombo("Render scale", cs)) {
-        for (uint32_t k = 1; k <= 4; k++) {
-            snprintf(cs, sizeof cs, "%ux  (%up)", k, 1080 * k);
-            if (ImGui::Selectable(cs, k == s)) H->set_render_scale(k);
-        }
-        ImGui::EndCombo();
+    char fmt[48];
+    snprintf(fmt, sizeof fmt, "%%dp  (%.4gx)", h / 1080.0);
+    if (ImGui::SliderInt("Render scale", &h, 1080, 4320, fmt, ImGuiSliderFlags_AlwaysClamp)) drag_h = (h + 4) / 9 * 9;
+    if (ImGui::IsItemDeactivatedAfterEdit() && drag_h) {
+        H->set_render_scale(drag_h / 1080.0f);
+        drag_h = 0;
+    } else if (!ImGui::IsItemActive()) drag_h = 0;
+    help("The height the game is drawn at, then scaled to the window. Your screen's height gives a sharp picture "
+         "without drawing more than the window shows (1440p screen: 1440p). Ctrl+click to type a height.");
+    static const int common[] = {1080, 1440, 1620, 1800, 2160, 2880, 4320};
+    for (int i = 0; i < (int)(sizeof common / sizeof *common); i++) {
+        char b[16];
+        snprintf(b, sizeof b, "%dp", common[i]);
+        if (i) ImGui::SameLine();
+        if (common[i] == cur_h) ImGui::BeginDisabled();
+        if (ImGui::SmallButton(b)) H->set_render_scale(common[i] / 1080.0f);
+        if (common[i] == cur_h) ImGui::EndDisabled();
     }
-    help("Draws above 1080p, then scales to the window.");
     if (H->taa_available) {
-        static const char *modes[] = {"Off", "FSR 2 (native)"};
         int m = H->taa_mode();
-        if (m < 0 || m > 1) m = 0;
-        ImGui::SetNextItemWidth(260);
-        if (ImGui::BeginCombo("Anti-aliasing", modes[m])) {
-            for (int k = 0; k < 2; k++)
-                if (ImGui::Selectable(modes[k], k == m)) H->set_taa_mode(k);
-            ImGui::EndCombo();
-        }
-        help("AMD FSR 2 at the render size: smooths edges and shimmer using earlier frames. "
-             "Moving characters can leave a faint trail.");
+        if (m < 0 || m > 2) m = 0;
+        bool on = m != 0;
+        if (ImGui::Checkbox("FSR 2 anti-aliasing", &on)) H->set_taa_mode(on ? 1 : 0);
+        help("AMD FSR 2: smooths edges and shimmer using earlier frames. Moving characters can leave a faint trail.");
         if (H->taa_failed()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "FSR 2 could not start: see the log");
-        else if (m) {
+        else if (on) {
+            /* quality: output / scene. The scene never goes below the game's own 1080p, so at a low render scale
+             * the stronger presets are not available */
+            struct Q { const char *name; float r; };
+            static const Q qs[] = {{"Native (anti-aliasing only)", 1.0f}, {"Quality (1.5x)", 1.5f},
+                                   {"Balanced (1.7x)", 1.7f}, {"Performance (2x)", 2.0f},
+                                   {"Ultra performance (3x)", 3.0f}};
+            float out = H->render_scale(), r = m == 2 ? H->taa_ratio() : 1.0f;
+            int sel = -1;
+            for (int i = 0; i < 5; i++)
+                if (fabsf(qs[i].r - r) < 0.01f) sel = i;
+            char cur[64];
+            if (sel >= 0) snprintf(cur, sizeof cur, "%s", qs[sel].name);
+            else snprintf(cur, sizeof cur, "Custom (%.3gx)", r);
+            auto scene_h = [&](float ratio) { return (int)((long)(out * 120.0f / ratio + 0.5f) * 9); };
+            ImGui::SetNextItemWidth(260);
+            if (ImGui::BeginCombo("FSR 2 quality", cur)) {
+                for (int i = 0; i < 5; i++) {
+                    int sh = scene_h(qs[i].r);
+                    bool ok = sh >= 1080;
+                    char l[96];
+                    if (ok) snprintf(l, sizeof l, "%s  - draws %dp", qs[i].name, sh);
+                    else snprintf(l, sizeof l, "%s  - needs a render scale of %dp", qs[i].name, (int)(1080 * qs[i].r + 0.5f));
+                    if (ImGui::Selectable(l, i == sel, ok ? 0 : ImGuiSelectableFlags_Disabled)) {
+                        if (i == 0) H->set_taa_mode(1);
+                        else { H->set_taa_ratio(qs[i].r); H->set_taa_mode(2); }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            help("How much smaller the scene is drawn before FSR 2 upscales it to the render scale: faster on the "
+                 "GPU, softer the further it goes. Menus and text are always drawn at the full render scale. "
+                 "The scene is never drawn below 1080p (the game's own size).");
+            /* custom: the scene's height, from 1080p up to the render scale's */
+            int out_h = (int)(out * 120.0f + 0.5f) * 9;
+            if (out_h > 1080) {
+                static int drag_s = 0;
+                int sh = drag_s ? drag_s : (m == 2 ? scene_h(r) : out_h);
+                char f2[48];
+                snprintf(f2, sizeof f2, "%%dp  (%.3gx upscale)", (double)out_h / sh);
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::SliderInt("Scene height", &sh, 1080, out_h, f2, ImGuiSliderFlags_AlwaysClamp)) drag_s = (sh + 4) / 9 * 9;
+                if (ImGui::IsItemDeactivatedAfterEdit() && drag_s) {
+                    if (drag_s >= out_h) H->set_taa_mode(1);
+                    else { H->set_taa_ratio((float)out_h / drag_s); H->set_taa_mode(2); }
+                    drag_s = 0;
+                } else if (!ImGui::IsItemActive()) drag_s = 0;
+                help("Any height between 1080p and the render scale's (custom quality).");
+            }
             float sh = H->taa_sharpness();
             ImGui::SetNextItemWidth(260);
             if (ImGui::SliderFloat("Sharpening", &sh, 0.0f, 1.0f, "%.2f")) H->set_taa_sharpness(sh);

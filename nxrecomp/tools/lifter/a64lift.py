@@ -687,6 +687,17 @@ class Fn:
         name = self.env.callee(target)
         if name.startswith('h_'):                      # host replacements may set any register
             return 'X30 = 0x%xull; SAVE; %s(c); LOAD;' % (ret_addr, name)
+        body = self.env.leaf_body(target) if INLINE_MAX else None
+        if body:
+            # the leaf in place: LR set as the BL does, its instructions on this function's locals (their reads and
+            # writes become this instruction's, so call_masks and csr_flow see them), its RET falls through here
+            stmts = ['X30 = 0x%xull;' % ret_addr]
+            self.fk = None
+            for lpc, lw in body:
+                stmts.append(lift_insn(self, lw, lpc))
+            self.fk = None
+            self.env.inlined += 1
+            return '{ %s }' % ' '.join(stmts)
         p = self.cur_pc
         self.callsites.add(p)
         post = ' LOADX(@L%x@);' % p + (' POISONL(@P%x@);' % p if CSR_POISON else '')
@@ -744,7 +755,46 @@ class Env:
         self.extra = set()                 # absolute addresses lifted as secondary entries of this module
         self.ext_callees = set()           # names of functions defined elsewhere (other modules, host)
         self.unresolved = collections.Counter()
+        self.inlined = 0                   # BL sites given their leaf's instructions (leaf_body)
+        self._leaves = {}
         self.csr = {}                      # 'f_<owner>' -> (local mask, [(callee name, mask)], [entry names]): csr_flow
+
+    def leaf_body(self, target):
+        """[(pc, word)] of the leaf at `target` without its RET, if a BL there may be inlined (INLINE_MAX): a
+        function of this module that starts there, one straight run of at most INLINE_MAX instructions ending in RET
+        (x30), with nothing between that branches, calls, traps, makes a system call, touches the exclusive monitor,
+        writes x30, is patched or hooked, or lifts to anything but plain register / memory work. Else None."""
+        if target in self._leaves:
+            return self._leaves[target]
+        mod, base, res = self.mod, self.mod.base, None
+        off = target - base
+        offs = mod.funcs.get(off) if off not in mod.plt else None
+        if offs is not None and 2 <= len(offs) <= INLINE_MAX and offs[0] == off and offs[-1] == off + 4 * (len(offs) - 1):
+            words = [(base + o, mod.word(o)) for o in offs]
+            if words[-1][1] == 0xd65f03c0 and not any(pc in self.prog.patches for pc, _ in words):
+                ok = True
+                scratch = Fn(self, mod, target, [])
+                for pc, w in words[:-1]:
+                    if (branch_targets(w, pc) or w & 0x7c000000 == 0x14000000         # B / BL (not in branch_targets)
+                            or w & 0xff000010 == 0x54000000 or w & 0x7e000000 in (0x34000000, 0x36000000)   # B.cond CB TB
+                            or w & 0xfe1f0000 == 0xd61f0000                                   # BR / BLR / RET
+                            or w & 0xff000000 == 0xd4000000                           # SVC, HVC, BRK, ...
+                            or w & 0x3f000000 == 0x08000000                           # exclusives, LDAR / STLR family
+                            or w & 0xffc00000 == 0xd5000000):                         # system instructions
+                        ok = False
+                        break
+                    try:
+                        st = lift_insn(scratch, w, pc)
+                    except Unimpl:
+                        ok = False
+                        break
+                    if any(k in st for k in ('SAVE', 'LOAD', 'return', 'goto', '@', 'guest_', 'c->')):
+                        ok = False
+                        break
+                if ok and 30 not in scratch.wx:
+                    res = words[:-1]
+        self._leaves[target] = res
+        return res
 
     def callee(self, target):
         """C function name for a direct call or tail call to absolute address `target`."""
@@ -879,6 +929,11 @@ def sext26(w):
 # (compiled code clears it with CLREX or loads again; it never stores without loading). Nothing may branch into the
 # sequence but to L, Xn must not change in it, and no instruction in it may carry a patches.txt hook.
 EXCL_FUSE = os.environ.get('NX_EXCL_FUSE', '1') != '0'
+# Leaf inlining (Env.leaf_body, Fn.call): a BL to a straight-line leaf of at most INLINE_MAX instructions (its RET
+# included) becomes the leaf's instructions in the caller's locals: no call, no Ctx stores before it or reloads after.
+# Off by default (NX_INLINE_MAX=8 on): 2026-11-25 it inlined 19,958 sites in Violet (4.7% of main's BL sites) and the
+# CPU-only frame did not move (3.65 vs 3.69 ms, ABBA)
+INLINE_MAX = int(os.environ.get('NX_INLINE_MAX', '0'))
 
 
 def excl_fusions(fn, env, bt):
@@ -1473,6 +1528,7 @@ def _lift_chunk(job, prog=None):
     env = Env(prog, prog.mods[n])
     stats = {'ok': 0, 'bad': collections.Counter(), 'example': {}, 'fused': collections.Counter()}
     srcs = [lift_function(env, off, sec.get(off, ()), stats) for off in offs]
+    stats['inlined'] = env.inlined
     return srcs, env.extra, env.ext_callees, env.unresolved, stats, env.csr
 
 
@@ -1529,6 +1585,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
             stats['ok'] += st['ok']
             stats['bad'].update(st['bad'])
             stats['fused'].update(st['fused'])
+            stats['inlined'] = stats.get('inlined', 0) + st.get('inlined', 0)
             for k, v in st['example'].items():
                 stats['example'].setdefault(k, v)
             for off, src in zip(job[1], srcs):
@@ -1590,6 +1647,7 @@ def cmd_lift(outdir, only=None, per_file=40000):
             print('removed stale', name)
     total = stats['ok'] + sum(stats['bad'].values())
     print('instructions %d, not translated %d' % (total, total - stats['ok']))
+    print('leaf calls inlined: %d (NX_INLINE_MAX=%d)' % (stats.get('inlined', 0), INLINE_MAX))
     print('exclusive loops fused: %s' % (', '.join('%s %d' % kv for kv in stats['fused'].most_common()) if EXCL_FUSE
                                          else 'off (NX_EXCL_FUSE=0)'))
 

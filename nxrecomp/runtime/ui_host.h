@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define NXUI_VERSION 4
+#define NXUI_VERSION 6
 
 typedef struct UiHost {
     uint32_t version;                       /* NXUI_VERSION */
@@ -25,8 +25,8 @@ typedef struct UiHost {
     /* video (options.h: recorded here, applied on the window thread) */
     int32_t (*framerate)(void);             /* -1 the game's own, 0 uncapped, else fps */
     void (*set_framerate)(int32_t r);
-    uint32_t (*render_scale)(void);
-    void (*set_render_scale)(uint32_t s);
+    float (*render_scale)(void);            /* version 5: a float, 1-4 in 120ths (was whole numbers) */
+    void (*set_render_scale)(float s);
     bool (*fps_counter)(void);
     void (*set_fps_counter)(bool on);
     bool (*fullscreen)(void);
@@ -85,12 +85,15 @@ typedef struct UiHost {
     /* version 4: anti-aliasing (options.h taa_*; taa_available false: no FSR 2 in this build or game) */
     bool taa_available;
     bool (*taa_failed)(void);
-    int (*taa_mode)(void);                  /* 0 off, 1 FSR 2 at the render size */
+    int (*taa_mode)(void);                  /* 0 off, 1 FSR 2 at the render size, 2 (version 6) FSR 2 upscaling */
     void (*set_taa_mode)(int m);
     float (*taa_sharpness)(void);           /* 0-1 */
     void (*set_taa_sharpness)(float s);
     bool (*taa_jitter)(void);               /* development builds: the jitter on / off, to compare */
     void (*set_taa_jitter)(bool on);
+    /* version 6: upscaling's ratio, output / scene (the scene is never below the game's own size) */
+    float (*taa_ratio)(void);
+    void (*set_taa_ratio)(float r);
 } UiHost;
 
 /* nxui.dll's exports */

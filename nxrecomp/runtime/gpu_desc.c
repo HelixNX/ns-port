@@ -341,7 +341,7 @@ static void descset_resolve(DescSet *d, u32 i) {
         rs_hint = d->kind == DS_IMG;    /* storage images are scaled as render targets are */
         im = image_ref(&tr, &v);
         rs_hint = false;
-        if (im && d->kind == DS_IMG && im->can_scale && im->scale != rs_scale) image_rescale(im, rs_scale);
+        if (im && d->kind == DS_IMG && im->can_scale && im->scale != img_want_scale(im)) image_rescale(im, img_want_scale(im));
     }
     if (im) image_upload(im);
     d->res[i] = 1;

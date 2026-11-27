@@ -20,6 +20,7 @@ typedef struct Fsr2Frame {
     VkImage color, depth, mv;
     VkImageView color_view, depth_view, mv_view;
     VkFormat color_format, depth_format;
+    uint32_t color_w, color_h;      /* the colour image's own size (the frame is its top-left w x h; 0: w x h) */
     /* the output at ow x oh, a storage image in GENERAL */
     VkImage out;
     VkImageView out_view;

@@ -203,7 +203,15 @@ static VkImageView rt_view(const TexRef *r, Image **out, u32 *level, u32 *first,
     Image *im = image_ref(r, &v);
     rs_hint = false;
     if (im && promote) image_promote(im);                       /* drawn with a scaled depth (image_promote) */
-    if (im && im->can_scale && im->scale != rs_scale) image_rescale(im, rs_scale);   /* a texture first drawn into */
+    /* a colour target drawn after this frame's resolve is the output's (FSR 2 upscaling: the HUD at full size) */
+    if (im && post_phase && im->can_scale && !im->post && im->aspects == VK_IMAGE_ASPECT_COLOR_BIT && rs_in != rs_scale) {
+        im->post = true;
+        static int told;
+        if (told++ < 24)
+            hlog(0, "gpu: %ux%u f%u @%llx is the output's (drawn after the resolve, frame %llu)", im->info.width,
+                 tex_height(&im->info), im->info.format, im->info.addr, frame_no);
+    }
+    if (im && im->can_scale && im->scale != img_want_scale(im)) image_rescale(im, img_want_scale(im));   /* first drawn into */
     if (out) *out = im;
     if (level) *level = v.base_level;
     if (!im) return NULL;
@@ -222,8 +230,8 @@ static void rt_scale_of(const Image *im) {
     if (warned++ < 2)
         for (int k = 0; k < 2; k++) {
             const Image *x = k ? im : first;
-            hlog(0, "gpu: render targets at scales %u and %u in one pass: %ux%ux%u f%u (vk %d) target %u flags %x "
-                    "samples %u levels %u at %llx, scale %u%s", st.rt_scale, im->scale, x->info.width,
+            hlog(0, "gpu: render targets at scales %.3g and %.3g in one pass: %ux%ux%u f%u (vk %d) target %u flags %x "
+                    "samples %u levels %u at %llx, scale %.3g%s", st.rt_scale, im->scale, x->info.width,
                  tex_height(&x->info), x->layers, x->info.format, x->format, x->info.target, x->info.flags,
                  x->info.samples, x->levels, x->info.addr, x->scale, x->can_scale ? "" : ", not a candidate");
         }
@@ -245,7 +253,7 @@ bool begin_rendering(void) {
     bool any = false;
     /* a scaled screen depth bound: the colour targets join its scale (image_promote) */
     bool promote = false;
-    if (st.has_depth && rs_scale > 1) {
+    if (st.has_depth && (rs_in > 1 || rs_scale > 1)) {
         ViewInfo dv;
         rs_hint = true;
         Image *d = image_ref(&st.depth, &dv);
@@ -451,8 +459,9 @@ typedef struct {
 
 /* entry id of a texture or image set holds a scaled image (its pointer only while no image died since the set
  * was used: descset_use resolved the bound entries) */
-static bool desc_scaled(const DescSet *d, u32 id) {
-    return d && id < d->count && d->epoch == image_epoch && d->res[id] && d->img[id] && d->img[id]->scale > 1;
+static u32 desc_scaled(const DescSet *d, u32 id) {
+    if (!d || id >= d->count || d->epoch != image_epoch || !d->res[id] || !d->img[id] || d->img[id]->scale <= 1) return 0;
+    return d->img[id]->scale == rs_in ? HANDLE_SCALED : HANDLE_SCALED | HANDLE_OUT;
 }
 
 /* the uniform buffers of one stage (push descriptors at binding base + slot; the shader says which c[i] each slot
@@ -473,12 +482,12 @@ static int stage_ubos(u32 stage, u32 base, const ShaderCode *sc, VkWriteDescript
     for (u32 k = 0; k < 32; k++) {
         u32 h = (u32)st.tex[stage][k], id = h & 0xfffff;
         if (ts && id < ts->count && ts->intv[id]) h |= HANDLE_INT;
-        if (h && desc_scaled(ts, id)) h |= HANDLE_SCALED;
+        if (h) h |= desc_scaled(ts, id);
         tex[k] = h;
     }
     for (u32 k = 0; k < 8; k++) {
         u32 h = (u32)st.img[stage][k], id = h & 0xfffff;
-        if (h && desc_scaled(is, id)) h |= HANDLE_SCALED;
+        if (h) h |= desc_scaled(is, id);
         img[k] = h;
     }
     /* compared in place (twice a draw, ~2,000 draws a frame): the key is built only when it changed */
@@ -589,7 +598,7 @@ static void set_dynamic_state(VkCommandBuffer c, u32 mode) {
     last_serial = slot_serial;
     DynState d;
     memset(&d, 0, sizeof d);
-    float S = (float)(st.rt_scale ? st.rt_scale : 1);  /* the viewport is in the game's pixels */
+    float S = st.rt_scale > 0 ? st.rt_scale : 1;       /* the viewport is in the game's pixels */
     d.vp = (VkViewport){st.viewport[0][0] * S, st.viewport[0][1] * S, st.viewport[0][2] * S, st.viewport[0][3] * S,
                         st.depth_range[0][0], st.depth_range[0][1]};
     if (d.vp.width <= 0 || d.vp.height == 0) {
@@ -923,8 +932,8 @@ static void xfb_begin(VkCommandBuffer c, u32 op, const void *payload) {
         sizes[b] = st.xfb[b].size - w;
         u64 da = store ? gpu_device_addr(st.xfb[b].addr) : 0;
         if (!da || (u64)pd->count * vs->xfb_stride[b] > sizes[b]) store = false;     /* (a capture stops at the end) */
-        pcx[1 + 2 * b] = (u32)(da + w);
-        pcx[2 + 2 * b] = (u32)((da + w) >> 32);
+        pcx[2 * b] = (u32)(da + w);
+        pcx[1 + 2 * b] = (u32)((da + w) >> 32);
         n = b + 1;
         if (used == 4) used = b;
     }
@@ -1446,6 +1455,7 @@ static void draw_one(u32 op, const void *payload) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         rec.pipe = pipe;
     }
+    taa_resolve_pass();                 /* (FSR 2 upscaling: the resolve draw at the scene's scale) */
     set_dynamic_state(c, ((const CmdDraw *)payload)->mode);
     VkWriteDescriptorSet w[32];
     VkDescriptorBufferInfo bi[32];
@@ -1473,10 +1483,10 @@ static void draw_one(u32 op, const void *payload) {
     /* debug word (fragment shaders' pc.debug): bit 0 NX_NO_DISCARD, discards off in draws that write depth (is an
      * object drawn but discarded?); 2D layers keep theirs (with every discard off, the title screen covered all) */
     bool no_discard = env.no_discard;
-    /* scale: textures' (bits 0-7: HANDLE_SCALED ones are at it) and this pass's targets' (8-15) */
-    u32 rts = st.rt_scale ? st.rt_scale : 1;
-    struct { u32 func; float ref, point_size; u32 debug, scale; } pc = {st.color.alpha_test, st.alpha_ref,
-        st.point_size * (float)rts, (u32)(no_discard && (st.ds.flags & 2)), rs_scale | rts << 8};
+    /* scale: textures' (HANDLE_SCALED ones are at it) and this pass's targets' */
+    float rts = st.rt_scale > 0 ? st.rt_scale : 1;
+    struct { u32 func; float ref, point_size; u32 debug; float tscale, rscale, oscale; u32 pad; } pc = {st.color.alpha_test,
+        st.alpha_ref, st.point_size * rts, (u32)(no_discard && (st.ds.flags & 2)), rs_in, rts, rs_scale, 0};
     if (debug_rt_hit() && env.debug_rt_bits & 1) pc.debug |= 1;
     if (a2c_test) {                     /* GEQUAL 0.5: alpha to coverage on one sample (the key's alpha_func) */
         pc.func = 7;
@@ -1624,8 +1634,9 @@ void dispatch(u32 op, const u8 *pay) {
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 0, nw, w);
     VkDescriptorSet sets[3] = {ts ? ts->set : empty_tex, ss ? ss->set : empty_smp, is ? is->set : empty_img};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout_gfx, 1, 3, sets, 0, NULL);
-    u32 cpc[PC_SIZE / 4] = {0, 0, 0, 0, rs_scale | 1u << 8};       /* the render scale (see draw_one) */
-    vkCmdPushConstants(c, layout_gfx, PC_STAGES, 0, PC_SIZE, cpc);
+    struct { u32 func; float ref, point_size; u32 debug; float tscale, rscale, oscale; u32 pad; } cpc = {0, 0, 0, 0, rs_in, 1,
+                                                                                                    rs_scale, 0};
+    vkCmdPushConstants(c, layout_gfx, PC_STAGES, 0, PC_SIZE, &cpc);  /* the render scale (see draw_one) */
     rec_check();
     memset(rec.pc, 0xff, sizeof rec.pc);    /* push constants are shared with graphics: theirs are gone */
     if (prof_on > 0) {

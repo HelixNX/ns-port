@@ -57,16 +57,21 @@ INT_FLAG = '((%s >> 19) & 1u) != 0u'
 # this way: the runtime reads it from the SPIR-V (gpu_shader.c, ShaderCode.texint_slots) and always gives the
 # constant its value for the draw's textures (PipeKey.vs_texint / fs_texint).
 INT_SPEC = '((TEX_INT >> %du) & 1u) != 0u'
-# Render scale (runtime/gpu.c HANDLE_SCALED, rs_scale): bit 18 of a handle marks a texture or image made N times the
-# game's size, N in pc.scale bits 0-7; the pass's targets' scale is in bits 8-15. gl_FragCoord is divided by the
-# targets' scale, integer coordinates of scaled textures and images are multiplied by N (plus the pixel's place in
-# its N x N block in fragment shaders), sizes divided by it; stores into scaled images outside fragment shaders
-# fill the whole block. Sampling with normalized coordinates needs nothing.
-PC_DECL = 'layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; uint scale; } pc;'
+# Render scale (runtime/gpu.c HANDLE_SCALED, rs_scale), any factor s >= 1, not only whole ones: bit 18 of a handle
+# marks a texture or image made s times the game's size (ceil(size * s)), s in pc.tscale, or with bit 17 too in
+# pc.oscale (HANDLE_OUT: the output scale, where FSR 2 upscales the scene from tscale); the pass's targets' scale is
+# pc.rscale. gl_FragCoord is divided by the targets' scale. An integer coordinate c of a scaled texture or
+# image becomes floor((c + f) * s), f being where this fragment lies inside its game pixel (fract of the divided
+# gl_FragCoord; 0.5, the middle, outside fragment shaders): a fragment reading its own pixel reads its own texel, a
+# whole factor N gives c * N + the fragment's place in its N x N block. Sizes: floor(size / s) (+ a hundredth for
+# rounding: the image's size is a ceiling). Stores into scaled images outside fragment shaders fill every texel whose
+# centre lies in the game's texel. Sampling with normalized coordinates needs nothing.
+PC_DECL = ('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; '
+           'float tscale; float rscale; float oscale; uint pc_pad; } pc;')
 # vertex shaders with transform feedback: where each capture buffer's bytes go when the runtime has the shader store
 # them itself (device addresses as two words, 0 = captured by transform feedback; runtime gpu_draw.c xfb_begin)
 PC_DECL_XFB = ('layout(push_constant) uniform PC { uint alpha_func; float alpha_ref; float point_size; uint debug; '
-               'uint scale; uint xfb_pad; uvec2 xfb_addr[4]; } pc;')
+               'float tscale; float rscale; float oscale; uint pc_pad; uvec2 xfb_addr[4]; } pc;')
 
 
 class Unsupported(Exception):
@@ -357,7 +362,7 @@ class Translator:
             lv = 'int(%s)' % lod if lod is not None else '0'
             if kind in ('2D', '2DARRAY'):
                 self.uses.add('rscale')
-                offset = '(vec2(%s) * float(tsc(%s)))' % (offset, handle)
+                offset = '(vec2(%s) * tsc(%s))' % (offset, handle)
             if kind == '2D':
                 coords = '(%s + %s / vec2(textureSize(%s, %s)))' % (coords, offset, s, lv)
             elif kind == '2DARRAY':
@@ -1703,9 +1708,11 @@ class Translator:
             self.emit(fmt.format(img=img, c=coords))
             return
         h, dim = block
-        c = 'ivec2(c_.xy * s_ + ivec2(x_, y_))' if dim == '2D' else 'ivec3(c_.xy * s_ + ivec2(x_, y_), c_.z)'
-        self.emit('{ int s_ = tsc(%s); %s c_ = %s;' % (h, 'ivec2' if dim == '2D' else 'ivec3', coords))
-        self.emit('  for (int y_ = 0; y_ < s_; y_++) for (int x_ = 0; x_ < s_; x_++) ' + fmt.format(img=img, c=c) + ' }')
+        c = 'ivec2(x_, y_)' if dim == '2D' else 'ivec3(x_, y_, c_.z)'
+        self.emit('{ float s_ = tsc(%s); %s c_ = %s; ivec2 a_ = rs_lo(c_.xy, s_), b_ = rs_lo(c_.xy + 1, s_);'
+                  % (h, 'ivec2' if dim == '2D' else 'ivec3', coords))
+        self.emit('  for (int y_ = a_.y; y_ < b_.y; y_++) for (int x_ = a_.x; x_ < b_.x; x_++) ' +
+                  fmt.format(img=img, c=c) + ' }')
 
     def op_SUST(self, w, form, pc):
         if bits(w, 52, 1):
@@ -2131,18 +2138,17 @@ class Translator:
             out.append(PC_DECL_XFB if self.xfb else PC_DECL)
         if 'rscale' in self.uses:
             frag = self.stage == 'fragment'
-            out += ['int tsc(uint h) { return ((h >> 18) & 1u) != 0u ? max(int(pc.scale & 0xffu), 1) : 1; }',
-                    'float rs_rt() { return float(max((pc.scale >> 8) & 0xffu, 1u)); }',
-                    # rs_s: where this fragment is inside its guest pixel, worked out once (main) and without an
-                    # integer modulo: the driver has no integer divide, and one per fetched coordinate was 28% of
-                    # the deferred lighting shader's instructions. The float quotient is never near a whole number
-                    # (a pixel centre over 2..4), so its floor is exact
-                    'ivec2 rs_s = ivec2(0);',
-                    ('void rs_init() { int r = int((pc.scale >> 8) & 0xffu); '
-                     'if (r > 1) rs_s = ivec2(gl_FragCoord.xy) - ivec2(gl_FragCoord.xy / float(r)) * r; }') if frag else
-                    'void rs_init() {}',
-                    'ivec2 rs_c2(uint h, ivec2 c) { int s = tsc(h); return s == 1 ? c : c * s + rs_s; }',
-                    'ivec3 rs_c3(uint h, ivec3 c) { int s = tsc(h); return s == 1 ? c : ivec3(c.xy * s + rs_s, c.z); }']
+            out += ['float tsc(uint h) { return ((h >> 18) & 1u) == 0u ? 1.0 : '
+                    'max(((h >> 17) & 1u) != 0u ? pc.oscale : pc.tscale, 1.0); }',
+                    'float rs_rt() { return max(pc.rscale, 1.0); }',
+                    # rs_f: where this fragment lies inside its game pixel, worked out once (main), not per fetched
+                    # coordinate (one integer modulo per fetch was 28% of the deferred lighting shader)
+                    'vec2 rs_f = vec2(0.5);',
+                    'void rs_init() { rs_f = fract(gl_FragCoord.xy / rs_rt()); }' if frag else 'void rs_init() {}',
+                    # the first texel of game texel c at scale s: the first whose centre lies in it
+                    'ivec2 rs_lo(ivec2 c, float s) { return ivec2(ceil(vec2(c) * s - 0.5)); }',
+                    'ivec2 rs_c2(uint h, ivec2 c) { float s = tsc(h); return s == 1.0 ? c : ivec2(floor((vec2(c) + rs_f) * s)); }',
+                    'ivec3 rs_c3(uint h, ivec3 c) { return ivec3(rs_c2(h, c.xy), c.z); }']
         base = STAGE_BASE[self.stage]
         # 16 push descriptor slots per stage (32 in all, the usual maxPushDescriptors) for c[0..16]: c[i] in slot i,
         # and c[16] in a slot this shader leaves free; the runtime reads the slots back from the cbN bindings
@@ -2172,7 +2178,7 @@ class Translator:
                         '    uint t = h & 0xffffu, s = min(h >> 20, 4095u);',
                         '    if (%s) {' % (INT_FLAG % 'h'),
                         '        ivec3 u = textureSize(ut2da[nonuniformEXT(t)], lod);',
-                        '        u.xy /= tsc(h);',
+                        '        u.xy = ivec2(vec2(u.xy) / tsc(h) + 0.01);',
                         '        return uvec4(uvec3(u), uint(textureQueryLevels(usampler2DArray(ut2da[nonuniformEXT(t)], smp[nonuniformEXT(s)]))));',
                         '    }',
                         '    ivec3 z = textureSize(t2da[nonuniformEXT(t)], lod);',
@@ -2181,7 +2187,7 @@ class Translator:
                         '        ivec3 d = textureSize(t3d[nonuniformEXT(t)], lod);',
                         '        if (d != ivec3(1)) { z = d; l = textureQueryLevels(sampler3D(t3d[nonuniformEXT(t)], smp[nonuniformEXT(s)])); }',
                         '    }',
-                        '    z.xy /= tsc(h);',
+                        '    z.xy = ivec2(vec2(z.xy) / tsc(h) + 0.01);',
                         '    return uvec4(uvec3(z), uint(l));',
                         '}']]
         # storage images: set 3, indexed by image id like the texture pool (formatless, except atomics)

@@ -24,16 +24,23 @@ bool gpu_ready;
 struct GpuEnv env;
 
 /* Render scale (the options panel, NX_RES_SCALE): screen-shaped render targets and storage images (image_candidate)
- * are made N times the size the game asked for; viewports, scissors, clears and copies are scaled to match, and
- * shaders learn which textures are scaled from bit 18 of their handles (HANDLE_SCALED) and the scale from the push
- * constants (tools/shader/translate.py: gl_FragCoord, texelFetch, texture sizes and image stores). Images become
- * scaled when first drawn into (rt_view) or bound as storage; a change while playing waits for the GPU and resizes
- * them in place (rescale_all, at a present). Every image is at scale 1 or rs_scale. */
-u32 rs_scale = 1;                       /* the scale in use (render thread, under gpu_cs) */
-static volatile LONG rs_want = 1;       /* the scale asked for */
+ * are made s times the size the game asked for (sc_size), s from 1 to 4 in 120ths (a 1080p game's height in 9-pixel
+ * steps: 4/3 = 1440p, 2 = 2160p, 8/3 = 2880p; 120ths keep 1920 x 1080 on whole pixels); viewports, scissors,
+ * clears and copies are scaled to match (sc_edge), and shaders learn which textures are scaled from bit 18 of their
+ * handles (HANDLE_SCALED) and the scale from the push constants (tools/shader/translate.py: gl_FragCoord, texelFetch,
+ * texture sizes and image stores). Images become scaled when first drawn into (rt_view) or bound as storage; a
+ * change while playing waits for the GPU and resizes them in place (rescale_all, at a present). Every image is at
+ * scale 1 or rs_scale. */
+float rs_scale = 1;                     /* the scale in use (render thread, under gpu_cs) */
+float rs_in = 1;                        /* the scene's (gpu_int.h) */
+bool post_phase;
+static volatile LONG rs_want = 120;     /* the scale asked for, in 120ths */
 bool rs_hint;                           /* an image made now is a render target or storage image */
-void gpu_render_scale_set(u32 s) { InterlockedExchange(&rs_want, (LONG)(s < 1 ? 1 : s > 4 ? 4 : s)); }
-u32 gpu_render_scale(void) { return (u32)rs_want; }
+void gpu_render_scale_set(float s) {
+    LONG k = (LONG)lroundf((s > 0 ? s : 1) * 120.0f);
+    InterlockedExchange(&rs_want, k < 120 ? 120 : k > 480 ? 480 : k);
+}
+float gpu_render_scale(void) { return (float)rs_want / 120.0f; }
 void vk_wait_idle(void);
 
 /* ---------------------------------------------------------------------------------------------- submissions */
@@ -750,23 +757,26 @@ bool gpu_wait(u64 value, u64 timeout_ns) {
 /* a new render scale, between frames: everything submitted has run (nothing recorded uses the old images, and
  * descriptor sets can be rewritten), then every scaled image and every render or storage target the game has used is
  * remade at the new scale with its contents blitted over */
-static void rescale_all(u32 s) {
+static void rescale_all(float s, float in) {
     vk_wait_idle();
     reap();
-    u32 from = rs_scale;
+    float from = rs_scale, from_in = rs_in;
     rs_scale = s;
+    rs_in = in;
     Image **list = malloc((nimages + 1) * sizeof *list);
     int n = 0;
     for (int b = 0; b < IMAGE_BUCKETS; b++)
         for (Image *im = buckets[b]; im; im = im->next)
-            if (n < nimages && im->can_scale && (im->scale != s) && (im->scale > 1 || im->rt_frame || im->gpu_written)) {
+            if (n < nimages && im->can_scale && im->scale != img_want_scale(im) &&
+                (im->scale > 1 || im->rt_frame || im->gpu_written)) {
                 im->used = frame_no + 1;        /* not evicted while the others are made */
                 list[n++] = im;
             }
     u64 before = image_bytes;
-    for (int i = 0; i < n; i++) image_rescale(list[i], s);
+    for (int i = 0; i < n; i++) image_rescale(list[i], img_want_scale(list[i]));
     free(list);
-    hlog(0, "gpu: render scale %ux -> %ux: %d images remade, %llu -> %llu MB", from, s, n, before >> 20, image_bytes >> 20);
+    hlog(0, "gpu: render scale %.3gx (scene %.3gx) -> %.3gx (scene %.3gx): %d images remade, %llu -> %llu MB", from,
+         from_in, s, in, n, before >> 20, image_bytes >> 20);
 }
 
 /* What the images may hold of video memory (gpu_present evicts above it). With VK_EXT_memory_budget: 90% of what the
@@ -832,8 +842,10 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     if (im) image_upload(im);
     double t_flush0 = ms_now();
     flush();
-    if ((u32)rs_want != rs_scale) {     /* the options panel changed it: im is remade in place */
-        rescale_all((u32)rs_want);
+    float want_out = gpu_render_scale(), want_in = taa_scene_scale(want_out);
+    post_phase = false;                 /* (a new frame) */
+    if (want_out != rs_scale || want_in != rs_in) {     /* the options panel changed it: im is remade in place */
+        rescale_all(want_out, want_in);
         flush();
     }
     double t_flush = ms_now();
@@ -883,9 +895,11 @@ u64 gpu_present(u64 queue, Window *w, u32 index) {
     /* lower-left origin: row 0 is the bottom of the picture */
     u64 v = submitted;
     double t_vk = ms_now();
-    s32 S = im ? (s32)im->scale : 1;    /* the crop is in the game's pixels */
+    float S = im ? im->scale : 1;       /* the crop is in the game's pixels */
+    s32 cx0 = sc_edge(w->crop[0], S), cy0 = sc_edge(w->crop[1], S);
     vk_present(im ? im->image : NULL, im ? im->format : VK_FORMAT_UNDEFINED, im ? lvl_w(im, 0) : 0, im ? lvl_h(im, 0) : 0,
-               w->crop[0] * S, w->crop[1] * S, cw * S, ch * S, window_origin == 0, timeline, v);
+               cx0, cy0, sc_edge(w->crop[0] + cw, S) - cx0, sc_edge(w->crop[1] + ch, S) - cy0, window_origin == 0,
+               timeline, v);
     double t_end = ms_now();
     t_present_ms += t_end - t_present0;
     hf.present += t_end - t_present0;

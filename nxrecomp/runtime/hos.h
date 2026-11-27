@@ -31,7 +31,8 @@
 #define HOSTCALL_BASE   0x7181000000ull     /* guest addresses of host functions (never mapped) */
 #define HOSTCALL_MAX    4096
 
-#define TOTAL_MEMORY    0xcd500000ull       /* the application pool reported to the game */
+#define TOTAL_MEMORY    0xcd500000ull       /* the application pool reported to the game ... */
+extern u64 nx_total_memory;                 /* ... as given (game code may add to it before the game starts) */
 
 /* memory states (the low byte, as svcQueryMemory reports it) and permissions */
 enum { MS_FREE = 0, MS_IO = 1, MS_NORMAL = 2, MS_CODE = 3, MS_CODEDATA = 4, MS_HEAP = 5, MS_SHARED = 6,

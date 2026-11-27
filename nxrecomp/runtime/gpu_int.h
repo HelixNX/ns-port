@@ -6,6 +6,7 @@
 #include "astc.h"
 #include "trace.h"
 #include "game_config.h"
+#include <math.h>
 #include <process.h>
 #include <stdlib.h>
 #include <windows.h>
@@ -31,8 +32,16 @@ struct GpuEnv {
     char dump[256];
 };
 extern struct GpuEnv env;
-extern u32 rs_scale;
+extern float rs_scale;                  /* the output's scale: images drawn after the frame's resolve (Image.post) */
+extern float rs_in;                     /* the scene's: rs_scale, or lower while FSR 2 upscales (gpu_taa.c) */
 extern bool rs_hint;
+extern bool post_phase;                 /* this frame's resolve is done: targets drawn now are the output's */
+/* Render scale arithmetic (any factor s >= 1, in 120ths: gpu.c). A scaled image's size is ceil(size * s) (a hundredth of
+ * a pixel spare, so that 1920 * 4/3 is 2560); a rectangle's edge x is the first texel whose centre lies at or past x
+ * (ceil(x * s - 0.5)), the texels a viewport covers. A whole factor N gives size * N and x * N. Shaders map texels
+ * the same way (translate.py rs_c2, rs_lo). */
+static inline u32 sc_size(u32 v, float s) { return s == 1.0f ? v : (u32)ceilf((float)v * s - 0.01f); }
+static inline s32 sc_edge(s32 x, float s) { return s == 1.0f ? x : (s32)ceilf((float)x * s - 0.5f); }
 
 /* ---------------------------------------------------------------------------------------------- submissions */
 #define SLOTS 12
@@ -199,16 +208,20 @@ typedef struct Image {
     View *views;
     int nviews, capviews;
     struct Image *next;
-    u32 scale;                          /* render scale it was made at: its Vulkan size is the guest size times this */
+    float scale;                        /* render scale it was made at (1 or rs_scale): its Vulkan size is sc_size */
     bool can_scale;                     /* screen-shaped (image_candidate), or drawn with a scaled depth (image_promote) */
+    bool post;                          /* drawn after a frame's resolve (or its target): at rs_scale, not rs_in */
     VkImageCreateFlags cflags;
     u64 fresh;                          /* the slot (slot_serial) its Vulkan image was made in, until its first upload */
     bool zero_pending;                  /* ... and not zeroed yet (images_zero) */
 } Image;
 
+/* the scale im should be at */
+static inline float img_want_scale(const Image *im) { return !im->can_scale ? 1.0f : im->post ? rs_scale : rs_in; }
+
 /* level l's Vulkan size */
-static inline u32 lvl_w(const Image *im, u32 l) { u32 w = (im->info.width * im->scale) >> l; return w ? w : 1; }
-static inline u32 lvl_h(const Image *im, u32 l) { u32 h = (tex_height(&im->info) * im->scale) >> l; return h ? h : 1; }
+static inline u32 lvl_w(const Image *im, u32 l) { u32 w = sc_size(im->info.width, im->scale) >> l; return w ? w : 1; }
+static inline u32 lvl_h(const Image *im, u32 l) { u32 h = sc_size(tex_height(&im->info), im->scale) >> l; return h ? h : 1; }
 
 /* Pitch-linear textures are memory the CPU may read as it is (on the console, one memory): what the GPU writes
  * into one is copied back to guest memory at the end of the submission (flush), before its syncs signal. Violet's
@@ -240,6 +253,7 @@ VkFormat usable_format(u32 nvn);
  * view is undefined: AMD returned garbage for the stencil a culling pass reads, hiding objects near the camera) */
 #define HANDLE_INT (1u << 19)
 #define HANDLE_SCALED (1u << 18)        /* the texture or image is at the render scale (translate.py SCALED_FLAG) */
+#define HANDLE_OUT (1u << 17)           /* ... at the output's (rs_scale), not the scene's (rs_in) */
 Image *image_find(const TexInfo *t, u32 *layer, u32 *level);
 Image *image_ref(const TexRef *r, ViewInfo *v);
 Image *image_get(const TexInfo *t);
@@ -252,7 +266,7 @@ typedef struct { VkImage image; VkAlloc alloc; } Temp;
 bool temp_image(VkFormat f, u32 w, u32 h, u32 levels, u32 layers, Temp *t);
 static inline void temp_free(Temp *t) { bury(DEAD_IMAGE, t->image, &t->alloc); }
 bool scale_blittable(const Image *im);
-void image_rescale(Image *im, u32 s);
+void image_rescale(Image *im, float s);
 bool image_promote(Image *im);
 void image_upload(Image *im);
 void images_zero(void);
@@ -290,7 +304,7 @@ typedef struct State {
     VkFormat rt_format[8], depth_format, stencil_format;     /* of the rendering in progress */
     struct { u64 addr, size; u32 level, layer, nlayers; } rt_sub[9];    /* ... its targets (8: depth; size 0: none) */
     u32 samples;
-    u32 rt_scale;                       /* ... the scale its targets were made at (1 or rs_scale) */
+    float rt_scale;                     /* ... the scale its targets were made at (1 or rs_scale; 0: not known yet) */
     BufferRange xfb[4];                 /* transform feedback buffers, the bytes captured into each since bound */
     u64 xfb_written[4];
     bool xfb_active;                    /* between Begin (or Resume) and End (or Pause) */
@@ -363,16 +377,18 @@ void occ_resolve(void);
 #define SMPPOOL_MAX 4096
 extern VkDescriptorSetLayout set_ubo, set_tex, set_smp, set_img;
 extern VkPipelineLayout layout_gfx;
-/* push constants (translate.py): alpha function and reference, point size, debug bits, render scale; one range for
- * every stage (compute reads only the scale) */
+/* push constants (translate.py): alpha function and reference, point size, debug bits, the render scale of scaled
+ * textures and of the pass's targets (floats); one range for every stage (compute reads only the scale) */
 #define PC_STAGES (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT)
-#define PC_SIZE 20
-#define PC_XFB_SIZE 36                  /* after it: a pad word, then 4 capture addresses (translate.py PC_DECL_XFB) */
+#define PC_SIZE 32
+#define PC_XFB_SIZE 32                  /* after it: 4 capture addresses (translate.py PC_DECL_XFB) */
 extern VkDescriptorSet empty_tex, empty_smp, empty_img;
 extern u64 submit_serial;
 extern u32 window_origin, depth_mode;
 /* temporal anti-aliasing, FSR 2 (gpu_taa.c; the menu's switches are in options.h) */
 void taa_init(void);
+float taa_scene_scale(float out);       /* the scene's scale for output scale out (lower while upscaling) */
+void taa_resolve_pass(void);            /* draw_one, before the dynamic state: the resolve draw at the scene's scale */
 void taa_note_draw(u32 op, const void *payload);
 void taa_pass_depth(Image *d);
 void taa_after_draw(u64 fs_hash, Image *pic);

@@ -40,8 +40,8 @@ static NxUiImGui dll_imgui;
 
 static int32_t get_rate(void) { return options_framerate(); }
 static void set_rate(int32_t r) { options_set_framerate(r); }
-static uint32_t get_scale(void) { return options_render_scale(); }
-static void set_scale(uint32_t s) { options_set_render_scale(s); }
+static float get_scale(void) { return options_render_scale(); }
+static void set_scale(float s) { options_set_render_scale(s); }
 static int hk_key(int i) { return (int)options_hotkey_key(i); }
 static void set_hk_key(int i, int k) { options_set_hotkey_key(i, (SDL_Scancode)k); }
 static int get_key(int a) { return (int)input_key(a); }
@@ -88,7 +88,7 @@ bool ui_init(SDL_Window *window) {
         .theme = NX_UI_THEME, .setting = options_get, .set_setting = options_set,
         .taa_available = taa_available(), .taa_failed = taa_failed, .taa_mode = taa_mode, .set_taa_mode = taa_set_mode,
         .taa_sharpness = taa_sharpness, .set_taa_sharpness = taa_set_sharpness, .taa_jitter = taa_jitter,
-        .set_taa_jitter = taa_set_jitter,
+        .set_taa_jitter = taa_set_jitter, .taa_ratio = taa_ratio, .set_taa_ratio = taa_set_ratio,
 #ifdef NX_NETPLAY
         .netplay = true, .room_state = netmenu_state, .room_message = netmenu_message, .room_join = netmenu_join,
         .room_leave = netmenu_leave, .in_session = netmenu_in_session, .lobby_refresh = netmenu_lobby_refresh,

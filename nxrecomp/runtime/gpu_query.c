@@ -7,14 +7,14 @@
  * at every report and reset. The sums cannot be made on the GPU; they are made here once the submission is done,
  * before any guest thread can learn that it is (gpu_completed, gpu_wait), and written to the report's place then.
  *
- * Counts are in the game's pixels: a pass at render scale N counts N * N samples for each.
+ * Counts are in the game's pixels: a pass at render scale s counts about s * s samples for each.
  *
  * The render thread records (under gpu_cs); guest threads resolve as well, under occ_lock only. */
 #include "gpu_int.h"
 
 #define OCC_MAX 16384                   /* queries per submission (a traced frame has two for each draw) */
 enum { OCC_QUERY, OCC_RESET, OCC_REPORT };
-typedef struct OccEvent { u8 kind, scale; u32 tag; u8 *dst; u64 ts; } OccEvent;    /* tag: occ_draw_begin's, + 1 */
+typedef struct OccEvent { u8 kind; float scale; u32 tag; u8 *dst; u64 ts; } OccEvent;    /* tag: occ_draw_begin's, + 1 */
 typedef struct OccSlot { VkQueryPool pool; OccEvent *ev; u32 nev, cap, nq; u64 value; } OccSlot;
 static OccSlot occ[SLOTS];
 static int fifo[SLOTS];                 /* submitted slots with events, oldest first */
@@ -28,7 +28,7 @@ static bool occ_open;                   /* a query is open in the pass being rec
 static void event(u8 kind, u8 *dst) {
     OccSlot *o = &occ[cur];
     if (o->nev == o->cap) o->ev = realloc(o->ev, (o->cap = o->cap * 2 + 256) * sizeof *o->ev);
-    o->ev[o->nev++] = (OccEvent){kind, (u8)(st.rt_scale ? st.rt_scale : 1), 0, dst, kind == OCC_REPORT ? now_ns() : 0};
+    o->ev[o->nev++] = (OccEvent){kind, st.rt_scale > 0 ? st.rt_scale : 1, 0, dst, kind == OCC_REPORT ? now_ns() : 0};
 }
 
 static void start(void) {
@@ -141,8 +141,8 @@ void occ_resolve(void) {
         for (u32 i = 0; i < o->nev; i++) {
             const OccEvent *e = &o->ev[i];
             if (e->kind == OCC_QUERY) {
-                u64 s2 = (u64)e->scale * e->scale, n = res[q++];
-                occ_total += (n + s2 - 1) / s2;
+                u64 n = res[q++];
+                occ_total += e->scale == 1 ? n : (u64)ceil((double)n / ((double)e->scale * e->scale) - 1e-6);
                 if (e->tag) query_result(e->tag - 1, n);
             } else if (e->kind == OCC_RESET) {
                 occ_total = 0;

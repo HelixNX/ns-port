@@ -1,7 +1,7 @@
 /* Settings: settings.ini in the cache folder (nx_cache_dir: build\ in a development build, %LOCALAPPDATA%\<title>\ in
  * a package), "key=value" lines, written by the window thread soon after any change (options_tick).
  *
- * Video: frame rate (the game's own 30 or 60; a development build also 120 and uncapped), render scale (1-4x the
+ * Video: frame rate (the game's own 30 or 60; a development build also 120 and uncapped), render scale (1-4x in 120ths, the
  * game's 1080p, gpu.c), the FPS counter, fullscreen (borderless). The menu (ui.cpp, render thread) only records
  * what it wants; options_tick applies it on the window thread, which owns the window and the swapchain's pacing.
  * Mouse: sensitivity (0.25-4x of input.c's scale), invert Y, the resting speed below which the stick stays centred.
@@ -12,6 +12,7 @@
 #include "options.h"
 #include "framerate.h"
 #include "hos.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +20,8 @@
 
 void overlay_set(bool on);
 bool overlay_shown(void);
-void gpu_render_scale_set(u32 s);
-u32 gpu_render_scale(void);
+void gpu_render_scale_set(float s);
+float gpu_render_scale(void);
 void gpu_capture_next(void);
 SDL_Window *vk_window(void);
 void ui_toggle_menu(void);
@@ -74,8 +75,12 @@ static bool fullscreen;
 
 s32 options_framerate(void) { return want_rate != 0x7fffffff ? (s32)want_rate : nx_framerate(); }
 void options_set_framerate(s32 r) { InterlockedExchange(&want_rate, r); }
-u32 options_render_scale(void) { return want_scale ? (u32)want_scale : gpu_render_scale(); }
-void options_set_render_scale(u32 s) { InterlockedExchange(&want_scale, (LONG)(s < 1 ? 1 : s > 4 ? 4 : s)); }
+/* want_scale: 120ths (gpu.c), 0 = no change asked */
+float options_render_scale(void) { return want_scale ? (float)want_scale / 120.0f : gpu_render_scale(); }
+void options_set_render_scale(float s) {
+    LONG k = (LONG)lroundf(s * 120.0f);
+    InterlockedExchange(&want_scale, k < 120 ? 120 : k > 480 ? 480 : k);
+}
 bool options_fps_counter(void) { return want_fps >= 0 ? want_fps != 0 : overlay_shown(); }
 void options_set_fps_counter(bool on) { InterlockedExchange(&want_fps, on); }
 bool options_fullscreen(void) { return want_full >= 0 ? want_full != 0 : fullscreen; }
@@ -166,10 +171,10 @@ void options_init(void) {
         nx_framerate_set(r);
     }
     if ((v = options_get("fps_counter", NULL)) && !getenv("NX_FPS")) overlay_set(atoi(v) != 0);
-    if ((v = options_get("render_scale", NULL))) gpu_render_scale_set((u32)atoi(v));
+    if ((v = options_get("render_scale", NULL))) gpu_render_scale_set((float)atof(v));
     const char *rs = getenv("NX_RES_SCALE");
-    if (rs) gpu_render_scale_set((u32)atoi(rs));
-    if (gpu_render_scale() > 1) hlog(0, "options: render scale %ux", gpu_render_scale());
+    if (rs) gpu_render_scale_set((float)atof(rs));
+    if (gpu_render_scale() > 1) hlog(0, "options: render scale %.3gx", gpu_render_scale());
     sens = options_get_float("mouse_sensitivity", 1.0f);
     if (getenv("NX_MOUSE_SENS")) sens = (float)atof(getenv("NX_MOUSE_SENS"));
     if (!(sens >= SENS_MIN)) sens = sens > 0 ? SENS_MIN : 1.0f;
@@ -189,7 +194,12 @@ void options_tick(void) {
     LONG r = InterlockedExchange(&want_rate, 0x7fffffff);
     if (r != 0x7fffffff) { nx_framerate_set(r); options_set_int("framerate", r); }
     LONG s = InterlockedExchange(&want_scale, 0);
-    if (s) { gpu_render_scale_set((u32)s); options_set_int("render_scale", s); }
+    if (s) {
+        char t[16];
+        snprintf(t, sizeof t, "%.5g", (double)s / 120.0);  /* 1.3333, 1.5, 2: read back to the same 120th */
+        gpu_render_scale_set((float)s / 120.0f);
+        options_set("render_scale", t);
+    }
     LONG fp = InterlockedExchange(&want_fps, -1);
     if (fp >= 0) { overlay_set(fp != 0); options_set_int("fps_counter", fp); }
     LONG fs = InterlockedExchange(&want_full, -1);

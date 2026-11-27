@@ -11,6 +11,10 @@
  *     into an image of ours, and that is copied back over the picture; the HUD follows unjittered.
  * A frame FSR 2 did not resolve is never shown jittered: jitter only follows a resolved frame (at most the first
  * jittered frame after a pause shows unresolved).
+ * Upscaling (TAA_UPSCALE): the scene renders at a lower scale than the output (rs_in < rs_scale, gpu.c), the resolve
+ * draw at the scene's scale into the top-left of the output-sized picture (taa_resolve_pass), FSR 2 makes the
+ * output from it, and targets drawn after it (the HUD) are the output's (Image.post, HANDLE_OUT). A frame FSR 2 does
+ * not resolve gets that corner stretched over the picture instead (upscale_plain).
  * On / off and the sharpening are the menu's (Options > Video, settings.ini "taa" / "taa_sharpness"; a change takes
  * the next frame, history reset); NX_TAA=0/1 and NX_TAA_SHARPNESS (0-1, default 0.3: FSR 2's RCAS) decide at start
  * when set. NX_TAA_JITTER=0 (or the development menu's Jitter): no jitter (motion vectors and history only, to
@@ -38,6 +42,7 @@ static struct {
     /* counts since the last log line (every 600 frames): resolved, of those reset; scene draws jittered, scene draws
      * left unjittered as full-screen triangles, other draws */
     u32 n_res, n_reset, n_jit, n_full, n_other, n_frames;
+    u32 n_why[4];                       /* resolves not done: no camera / depth, sizes, other */
     /* ours: motion vectors (render size), FSR 2's output (output size), views of the game's depth and picture */
     VkImage mv, out;
     VkAlloc mv_a, out_a;
@@ -57,6 +62,8 @@ float taa_jit[2];
 static volatile LONG want_mode;         /* TAA_* (gpu_int.h) */
 static volatile float want_sharp = 0.3f;
 static volatile LONG want_jitter = 1;   /* (NX_TAA_JITTER; the development menu's switch) */
+static volatile LONG want_ratio = 160;  /* TAA_UPSCALE: output / scene, in 120ths (4/3 default: 1080p -> 1440p) */
+static bool low_pass;                   /* this frame's resolve draw ran at the scene's scale (taa_resolve_pass) */
 
 static float clamp01(float v) { return !(v > 0) ? 0 : v > 1 ? 1 : v; }
 
@@ -64,12 +71,27 @@ bool taa_available(void) { return true; }
 bool taa_failed(void) { return taa.broken; }
 int taa_mode(void) { return (int)want_mode; }
 void taa_set_mode(int m) {
-    m = m == TAA_NATIVE ? TAA_NATIVE : TAA_OFF;
+    m = m == TAA_NATIVE || m == TAA_UPSCALE ? m : TAA_OFF;
     InterlockedExchange(&want_mode, m);
     options_set_int("taa", m);
 }
 bool taa_jitter(void) { return want_jitter != 0; }
 void taa_set_jitter(bool on) { InterlockedExchange(&want_jitter, on); }
+float taa_ratio(void) { return (float)want_ratio / 120.0f; }
+void taa_set_ratio(float r) {
+    LONG k = (LONG)lroundf(r * 120.0f);
+    InterlockedExchange(&want_ratio, k < 120 ? 120 : k > 480 ? 480 : k);
+    char t[16];
+    snprintf(t, sizeof t, "%.5g", (double)want_ratio / 120.0);
+    options_set("taa_ratio", t);
+}
+/* the scene's scale: the output's over the ratio, in 120ths like every scale (gpu.c), never below the game's size */
+float taa_scene_scale(float out) {
+    if (want_mode != TAA_UPSCALE || taa.broken) return out;
+    long k = lroundf(out * 120.0f / ((float)want_ratio / 120.0f));
+    float in = (float)(k < 120 ? 120 : k) / 120.0f;
+    return in < out ? in : out;
+}
 float taa_sharpness(void) { return want_sharp; }
 void taa_set_sharpness(float s) {
     want_sharp = clamp01(s);
@@ -78,7 +100,11 @@ void taa_set_sharpness(float s) {
 
 void taa_init(void) {
     const char *e = getenv("NX_TAA");
-    want_mode = (e ? atoi(e) : options_get_int("taa", TAA_OFF)) ? TAA_NATIVE : TAA_OFF;
+    int m = e ? atoi(e) : options_get_int("taa", TAA_OFF);
+    want_mode = m == TAA_UPSCALE ? TAA_UPSCALE : m ? TAA_NATIVE : TAA_OFF;
+    float r = (e = getenv("NX_TAA_RATIO")) ? (float)atof(e) : options_get_float("taa_ratio", 4.0f / 3.0f);
+    LONG k = (LONG)lroundf(r * 120.0f);
+    want_ratio = k < 120 ? 120 : k > 480 ? 480 : k;
     want_sharp = clamp01((e = getenv("NX_TAA_SHARPNESS")) ? (float)atof(e) : options_get_float("taa_sharpness", 0.3f));
     want_jitter = !(e = getenv("NX_TAA_JITTER")) || atoi(e);
     taa.sx = taa.sy = 1;
@@ -103,8 +129,10 @@ static void taa_frame(void) {
     }
     taa.frame = frame_no;
     if (taa.on && ++taa.n_frames >= 600) {
-        hlog(0, "taa: last 600 frames: %u resolved (%u reset), per frame %.1f jittered draws, %.1f full-screen, %.1f other",
-             taa.n_res, taa.n_reset, taa.n_jit / 600.0, taa.n_full / 600.0, taa.n_other / 600.0);
+        hlog(0, "taa: last 600 frames: %u resolved (%u reset), per frame %.1f jittered draws, %.1f full-screen, %.1f other; "
+                "not resolved: %u no camera, %u no depth, %u sizes", taa.n_res, taa.n_reset, taa.n_jit / 600.0,
+             taa.n_full / 600.0, taa.n_other / 600.0, taa.n_why[0], taa.n_why[1], taa.n_why[2]);
+        memset(taa.n_why, 0, sizeof taa.n_why);
         taa.n_res = taa.n_reset = taa.n_jit = taa.n_full = taa.n_other = taa.n_frames = 0;
     }
     taa.jx = taa.jy = 0;
@@ -268,21 +296,69 @@ static void off(const char *why) {
     if (taa_draw_jitter) { taa_draw_jitter = false; dyn_gen++; }
 }
 
+/* draw_one, the resolve draw (upscaling): drawn at the scene's scale, into the top-left of the output-sized picture */
+void taa_resolve_pass(void) {
+    if (!taa.on || taa.broken || rs_in == rs_scale || pipe_fs_hash != NX_TAA_RESOLVE_FS) return;
+    if (st.rt_scale > rs_in) {
+        st.rt_scale = rs_in;
+        dyn_gen++;                      /* (the viewport and scissor) */
+        low_pass = true;
+    }
+}
+
+/* a frame not resolved after an upscaled resolve draw: its top-left corner (the scene's size) stretched over the
+ * picture, through a copy (a blit within one image must not overlap) */
+static void upscale_plain(Image *pic) {
+    end_rendering();
+    u32 w = sc_size(pic->info.width, rs_in), h = sc_size(tex_height(&pic->info), rs_in);
+    u32 ow = lvl_w(pic, 0), oh = lvl_h(pic, 0);
+    Temp t;
+    if (w >= ow || !temp_image(pic->format, w, h, 1, 1, &t)) return;
+    barrier();
+    VkImageCopy c = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImage(cmd(), pic->image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    barrier();
+    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(s32)w, (s32)h, 1}},
+                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(s32)ow, (s32)oh, 1}}};
+    vkCmdBlitImage(cmd(), t.image, VK_IMAGE_LAYOUT_GENERAL, pic->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+    barrier();
+    temp_free(&t);
+}
+
+static bool resolve(Image *pic);
+
 /* after each draw: the tone-map draw (game.json "taa".resolve_fs) is followed by the resolve. pic: its target */
 void taa_after_draw(u64 fs_hash, Image *pic) {
-    if (!taa.on || taa.broken || fs_hash != NX_TAA_RESOLVE_FS || !pic || taa.ok_frame == frame_no) return;
+    if (fs_hash != NX_TAA_RESOLVE_FS || !pic) return;
+    bool low = low_pass;
+    low_pass = false;
+    if (!taa.on || taa.broken) {
+        if (low) upscale_plain(pic);
+        return;
+    }
+    if (rs_in != rs_scale) {            /* what is drawn from here on is the output's */
+        post_phase = true;
+        if (pic->can_scale) pic->post = true;
+    }
+    if (taa.ok_frame == frame_no) return;
+    if (!resolve(pic) && low) upscale_plain(pic);
+}
+
+static bool resolve(Image *pic) {
     Image *d = taa.depth;
-    if (taa.vp_frame != frame_no || !d || d->info.addr != taa.depth_addr) return;   /* no camera / depth this frame */
-    u32 w = d->info.width * d->scale, h = d->info.height * d->scale;
-    u32 ow = pic->info.width * pic->scale, oh = pic->info.height * pic->scale;
-    if (w > ow || h > oh || !w || !h) return;
-    if (!mv_pipeline()) { off("motion vector pipeline not made"); return; }
+    if (taa.vp_frame != frame_no) { taa.n_why[0]++; return false; }                     /* no camera this frame */
+    if (!d || d->info.addr != taa.depth_addr) { taa.n_why[1]++; return false; }
+    u32 w = lvl_w(d, 0), h = lvl_h(d, 0);
+    u32 ow = lvl_w(pic, 0), oh = lvl_h(pic, 0);
+    if (w > ow || h > oh || !w || !h) { taa.n_why[2]++; return false; }
+    if (!mv_pipeline()) { off("motion vector pipeline not made"); return false; }
     end_rendering();
-    if (!images(w, h, ow, oh)) { off("images not made"); return; }
+    if (!images(w, h, ow, oh)) { off("images not made"); return false; }
     VkImageView dv = game_view(d, VK_IMAGE_ASPECT_DEPTH_BIT, &taa.depth_img, &taa.depth_v);
     VkImageView cv = game_view(pic, VK_IMAGE_ASPECT_COLOR_BIT, &taa.color_img, &taa.color_v);
-    if (!dv || !cv) { off("views not made"); return; }
+    if (!dv || !cv) { off("views not made"); return false; }
     VkCommandBuffer c = cmd();
+    prof_mark("taa: motion vectors (and the barriers around)");
     barrier();                          /* the depth and the picture are written */
     /* motion vectors: last VP x inverse of this VP */
     bool have_prev = taa.vp_prev_frame + 1 == frame_no;
@@ -313,26 +389,31 @@ void taa_after_draw(u64 fs_hash, Image *pic) {
     const float *m = taa.vp;
     float ysc = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
     Fsr2Frame f = {.color = pic->image, .depth = d->image, .mv = taa.mv, .color_view = cv, .depth_view = dv, .mv_view = taa.mv_v,
-                   .color_format = pic->format, .depth_format = d->format, .out = taa.out, .out_view = taa.out_v,
+                   .color_format = pic->format, .depth_format = d->format, .color_w = ow, .color_h = oh,
+                   .out = taa.out, .out_view = taa.out_v,
                    .out_format = VK_FORMAT_R16G16B16A16_SFLOAT, .w = w, .h = h, .ow = ow, .oh = oh,
                    .jx = taa.jx, .jy = taa.jy, .dt_ms = fminf(fmaxf(dt, 1), 100), .near_z = m[14] > 0 ? m[14] : 0.1f,
                    .far_z = 1e6f, .fov_y = ysc > 0 ? 2 * atanf(1 / ysc) : 0.8f, .sharpness = taa.sharp,
                    .depth_inverted = true, .depth_infinite = true, .reset = !have_prev || taa.ok_frame + 1 != frame_no};
-    if (!fsr2_record(c, &f)) { off("FSR 2 failed"); return; }
+    prof_mark("taa: FSR 2");
+    if (!fsr2_record(c, &f)) { off("FSR 2 failed"); return false; }
+    prof_mark("taa: copy back");
     barrier_src(c, VK_ACCESS_2_MEMORY_WRITE_BIT);
     /* back over the picture (the HUD is drawn on it next) */
     VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(s32)ow, (s32)oh, 1}},
                       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(s32)ow, (s32)oh, 1}}};
     vkCmdBlitImage(c, taa.out, VK_IMAGE_LAYOUT_GENERAL, pic->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
     barrier();
+    prof_mark("outside passes (copies, clears, barriers)");
     taa.ok_frame = frame_no;
     taa.n_res++;
     taa.n_reset += f.reset;
-    static bool told;
-    if (!told) {
-        told = true;
-        hlog(0, "taa: first frame resolved: %ux%u -> %ux%u, near %.3f, fov %.1f deg", w, h, ow, oh, f.near_z, f.fov_y * 57.2958f);
+    static u32 told_w, told_ow;
+    if (told_w != w || told_ow != ow) {
+        told_w = w, told_ow = ow;
+        hlog(0, "taa: resolved %ux%u -> %ux%u, near %.3f, fov %.1f deg", w, h, ow, oh, f.near_z, f.fov_y * 57.2958f);
     }
+    return true;
 }
 #else
 void taa_init(void) {
@@ -349,6 +430,10 @@ void taa_set_sharpness(float s) { (void)s; }
 void taa_note_draw(u32 op, const void *payload) { (void)op; (void)payload; }
 void taa_pass_depth(Image *d) { (void)d; }
 void taa_after_draw(u64 fs_hash, Image *pic) { (void)fs_hash; (void)pic; }
+float taa_scene_scale(float out) { return out; }
+void taa_resolve_pass(void) {}
+float taa_ratio(void) { return 1; }
+void taa_set_ratio(float r) { (void)r; }
 bool taa_draw_jitter;
 float taa_jit[2];
 #endif

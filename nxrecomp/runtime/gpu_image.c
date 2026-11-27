@@ -333,15 +333,19 @@ static void bucket_unlink(Image *im) {
 
 /* a whole level (guest size w x h x depth, n layers) of s into d: copied at one scale, blitted between two */
 static void img_copy(Image *s, u32 sl, u32 slayer, Image *d, u32 dl, u32 dlayer, u32 n, u32 w, u32 h, u32 depth) {
-    if (s->scale == d->scale) {
-        VkImageCopy c = {{s->aspects, sl, slayer, n}, {0, 0, 0}, {d->aspects, dl, dlayer, n}, {0, 0, 0},
-                         {w * s->scale, h * s->scale, depth}};
+    u32 sw = sc_size(w, s->scale), sh = sc_size(h, s->scale), dw = sc_size(w, d->scale), dh = sc_size(h, d->scale);
+    if (sw > lvl_w(s, sl)) sw = lvl_w(s, sl);
+    if (sh > lvl_h(s, sl)) sh = lvl_h(s, sl);
+    if (dw > lvl_w(d, dl)) dw = lvl_w(d, dl);
+    if (dh > lvl_h(d, dl)) dh = lvl_h(d, dl);
+    if (s->scale == d->scale && sw == dw && sh == dh) {
+        VkImageCopy c = {{s->aspects, sl, slayer, n}, {0, 0, 0}, {d->aspects, dl, dlayer, n}, {0, 0, 0}, {sw, sh, depth}};
         vkCmdCopyImage(cmd(), s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         return;
     }
     if (s->info.samples > 1 || d->info.samples > 1 || !blit_ok(s, d)) return;
-    VkImageBlit b = {{s->aspects, sl, slayer, n}, {{0, 0, 0}, {(s32)(w * s->scale), (s32)(h * s->scale), (s32)depth}},
-                     {d->aspects, dl, dlayer, n}, {{0, 0, 0}, {(s32)(w * d->scale), (s32)(h * d->scale), (s32)depth}}};
+    VkImageBlit b = {{s->aspects, sl, slayer, n}, {{0, 0, 0}, {(s32)sw, (s32)sh, (s32)depth}},
+                     {d->aspects, dl, dlayer, n}, {{0, 0, 0}, {(s32)dw, (s32)dh, (s32)depth}}};
     vkCmdBlitImage(cmd(), s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                    smooth(s->format));
 }
@@ -500,7 +504,7 @@ static Image *image_make(const TexInfo *t, u32 h) {
     if (type == VK_IMAGE_TYPE_3D) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     im->cflags = flags;
     im->can_scale = image_candidate(t, fmt, usage);
-    im->scale = im->can_scale && rs_hint ? rs_scale : 1;
+    im->scale = im->can_scale && rs_hint ? rs_in : 1;
     if (!image_vk_create(im)) {
         free(im);
         return NULL;
@@ -529,13 +533,13 @@ static bool image_vk_create(Image *im) {
         .viewFormatCount = im->nvfmts, .pViewFormats = im->vfmts};
     u32 samples = t->samples > 1 ? t->samples : 1;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = im->cflags, .imageType = type, .format = fmt,
-        .extent = {t->width * im->scale, tex_height(t) * im->scale, tex_depth(t)}, .mipLevels = im->levels,
+        .extent = {sc_size(t->width, im->scale), sc_size(tex_height(t), im->scale), tex_depth(t)}, .mipLevels = im->levels,
         .arrayLayers = im->layers, .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = im->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     if (!env.mutable_all && im->cflags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ci.pNext = &fl;
     VkResult r = vkCreateImage(vk.dev, &ci, NULL, &im->image);
     if (r != VK_SUCCESS) {
-        hlog(0, "gpu: vkCreateImage %ux%ux%u (x%u) format %u (vk %d) target %u: %d", t->width, t->height, t->depth,
+        hlog(0, "gpu: vkCreateImage %ux%ux%u (x%.3g) format %u (vk %d) target %u: %d", t->width, t->height, t->depth,
              im->scale, t->format, fmt, t->target, r);
         return false;
     }
@@ -776,10 +780,11 @@ bool scale_blittable(const Image *im) {
 }
 
 /* every level and layer of s (made at scale ss) into d (scale ds); w x h: level 0's guest size */
-static void blit_levels(VkImage s, u32 ss, VkImage d, u32 ds, VkImageAspectFlags asp, u32 w, u32 h, u32 levels,
+static void blit_levels(VkImage s, float ss, VkImage d, float ds, VkImageAspectFlags asp, u32 w, u32 h, u32 levels,
                         u32 layers, VkFilter filter) {
     for (u32 l = 0; l < levels; l++) {
-        s32 sw = (s32)((w * ss) >> l), sh = (s32)((h * ss) >> l), dw = (s32)((w * ds) >> l), dh = (s32)((h * ds) >> l);
+        s32 sw = (s32)(sc_size(w, ss) >> l), sh = (s32)(sc_size(h, ss) >> l);
+        s32 dw = (s32)(sc_size(w, ds) >> l), dh = (s32)(sc_size(h, ds) >> l);
         VkImageBlit b = {{asp, l, 0, layers}, {{0, 0, 0}, {sw ? sw : 1, sh ? sh : 1, 1}},
                          {asp, l, 0, layers}, {{0, 0, 0}, {dw ? dw : 1, dh ? dh : 1, 1}}};
         vkCmdBlitImage(cmd(), s, VK_IMAGE_LAYOUT_GENERAL, d, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
@@ -788,12 +793,12 @@ static void blit_levels(VkImage s, u32 ss, VkImage d, u32 ds, VkImageAspectFlags
 
 /* im remade at scale s (its old contents blitted over where the format allows; otherwise cleared). The Image stays
  * (descriptor sets hold it): its views go, and the image epoch makes the sets look its entries up again */
-void image_rescale(Image *im, u32 s) {
+void image_rescale(Image *im, float s) {
     if (im->scale == s) return;
     end_rendering();
     VkImage old = im->image;
     VkAlloc olda = im->alloc;
-    u32 os = im->scale;
+    float os = im->scale;
     im->scale = s;
     image_bytes -= olda.size;
     zero_now(im);

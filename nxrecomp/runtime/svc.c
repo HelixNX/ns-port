@@ -6,6 +6,8 @@
 #include <bcrypt.h>
 #include "game_config.h"
 
+u64 nx_total_memory = TOTAL_MEMORY;
+
 static const char *svc_name(u32 n) {
     static const char *const names[0x80] = {
         [0x01] = "SetHeapSize", [0x02] = "SetMemoryPermission", [0x03] = "SetMemoryAttribute", [0x04] = "MapMemory",
@@ -43,7 +45,7 @@ static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
     case 3: *out = ALIAS_SIZE; return R_OK;
     case 4: *out = HEAP_BASE; return R_OK;
     case 5: *out = HEAP_MAX; return R_OK;
-    case 6: *out = TOTAL_MEMORY; return R_OK;
+    case 6: *out = nx_total_memory; return R_OK;
     case 7: *out = mem_used(); return R_OK;
     case 8: *out = 0; return R_OK;                                     /* no debugger */
     case 9: *out = 0; return R_OK;                                     /* no resource limit handle */
@@ -57,7 +59,7 @@ static u32 get_info(u32 id0, u32 handle, u64 id1, u64 *out) {
     case 17: *out = system_resource_size / 4; return R_OK;
     case 18: *out = NX_TITLE_ID; return R_OK;
     case 20: *out = user_exception_context(); return R_OK;
-    case 21: *out = TOTAL_MEMORY; return R_OK;
+    case 21: *out = nx_total_memory; return R_OK;
     case 22: *out = mem_used(); return R_OK;
     case 0xf0000002: *out = 0; return R_OK;                            /* thread tick count */
     }
